@@ -72,6 +72,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     include(cmake/dependencies/windows.cmake)
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    include(cmake/dependencies/wiiu.cmake)
+endif()
+
 # === Platform Specific Configuration ===
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     include(cmake/ios-toolchain-populate.cmake)

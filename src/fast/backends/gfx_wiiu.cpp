@@ -355,6 +355,23 @@ static void gfx_wiiu_set_keyboard_callbacks(bool (*on_key_down)(int scancode), b
                                             void (*on_all_keys_up)(void)) {
 }
 
+// The modern window owns the frame loop, so the old main_loop's exit path has to
+// live somewhere: IsRunning() reports ProcUI's state and Destroy() performs the
+// teardown that used to run after the while() fell through. Losing that teardown
+// would leak the GX2 context and skip WHBProcShutdown on exit.
+bool gfx_wiiu_is_running(void) {
+    return WHBProcIsRunning();
+}
+
+void gfx_wiiu_teardown(void) {
+    LUS::ExecuteHooks<LUS::ExitGame>();
+    LUS::WiiU::Exit();
+
+    gfx_gx2_shutdown();
+    gfx_wiiu_shutdown();
+    WHBProcShutdown();
+}
+
 static void gfx_wiiu_main_loop(void (*run_one_game_iter)(void)) {
     while (WHBProcIsRunning()) {
         run_one_game_iter();
@@ -487,3 +504,175 @@ struct GfxWindowManagerAPI gfx_wiiu = {
 };
 
 #endif
+
+// ---------------------------------------------------------------------------
+// GfxWindowBackendWiiU — C++ facade over the ProcUI/GX2 window code above.
+//
+// Modern libultraship replaced the C `GfxWindowManagerAPI` struct (18 entries)
+// with an abstract class (32 virtuals). Most additions are pointer input, which
+// the Wii U does not have; those are implemented as honest no-ops rather than
+// fabricated coordinates. GamePad touch reaches ImGui through imgui_impl_wiiu.
+// ---------------------------------------------------------------------------
+
+#include "fast/backends/gfx_window_backend_wiiu.h"
+
+namespace Fast {
+
+void GfxWindowBackendWiiU::Init(const char* gameName, const char* apiName, bool startFullScreen, uint32_t width,
+                                uint32_t height, int32_t posX, int32_t posY) {
+    // The Wii U framebuffer is fixed by the TV/GamePad scan-out; position and the
+    // requested size are meaningless here and are deliberately ignored.
+    (void)posX;
+    (void)posY;
+    gfx_wiiu_init(gameName, apiName, startFullScreen, width, height);
+}
+
+void GfxWindowBackendWiiU::Close() {
+    gfx_wiiu_close();
+}
+
+void GfxWindowBackendWiiU::Destroy() {
+    // Full teardown, mirroring what gfx_wiiu_main_loop() used to run once its
+    // WHBProcIsRunning() loop exited.
+    gfx_wiiu_teardown();
+}
+
+void GfxWindowBackendWiiU::SetKeyboardCallbacks(bool (*onKeyDown)(int scancode), bool (*onKeyUp)(int scancode),
+                                                void (*onAllKeysUp)()) {
+    gfx_wiiu_set_keyboard_callbacks(onKeyDown, onKeyUp, onAllKeysUp);
+}
+
+void GfxWindowBackendWiiU::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn), bool (*onMouseButtonUp)(int btn)) {
+    // No mouse on Wii U.
+    (void)onMouseButtonDown;
+    (void)onMouseButtonUp;
+}
+
+void GfxWindowBackendWiiU::SetFullscreenChangedCallback(void (*onFullscreenChanged)(bool isNowFullscreen)) {
+    gfx_wiiu_set_fullscreen_changed_callback(onFullscreenChanged);
+}
+
+void GfxWindowBackendWiiU::SetFullscreen(bool fullscreen) {
+    gfx_wiiu_set_fullscreen(fullscreen);
+}
+
+bool GfxWindowBackendWiiU::IsFullscreen() {
+    // Scan-out is always full screen; there is no windowed mode to report.
+    return true;
+}
+
+void GfxWindowBackendWiiU::GetActiveWindowRefreshRate(uint32_t* refreshRate) {
+    gfx_wiiu_get_active_window_refresh_rate(refreshRate);
+}
+
+void GfxWindowBackendWiiU::SetCursorVisibility(bool visible) {
+    gfx_wiiu_show_cursor(visible);
+}
+
+void GfxWindowBackendWiiU::SetMousePos(int32_t posX, int32_t posY) {
+    (void)posX;
+    (void)posY;
+}
+
+void GfxWindowBackendWiiU::GetMousePos(int32_t* x, int32_t* y) {
+    *x = 0;
+    *y = 0;
+}
+
+void GfxWindowBackendWiiU::GetMouseDelta(int32_t* x, int32_t* y) {
+    *x = 0;
+    *y = 0;
+}
+
+void GfxWindowBackendWiiU::GetMouseWheel(float* x, float* y) {
+    *x = 0.0f;
+    *y = 0.0f;
+}
+
+bool GfxWindowBackendWiiU::GetMouseState(uint32_t btn) {
+    (void)btn;
+    return false;
+}
+
+void GfxWindowBackendWiiU::SetMouseCapture(bool capture) {
+    (void)capture;
+}
+
+bool GfxWindowBackendWiiU::IsMouseCaptured() {
+    return false;
+}
+
+void GfxWindowBackendWiiU::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
+    gfx_wiiu_get_dimensions(width, height);
+    if (posX != nullptr) {
+        *posX = 0;
+    }
+    if (posY != nullptr) {
+        *posY = 0;
+    }
+}
+
+void GfxWindowBackendWiiU::SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) {
+    // Fixed scan-out: resizing is not possible, so this is a no-op rather than a
+    // silent partial resize that would desync Fast3D's idea of the framebuffer.
+    (void)width;
+    (void)height;
+    (void)posX;
+    (void)posY;
+}
+
+Ship::WindowRect GfxWindowBackendWiiU::GetPrimaryMonitorRect() {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    gfx_wiiu_get_dimensions(&width, &height);
+    return Ship::WindowRect{ 0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height) };
+}
+
+void GfxWindowBackendWiiU::HandleEvents() {
+    gfx_wiiu_handle_events();
+}
+
+bool GfxWindowBackendWiiU::IsFrameReady() {
+    return gfx_wiiu_start_frame();
+}
+
+bool GfxWindowBackendWiiU::IsRunning() {
+    // The old backend drove its own loop via gfx_wiiu_main_loop(); the modern
+    // window owns the loop and asks us whether ProcUI still wants us alive.
+    return gfx_wiiu_is_running();
+}
+
+void GfxWindowBackendWiiU::SwapBuffersBegin() {
+    gfx_wiiu_swap_buffers_begin();
+}
+
+void GfxWindowBackendWiiU::SwapBuffersEnd() {
+    gfx_wiiu_swap_buffers_end();
+}
+
+double GfxWindowBackendWiiU::GetTime() {
+    return gfx_wiiu_get_time();
+}
+
+int GfxWindowBackendWiiU::GetTargetFps() {
+    return mTargetFps;
+}
+
+void GfxWindowBackendWiiU::SetTargetFps(int fps) {
+    mTargetFps = fps;
+    gfx_wiiu_set_target_fps(fps);
+}
+
+void GfxWindowBackendWiiU::SetMaxFrameLatency(int latency) {
+    gfx_wiiu_set_maximum_frame_latency(latency);
+}
+
+const char* GfxWindowBackendWiiU::GetKeyName(int scancode) {
+    return gfx_wiiu_get_key_name(scancode);
+}
+
+bool GfxWindowBackendWiiU::CanDisableVsync() {
+    return gfx_wiiu_can_disable_vsync();
+}
+
+} // namespace Fast
