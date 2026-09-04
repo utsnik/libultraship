@@ -39,5 +39,14 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "graphic/Fast3D/backends/gfx_opengl*")
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    # Wii U has no OpenGL/SDL video path; it renders through GX2.
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "gfx_opengl")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "gfx_sdl")
+else()
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "gfx_gx2")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "gx2_shader_gen")
+endif()
+
 source_group("graphic" FILES ${Source_Files__Graphic})
 target_sources(libultraship PRIVATE ${Source_Files__Graphic})

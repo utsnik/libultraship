@@ -201,6 +201,16 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
         )
     endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    # Wii U (devkitPPC/wut): GPU7 via GX2, no OpenGL and no SDL video backend.
+    target_compile_definitions(libultraship PRIVATE
+        ENABLE_GX2
+        __WIIU__
+        $<$<CONFIG:Debug>:_DEBUG>
+        $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+        SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
+        $<$<BOOL:${GFX_DEBUG_DISASSEMBLER}>:GFX_DEBUG_DISASSEMBLER>
+    )
 else()
     target_compile_definitions(libultraship PRIVATE
         ENABLE_OPENGL
