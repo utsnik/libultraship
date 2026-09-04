@@ -33,28 +33,14 @@ namespace Fast {
  */
 struct ShaderProgram {
     ShaderGroup group;
-    uint8_t numInputs;
-    bool usedTextures[SHADER_MAX_TEXTURES];
-    bool usedNoise;
-    uint32_t windowParamsOffset;
-    int32_t samplersLocation[SHADER_MAX_TEXTURES];
+    uint8_t num_inputs;
+    bool used_textures[2];
+    bool used_noise;
+    uint32_t window_params_offset;
+    int32_t samplers_location[2];
 };
 
-struct GX2TextureEntry {
-    GX2Texture texture;
-    bool textureUploaded;
 
-    GX2Sampler sampler;
-    bool samplerSet;
-};
-
-struct GX2Framebuffer {
-    GX2ColorBuffer colorBuffer;
-    GX2DepthBuffer depthBuffer;
-    uint32_t textureId;
-    bool hasDepthBuffer;
-    uint32_t msaaLevel;
-};
 
 class GfxRenderingAPIGX2 : public GfxRenderingAPI {
   public:
@@ -119,15 +105,11 @@ class GfxRenderingAPIGX2 : public GfxRenderingAPI {
     std::shared_ptr<Ship::ConsoleVariable> mConsoleVariables;
     std::shared_ptr<Ship::ResourceManager> mResourceManager;
 
-    std::map<std::pair<uint64_t, uint64_t>, ShaderProgram> mShaderProgramPool;
-    ShaderProgram* mCurrentShaderProgram = nullptr;
 
-    std::map<uint32_t, GX2TextureEntry> mTextures;
     uint32_t mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
     int mCurrentTile = 0;
     uint32_t mNextTextureId = 1;
 
-    std::map<int, GX2Framebuffer> mFramebuffers;
     int mNextFramebufferId = 0;
     int mCurrentFramebufferId = 0;
 
