@@ -202,6 +202,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
         )
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    # The shim must out-rank the real include dirs so <SDL3/SDL.h> resolves to it.
+    target_include_directories(libultraship BEFORE PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include/port/wiiu/sdl3compat
+        $ENV{DEVKITPRO}/portlibs/wiiu/include
+    )
+    target_sources(libultraship PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/port/wiiu/sdl3compat.cpp)
     # Wii U (devkitPPC/wut): GPU7 via GX2, no OpenGL and no SDL video backend.
     target_compile_definitions(libultraship PRIVATE
         ENABLE_GX2

@@ -56,3 +56,12 @@ target_compile_definitions(ImGui PUBLIC
 # GPU7 has no compute/geometry stages and a hard 8192 texture limit; nothing here
 # needs the docking backends' multi-viewport support, which requires a real WM.
 target_compile_definitions(ImGui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+
+#=================== SDL3-over-SDL2 shim ===================
+# SDL3 has no Wii U video driver upstream and devkitPro ships only wiiu-sdl2, so
+# there is no SDL3 to link. include/port/wiiu/sdl3compat provides an <SDL3/SDL.h>
+# that maps the 107 SDL3-only symbols libultraship uses onto SDL2 equivalents.
+# It is placed BEFORE the normal include dirs so #include <SDL3/SDL.h> resolves here.
+find_library(WIIU_SDL2_LIB SDL2 REQUIRED HINTS "$ENV{DEVKITPRO}/portlibs/wiiu/lib")
+list(APPEND ADDITIONAL_LIB_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/port/wiiu/sdl3compat)
+target_include_directories(ImGui BEFORE PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/port/wiiu/sdl3compat)
