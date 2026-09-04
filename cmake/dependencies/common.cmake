@@ -27,11 +27,16 @@ target_sources(ImGui
     ${imgui_SOURCE_DIR}/imgui.cpp
 )
 
-target_sources(ImGui
-    PRIVATE
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
-)
+# The Wii U has neither OpenGL nor the desktop SDL video backend, and
+# imgui_impl_opengl3_loader.h reaches for <dlfcn.h>, which wut's newlib does not
+# provide. libultraship supplies imgui_impl_gx2 / imgui_impl_wiiu instead.
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    target_sources(ImGui
+        PRIVATE
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+    )
+endif()
 
 target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends PRIVATE ${SDL2_INCLUDE_DIRS})
 
