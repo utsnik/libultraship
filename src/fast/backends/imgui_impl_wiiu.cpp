@@ -1,7 +1,7 @@
 // dear imgui: Platform Backend for the Wii U
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "imgui_impl_wiiu.h"
+#include "fast/backends/imgui_impl_wiiu.h"
 #include <stdlib.h> // malloc/free
 
 // Software keyboard
@@ -19,6 +19,11 @@ struct ImGui_ImplWiiU_Data
 
     ImGui_ImplWiiU_Data()   { memset((void*)this, 0, sizeof(*this)); }
 };
+
+// Scratch buffer for the UTF-8 -> UTF-16 conversion below. Deliberately NOT a
+// member of ImGui_ImplWiiU_Data: that struct's constructor memsets itself, which
+// would corrupt any non-trivial member such as an ImVector.
+static ImVector<ImWchar> gInitialTextUtf16;
 
 // Backend data stored in io.BackendPlatformUserData
 static ImGui_ImplWiiU_Data* ImGui_ImplWiiU_GetBackendData()
@@ -255,9 +260,20 @@ bool     ImGui_ImplWiiU_ProcessInput(ImGui_ImplWiiU_ControllerInput* input)
         if (state)
         {
             if (!(state->Flags & ImGuiInputTextFlags_AlwaysOverwrite))
-                bd->AppearArg.inputFormArg.initialText = (char16_t*) state->TextW.Data;
+            {
+                // ImGui >= 1.91 keeps the edit buffer as UTF-8 in TextA; it used to
+                // be UTF-16 in TextW. nn::swkbd takes UTF-16, so convert rather than
+                // reinterpret-casting, which would feed the keyboard mojibake.
+                gInitialTextUtf16.resize(state->TextA.Size + 1);
+                int len = ImTextStrFromUtf8((ImWchar*) gInitialTextUtf16.Data,
+                                            gInitialTextUtf16.Size,
+                                            state->TextA.Data,
+                                            state->TextA.Data + state->TextA.Size);
+                gInitialTextUtf16[len] = 0;
+                bd->AppearArg.inputFormArg.initialText = (char16_t*) gInitialTextUtf16.Data;
+            }
 
-            bd->AppearArg.inputFormArg.maxTextLength = state->BufCapacityA;
+            bd->AppearArg.inputFormArg.maxTextLength = state->BufCapacity;
             bd->AppearArg.inputFormArg.higlightInitialText = !!(state->Flags & ImGuiInputTextFlags_AutoSelectAll);
 
             if (state->Flags & ImGuiInputTextFlags_Password)

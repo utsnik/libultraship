@@ -3934,6 +3934,36 @@ bool gfx_othermode_h_handler_f3d(F3DGfx** cmd0) {
     return false;
 }
 
+// A resolved address still in the N64 segmented range (<= 0x0FFFFFFF) usually means SegAddr
+// failed to resolve it (segment not set up). Keep it only if it belongs to a loaded module,
+// where it's a real low pointer (e.g. a static TLUT) rather than an unresolved segment addr.
+static bool IsValidResolvedAddress(uintptr_t addr) {
+    if (addr > 0x0FFFFFFF) {
+        return true;
+    }
+
+    // Still in the N64 segmented range, but might be a false positive (a real low pointer).
+#ifdef _WIN32
+    // For Windows, check whether the address belongs to a dll.
+    HMODULE module = nullptr;
+    return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCSTR>(addr), &module) != 0;
+#elif defined(__WIIU__)
+    // The Wii U links everything statically into a single RPX, so there are no
+    // dynamically loaded objects to interrogate and wut provides no dladdr.
+    // Report "not a loaded object", i.e. treat the value as a genuine N64
+    // segmented address. That is the conservative answer: segmented addresses are
+    // overwhelmingly what lands in this range, and misreading one as a host
+    // pointer would dereference outside the game's memory.
+    (void)addr;
+    return false;
+#else
+    // For non-Windows platforms, check whether the address belongs to a loaded object.
+    Dl_info info;
+    return dladdr(reinterpret_cast<void*>(addr), &info) != 0;
+#endif
+}
+
 bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;

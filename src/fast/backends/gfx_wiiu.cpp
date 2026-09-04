@@ -36,12 +36,20 @@
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_gx2.h"
-#include "gfx_wiiu.h"
+
+// gfx_gx2.cpp lives in namespace Fast; its shutdown entry point is used below.
+namespace Fast {
+void gfx_gx2_shutdown(void);
+}
+using Fast::gfx_gx2_shutdown;
+#include "fast/backends/gfx_wiiu.h"
 
 #include "fast/backends/imgui_impl_wiiu.h"
 #include "port/wiiu/WiiUImpl.h"
-#include "menu/ImGuiImpl.h"
-#include "misc/Hooks.h"
+#include "fast/backends/imgui_impl_wiiu.h" // ImGui_ImplWiiU_ControllerInput
+// (was menu/ImGuiImpl.h: that header belonged to the pre-8.x LUS GUI and is gone)
+// (was misc/Hooks.h) The pre-8.x LUS hook system was removed upstream; the
+// ExitGame hook had no Wii U-specific work beyond the teardown below.
 
 static MEMHeapHandle heap_MEM1 = nullptr;
 static MEMHeapHandle heap_foreground = nullptr;
@@ -302,14 +310,13 @@ static void gfx_wiiu_init(const char* game_name, const char* gfx_api_name, bool 
 
     GX2SetSwapInterval(frame_divisor);
 
-    gfx_current_dimensions.width = gfx_current_game_window_viewport.width = WIIU_DEFAULT_FB_WIDTH;
-    gfx_current_dimensions.height = gfx_current_game_window_viewport.height = WIIU_DEFAULT_FB_HEIGHT;
-
-    LUS::WindowImpl window_impl;
-    window_impl.backend = LUS::Backend::GX2;
-    window_impl.Gx2.Width = WIIU_DEFAULT_FB_WIDTH;
-    window_impl.Gx2.Height = WIIU_DEFAULT_FB_HEIGHT;
-    LUS::InitGui(window_impl);
+    // The old tree set the Fast3D globals gfx_current_dimensions /
+    // gfx_current_game_window_viewport here and bootstrapped the GUI through
+    // LUS::WindowImpl + LUS::InitGui. Modern libultraship owns both: dimensions are
+    // pulled via GfxWindowBackend::GetDimensions(), and Fast3dWindow/Fast3dGui build
+    // the GUI. Only the ImGui Wii U platform backend still has to be started here,
+    // because nothing else knows about VPAD/WPAD.
+    ImGui_ImplWiiU_Init();
 }
 
 static void gfx_wiiu_shutdown(void) {
@@ -364,7 +371,6 @@ bool gfx_wiiu_is_running(void) {
 }
 
 void gfx_wiiu_teardown(void) {
-    LUS::ExecuteHooks<LUS::ExitGame>();
     LUS::WiiU::Exit();
 
     gfx_gx2_shutdown();
@@ -377,7 +383,6 @@ static void gfx_wiiu_main_loop(void (*run_one_game_iter)(void)) {
         run_one_game_iter();
     }
 
-    LUS::ExecuteHooks<LUS::ExitGame>();
     LUS::WiiU::Exit();
 
     gfx_gx2_shutdown();
@@ -409,9 +414,10 @@ static void gfx_wiiu_handle_events(void) {
         }
     }
 
-    LUS::EventImpl event_impl;
-    event_impl.Gx2.Input = &input;
-    LUS::UpdateGui(event_impl);
+    // Was LUS::EventImpl + LUS::UpdateGui. Modern libultraship drives the GUI from
+    // Fast3dWindow, so hand the gamepad state straight to the ImGui Wii U backend,
+    // which is the only consumer that understands VPAD/WPAD.
+    ImGui_ImplWiiU_ProcessInput(&input);
 }
 
 static bool gfx_wiiu_start_frame(void) {
@@ -482,26 +488,8 @@ bool gfx_wiiu_can_disable_vsync() {
     return false;
 }
 
-struct GfxWindowManagerAPI gfx_wiiu = {
-    gfx_wiiu_init,
-    gfx_wiiu_close,
-    gfx_wiiu_set_keyboard_callbacks,
-    gfx_wiiu_set_fullscreen_changed_callback,
-    gfx_wiiu_set_fullscreen,
-    gfx_wiiu_get_active_window_refresh_rate,
-    gfx_wiiu_show_cursor,
-    gfx_wiiu_main_loop,
-    gfx_wiiu_get_dimensions,
-    gfx_wiiu_handle_events,
-    gfx_wiiu_start_frame,
-    gfx_wiiu_swap_buffers_begin,
-    gfx_wiiu_swap_buffers_end,
-    gfx_wiiu_get_time,
-    gfx_wiiu_set_target_fps,
-    gfx_wiiu_set_maximum_frame_latency,
-    gfx_wiiu_get_key_name,
-    gfx_wiiu_can_disable_vsync,
-};
+// The C GfxWindowManagerAPI dispatch struct is retired: GfxWindowBackendWiiU
+// below implements the abstract interface that replaced it.
 
 #endif
 

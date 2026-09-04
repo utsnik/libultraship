@@ -47,15 +47,11 @@ target_include_directories(ImGui PUBLIC
 
 target_link_libraries(ImGui PUBLIC ${WUT_LIB})
 
-# ImGui's default backends assume a desktop windowing system; keep them out.
-target_compile_definitions(ImGui PUBLIC
-    IMGUI_DISABLE_DEFAULT_ALLOCATORS=0
-    IMGUI_IMPL_API=
-)
-
-# GPU7 has no compute/geometry stages and a hard 8192 texture limit; nothing here
-# needs the docking backends' multi-viewport support, which requires a real WM.
-target_compile_definitions(ImGui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+# NOTE: do NOT define IMGUI_DISABLE_OBSOLETE_FUNCTIONS here. libultraship's own
+# InputEditorWindow.cpp still calls ImGui::Push/PopButtonRepeat, which 1.91 keeps
+# only as obsolete API. Disabling it breaks upstream sources that have nothing to
+# do with this platform. The Wii U needs no ImGui defines beyond the backends
+# exclusion already handled in common.cmake.
 
 #=================== SDL3-over-SDL2 shim ===================
 # SDL3 has no Wii U video driver upstream and devkitPro ships only wiiu-sdl2, so

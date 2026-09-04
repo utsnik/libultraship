@@ -47,6 +47,12 @@
 #define SDL_EVENT_WINDOW_CLOSE_REQUESTED SDL_WINDOWEVENT_CLOSE
 #define SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED SDL_WINDOWEVENT_SIZE_CHANGED
 
+/* SDL3 renamed the event union's controller-device member cdevice -> gdevice.
+ * Mapping a bare identifier with the preprocessor is normally unwise, but
+ * `gdevice` appears exactly twice in the tree and only ever as this member, and
+ * confining the rename to the Wii U build avoids patching upstream source. */
+#define gdevice cdevice
+
 /* ------------------------------------------------------------------ *
  * Gamepad: SDL3 renamed GameController -> Gamepad wholesale.
  * ------------------------------------------------------------------ */
@@ -138,6 +144,13 @@ SDL_Window* SDL_CreateWindowWithProperties(SDL_PropertiesID props);
  * top of SDL2's queued-audio API rather than aliased.
  * ------------------------------------------------------------------ */
 #define SDL_AUDIO_S16 AUDIO_S16SYS
+
+/* SDL3 split pause/resume into single-argument calls; SDL2 has one function with
+ * a pause_on flag. */
+#ifdef SDL_PauseAudioDevice
+#undef SDL_PauseAudioDevice
+#endif
+#define SDL_PauseAudioDevice(dev) SDL_PauseAudioDevice_SDL2((dev), 1)
 #define SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK 0
 
 typedef struct SDL_AudioStream SDL_AudioStream;
@@ -154,6 +167,7 @@ int SDL_GetAudioStreamAvailable(SDL_AudioStream* stream);
 SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream* stream);
 bool SDL_ClearAudioStream(SDL_AudioStream* stream);
 bool SDL_ResumeAudioDevice(SDL_AudioDeviceID devid);
+void SDL_PauseAudioDevice_SDL2(SDL_AudioDeviceID devid, int pauseOn);
 #ifdef __cplusplus
 }
 #endif
@@ -189,3 +203,25 @@ bool SDL_SetGamepadLED(SDL_Gamepad* gamepad, Uint8 red, Uint8 green, Uint8 blue)
 #ifdef __cplusplus
 }
 #endif
+
+/* ------------------------------------------------------------------ *
+ * Timers: SDL3 reversed the callback argument order and added the timer
+ * id, so this needs a real trampoline rather than an alias.
+ *   SDL3: Uint32 cb(void *userdata, SDL_TimerID id, Uint32 interval)
+ *   SDL2: Uint32 cb(Uint32 interval, void *param)
+ * ------------------------------------------------------------------ */
+typedef Uint32 (*SDL3_TimerCallback)(void* userdata, SDL_TimerID timerID, Uint32 interval);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+SDL_TimerID SDL3Compat_AddTimer(Uint32 interval, SDL3_TimerCallback callback, void* userdata);
+#ifdef __cplusplus
+}
+#endif
+
+/* Route SDL_AddTimer to the trampoline. Undef first: SDL2 declares it already. */
+#ifdef SDL_AddTimer
+#undef SDL_AddTimer
+#endif
+#define SDL_AddTimer(interval, callback, userdata) SDL3Compat_AddTimer((interval), (callback), (userdata))

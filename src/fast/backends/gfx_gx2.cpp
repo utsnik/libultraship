@@ -41,7 +41,41 @@
 #include <proc_ui/procui.h>
 #include <coreinit/memory.h>
 
-#include "imgui_impl_gx2.h"
+#include "fast/backends/imgui_impl_gx2.h"
+
+// The whole translation unit lives in namespace Fast: the ported GPU7 code uses
+// FilteringMode, GfxClipParameters and ShaderProgram, all of which libultraship
+// moved into that namespace.
+namespace Fast {
+
+// The old backend called the free function CVarGetInteger() from
+// core/bridge/consolevariablebridge.h. Modern libultraship reads cvars through a
+// Ship::ConsoleVariable instance handed to the backend at construction. The GPU7
+// code below is file-scope, so the instance is published here by the constructor
+// and this shim keeps the ~20 original call sites untouched.
+static std::shared_ptr<Ship::ConsoleVariable> gGx2ConsoleVariables;
+
+static int32_t CVarGetInteger(const char* name, int32_t defaultValue) {
+    // Before Init() runs (or if the backend was built without cvars) fall back to
+    // the caller's default rather than dereferencing null.
+    if (gGx2ConsoleVariables == nullptr) {
+        return defaultValue;
+    }
+    return gGx2ConsoleVariables->GetInteger(name, defaultValue);
+}
+
+// Named GX2TextureEntry rather than Texture: libultraship has a Fast::Texture
+// resource class, and this file now lives in namespace Fast.
+struct GX2TextureEntry {
+    GX2Texture texture;
+    bool texture_uploaded;
+
+    GX2Sampler sampler;
+    bool sampler_set;
+
+    // For ImGui rendering
+    ImGui_ImplGX2_Texture imtex;
+};
 
 #define ALIGN(x, align) (((x) + ((align)-1)) & ~((align)-1))
 
@@ -67,7 +101,7 @@ static struct Framebuffer* current_framebuffer;
 static std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgram> shader_program_pool;
 static struct ShaderProgram* current_shader_program;
 
-static struct Texture* current_texture;
+static struct GX2TextureEntry* current_texture;
 static int current_tile;
 
 // 96 Mb (should be more than enough to draw everything without waiting for the GPU)
@@ -190,9 +224,9 @@ static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_
         return nullptr;
     }
 
-    prg->num_inputs = cc_features.num_inputs;
-    prg->used_textures[0] = cc_features.used_textures[0];
-    prg->used_textures[1] = cc_features.used_textures[1];
+    prg->num_inputs = cc_features.numInputs;
+    prg->used_textures[0] = cc_features.usedTextures[0];
+    prg->used_textures[1] = cc_features.usedTextures[1];
 
     gfx_gx2_load_shader(prg);
 
@@ -224,7 +258,7 @@ static void gfx_gx2_shader_get_info(struct ShaderProgram* prg, uint8_t* num_inpu
 
 static uint32_t gfx_gx2_new_texture(void) {
     // some 32-bit trickery :P
-    struct Texture* tex = (struct Texture*)calloc(1, sizeof(struct Texture));
+    struct GX2TextureEntry* tex = (struct GX2TextureEntry*)calloc(1, sizeof(struct GX2TextureEntry));
 
     tex->imtex.Texture = &tex->texture;
     tex->imtex.Sampler = &tex->sampler;
@@ -233,7 +267,7 @@ static uint32_t gfx_gx2_new_texture(void) {
 }
 
 static void gfx_gx2_delete_texture(uint32_t texture_id) {
-    struct Texture* tex = (struct Texture*)texture_id;
+    struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
 
     if (tex->texture.surface.image) {
         free(tex->texture.surface.image);
@@ -243,7 +277,7 @@ static void gfx_gx2_delete_texture(uint32_t texture_id) {
 }
 
 static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
-    struct Texture* tex = (struct Texture*)texture_id;
+    struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
     current_texture = tex;
     current_tile = tile;
 
@@ -262,7 +296,7 @@ static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
 }
 
 static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
-    struct Texture* tex = current_texture;
+    struct GX2TextureEntry* tex = current_texture;
     assert(tex);
 
     if ((tex->texture.surface.width != width) || (tex->texture.surface.height != height) ||
@@ -327,7 +361,7 @@ static GX2TexClampMode gfx_cm_to_gx2(uint32_t val) {
 }
 
 static void gfx_gx2_set_sampler_parameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
-    struct Texture* tex = current_texture;
+    struct GX2TextureEntry* tex = current_texture;
     assert(tex);
 
     current_tile = tile;
@@ -819,7 +853,7 @@ FilteringMode gfx_gx2_get_texture_filter(void) {
 }
 
 ImGui_ImplGX2_Texture* gfx_gx2_texture_for_imgui(uint32_t texture_id) {
-    struct Texture* tex = (struct Texture*)texture_id;
+    struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
     return &tex->imtex;
 }
 
@@ -835,11 +869,10 @@ ImGui_ImplGX2_Texture* gfx_gx2_texture_for_imgui(uint32_t texture_id) {
 // silent transcription bugs for no behavioural gain.
 // ---------------------------------------------------------------------------
 
-namespace Fast {
-
 GfxRenderingAPIGX2::GfxRenderingAPIGX2(std::shared_ptr<Ship::ConsoleVariable> consoleVariable,
                                        std::shared_ptr<Ship::ResourceManager> resourceManager)
     : mConsoleVariables(std::move(consoleVariable)), mResourceManager(std::move(resourceManager)) {
+    gGx2ConsoleVariables = mConsoleVariables;
 }
 
 GfxRenderingAPIGX2::~GfxRenderingAPIGX2() {

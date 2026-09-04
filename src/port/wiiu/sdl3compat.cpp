@@ -10,6 +10,15 @@
 
 #include <SDL3/SDL.h>
 
+// This translation unit implements the shim, so it must reach SDL2's real
+// SDL_AddTimer rather than the compat macro that redirects callers to us.
+#ifdef SDL_AddTimer
+#undef SDL_AddTimer
+#endif
+#ifdef SDL_PauseAudioDevice
+#undef SDL_PauseAudioDevice
+#endif
+
 #include <map>
 #include <mutex>
 #include <string>
@@ -179,6 +188,11 @@ bool SDL_ResumeAudioDevice(SDL_AudioDeviceID devid) {
     return true;
 }
 
+// Named target for the single-argument SDL3 form declared in the shim header.
+void SDL_PauseAudioDevice_SDL2(SDL_AudioDeviceID devid, int pauseOn) {
+    SDL_PauseAudioDevice(devid, pauseOn);
+}
+
 // SDL3 returns an owned array of instance ids; SDL2 enumerates by index.
 SDL_JoystickID* SDL_GetJoysticks(int* count) {
     const int n = SDL_NumJoysticks();
@@ -212,6 +226,56 @@ bool SDL_GetGamepadSensorData(SDL_Gamepad*, int, float*, int) {
 }
 bool SDL_SetGamepadLED(SDL_Gamepad*, Uint8, Uint8, Uint8) {
     return false;
+}
+
+
+// SDL2 calls back as cb(interval, param); SDL3 as cb(userdata, id, interval).
+// Keep the caller's function+userdata alongside the SDL2 timer so the arguments
+// can be reordered, rather than casting the pointer and corrupting the stack.
+} // extern "C"
+
+namespace {
+struct TimerShim {
+    SDL3_TimerCallback callback;
+    void* userdata;
+    SDL_TimerID id;
+};
+
+std::mutex gTimerMutex;
+std::map<SDL_TimerID, TimerShim*> gTimers;
+
+Uint32 TimerTrampoline(Uint32 interval, void* param) {
+    auto* shim = static_cast<TimerShim*>(param);
+    if (shim == nullptr || shim->callback == nullptr) {
+        return 0;
+    }
+    const Uint32 next = shim->callback(shim->userdata, shim->id, interval);
+    if (next == 0) {
+        std::lock_guard<std::mutex> lock(gTimerMutex);
+        gTimers.erase(shim->id);
+        delete shim;
+    }
+    return next;
+}
+} // namespace
+
+extern "C" {
+
+SDL_TimerID SDL3Compat_AddTimer(Uint32 interval, SDL3_TimerCallback callback, void* userdata) {
+    auto* shim = new TimerShim{ callback, userdata, 0 };
+    // SDL2's SDL_AddTimer is shadowed by the compat macro, so call through the
+    // real symbol name to avoid recursing into this function.
+    const SDL_TimerID id = SDL_AddTimer(interval, TimerTrampoline, shim);
+    if (id == 0) {
+        delete shim;
+        return 0;
+    }
+    shim->id = id;
+    {
+        std::lock_guard<std::mutex> lock(gTimerMutex);
+        gTimers[id] = shim;
+    }
+    return id;
 }
 
 } // extern "C"
