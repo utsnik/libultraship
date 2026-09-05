@@ -40,7 +40,11 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
         AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_METAL);
     }
 #endif
+#ifdef ENABLE_GX2
+    AddAvailableWindowBackend(WindowBackend::FAST3D_WIIU_GX2);
+#else
     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -164,8 +168,8 @@ void Fast3dWindow::InitWindowManager() {
             // The Wii U has no window manager and no SDL video path: the window
             // backend only wraps ProcUI plus the GX2 scan-out buffers.
             mWindowManagerApi = new GfxWindowBackendWiiU();
-            mRenderingApi = new GfxRenderingAPIGX2(GetConsoleVariables(),
-                                                   GetContext()->GetChildren().GetFirst<Ship::ResourceManager>());
+            mRenderingApi = new GfxRenderingAPIGX2(Ship::Context::GetRawInstance()->GetConsoleVariables(),
+                                                   Ship::Context::GetRawInstance()->GetResourceManager());
             break;
 #endif
         default:

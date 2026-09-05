@@ -7,6 +7,11 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
+#ifndef _WIN32
+#ifndef __WIIU__
+#include <dlfcn.h>
+#endif // wut has no dynamic loader; Wii U links everything statically.
+#endif
 
 #include <any>
 #include <map>

@@ -40,12 +40,19 @@ FetchContent_MakeAvailable(spdlog)
 # Deliberately NOT linked: SDL3, OpenGL, GLEW.
 
 find_library(WUT_LIB wut REQUIRED HINTS "$ENV{DEVKITPRO}/wut/lib")
+find_path(WIIU_SDL2_INCLUDE_DIR SDL2/SDL.h REQUIRED
+    HINTS "$ENV{DEVKITPRO}/portlibs/wiiu/include"
+)
+find_library(WIIU_SDL2_LIB SDL2 REQUIRED HINTS "$ENV{DEVKITPRO}/portlibs/wiiu/lib")
+
+list(APPEND ADDITIONAL_LIB_INCLUDES "${WIIU_SDL2_INCLUDE_DIR}")
 
 target_include_directories(ImGui PUBLIC
     "$ENV{DEVKITPRO}/wut/include"
+    "${WIIU_SDL2_INCLUDE_DIR}"
 )
 
-target_link_libraries(ImGui PUBLIC ${WUT_LIB})
+target_link_libraries(ImGui PUBLIC ${WUT_LIB} ${WIIU_SDL2_LIB})
 
 # NOTE: do NOT define IMGUI_DISABLE_OBSOLETE_FUNCTIONS here. libultraship's own
 # InputEditorWindow.cpp still calls ImGui::Push/PopButtonRepeat, which 1.91 keeps
