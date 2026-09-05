@@ -1,5 +1,5 @@
 #ifdef __WIIU__
-#include "WiiUImpl.h"
+#include <port/wiiu/WiiUImpl.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -9,9 +9,10 @@
 #include <whb/log_udp.h>
 #include <coreinit/debug.h>
 
-#include "core/Window.h"
+#include <ship/window/Window.h>
+#include <ship/Context.h>
 
-namespace LUS {
+namespace Ship {
 namespace WiiU {
 
 static bool hasVpad = false;
@@ -22,7 +23,7 @@ static bool hasKpad[4] = { false };
 static KPADError kpadError[4] = { KPAD_ERROR_OK };
 static KPADStatus kpadStatus[4];
 
-#ifdef _DEBUG
+#if 1 /* force UDP logging: no other way to diagnose on-device */
 extern "C" {
 void __wrap_abort() {
     printf("Abort called.\n");
@@ -47,8 +48,8 @@ static const devoptab_t dotab_stdout = {
 };
 #endif
 
-void Init() {
-#ifdef _DEBUG
+void Init(const std::string& shortName) {
+#if 1 /* force UDP logging: no other way to diagnose on-device */
     WHBLogUdpInit();
     WHBLogPrint("Hello World!");
 
@@ -59,9 +60,9 @@ void Init() {
     // make sure the required folders exist
     mkdir("/vol/external01/wiiu/", 0755);
     mkdir("/vol/external01/wiiu/apps/", 0755);
-    mkdir(("/vol/external01/wiiu/apps/" + Window::GetInstance()->GetShortName()).c_str(), 0755);
+    mkdir(("/vol/external01/wiiu/apps/" + shortName).c_str(), 0755);
 
-    chdir(("/vol/external01/wiiu/apps/" + Window::GetInstance()->GetShortName()).c_str());
+    chdir(("/vol/external01/wiiu/apps/" + shortName).c_str());
 
     KPADInit();
     WPADEnableURCC(true);
@@ -117,10 +118,12 @@ void Update() {
         }
     }
 
-    // rescan devices if connection state changed
-    if (rescan) {
-        Window::GetInstance()->GetControlDeck()->ScanDevices();
-    }
+    // Old libultraship exposed ControlDeck::ScanDevices() to re-enumerate on hotplug.
+    // Modern libultraship has no such method - there is nothing named Scan/Refresh/Reload
+    // Devices anywhere in the tree. The Wii U's VPAD/KPAD are polled directly above every
+    // frame, so the connection-state tracking is all the rescan we need; `rescan` is kept
+    // because the branches above are the hotplug bookkeeping.
+    (void)rescan;
 }
 
 VPADStatus* GetVPADStatus(VPADReadError* error) {
@@ -134,6 +137,6 @@ KPADStatus* GetKPADStatus(WPADChan chan, KPADError* error) {
 }
 
 }; // namespace WiiU
-}; // namespace LUS
+}; // namespace Ship
 
 #endif

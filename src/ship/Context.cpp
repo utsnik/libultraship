@@ -274,6 +274,13 @@ bool Context::InitControlDeck(std::shared_ptr<ControlDeck> controlDeck) {
     // Bring up the SDL game-controller subsystem here rather than in osContInit, so controllers work
     // in pre-game UI (e.g. navigating extraction prompts). osContInit still runs ControlDeck::Init(),
     // which needs the game's controllerBits.
+#ifdef __WIIU__
+    // The Wii U has no SDL game controllers - input comes from VPAD/KPAD via the GX2 window
+    // backend - and there is no gamecontrollerdb.txt to load. SDL_INIT_GAMECONTROLLER also
+    // spawns a joystick thread (SDL_HINT_JOYSTICK_THREAD) which hangs under wut's newlib
+    // threading. The on-device log ended exactly here, so this whole block is skipped.
+    SPDLOG_INFO("Wii U: skipping SDL game-controller init; input is VPAD/KPAD");
+#else
     std::string controllerDb = LocateFileAcrossAppDirs("gamecontrollerdb.txt");
     int mappingsAdded = SDL_GameControllerAddMappingsFromFile(controllerDb.c_str());
     if (mappingsAdded >= 0) {
@@ -285,6 +292,7 @@ bool Context::InitControlDeck(std::shared_ptr<ControlDeck> controlDeck) {
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
         SPDLOG_WARN("Failed to initialize SDL game controllers ({})", SDL_GetError());
     }
+#endif
 
     return true;
 }

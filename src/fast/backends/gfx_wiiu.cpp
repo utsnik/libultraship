@@ -371,7 +371,7 @@ bool gfx_wiiu_is_running(void) {
 }
 
 void gfx_wiiu_teardown(void) {
-    LUS::WiiU::Exit();
+    Ship::WiiU::Exit();
 
     gfx_gx2_shutdown();
     gfx_wiiu_shutdown();
@@ -383,7 +383,7 @@ static void gfx_wiiu_main_loop(void (*run_one_game_iter)(void)) {
         run_one_game_iter();
     }
 
-    LUS::WiiU::Exit();
+    Ship::WiiU::Exit();
 
     gfx_gx2_shutdown();
     gfx_wiiu_shutdown();
@@ -396,19 +396,19 @@ static void gfx_wiiu_get_dimensions(uint32_t* width, uint32_t* height) {
 }
 
 static void gfx_wiiu_handle_events(void) {
-    LUS::WiiU::Update();
+    Ship::WiiU::Update();
 
     ImGui_ImplWiiU_ControllerInput input{};
 
     VPADReadError vpad_error;
-    input.vpad = LUS::WiiU::GetVPADStatus(&vpad_error);
+    input.vpad = Ship::WiiU::GetVPADStatus(&vpad_error);
     if (vpad_error != VPAD_READ_SUCCESS) {
         input.vpad = nullptr;
     }
 
     KPADError kpad_error;
     for (int i = 0; i < 4; i++) {
-        input.kpad[i] = LUS::WiiU::GetKPADStatus((WPADChan)i, &kpad_error);
+        input.kpad[i] = Ship::WiiU::GetKPADStatus((WPADChan)i, &kpad_error);
         if (kpad_error != KPAD_ERROR_OK) {
             input.kpad[i] = nullptr;
         }

@@ -1,12 +1,13 @@
 #pragma once
 
+#include <string>
 #include <vpad/input.h>
 #include <padscore/kpad.h>
 
-namespace LUS {
+namespace Ship {
 namespace WiiU {
 
-void Init();
+void Init(const std::string& shortName);
 
 void Exit();
 
@@ -21,4 +22,4 @@ VPADStatus* GetVPADStatus(VPADReadError* error);
 KPADStatus* GetKPADStatus(WPADChan chan, KPADError* error);
 
 }; // namespace WiiU
-}; // namespace LUS
+}; // namespace Ship
