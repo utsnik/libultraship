@@ -52,12 +52,3 @@ target_link_libraries(ImGui PUBLIC ${WUT_LIB})
 # only as obsolete API. Disabling it breaks upstream sources that have nothing to
 # do with this platform. The Wii U needs no ImGui defines beyond the backends
 # exclusion already handled in common.cmake.
-
-#=================== SDL3-over-SDL2 shim ===================
-# SDL3 has no Wii U video driver upstream and devkitPro ships only wiiu-sdl2, so
-# there is no SDL3 to link. include/port/wiiu/sdl3compat provides an <SDL3/SDL.h>
-# that maps the 107 SDL3-only symbols libultraship uses onto SDL2 equivalents.
-# It is placed BEFORE the normal include dirs so #include <SDL3/SDL.h> resolves here.
-find_library(WIIU_SDL2_LIB SDL2 REQUIRED HINTS "$ENV{DEVKITPRO}/portlibs/wiiu/lib")
-list(APPEND ADDITIONAL_LIB_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/port/wiiu/sdl3compat)
-target_include_directories(ImGui BEFORE PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/port/wiiu/sdl3compat)
