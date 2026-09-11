@@ -48,5 +48,12 @@ target_sources(libultraship PRIVATE ${Source_Files__Window})
 
 file(GLOB_RECURSE Source_Files__Window__Gui RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "window/gui/*.cpp")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    # The input editor is a desktop/SDL configuration UI. Wii U input is
+    # supplied by the GX2/WPAD backend and must not pull this editor into the
+    # CafeOS link.
+    list(FILTER Source_Files__Window__Gui EXCLUDE REGEX "window/gui/InputEditorWindow\\.cpp")
+endif()
+
 source_group("window/gui" FILES ${Source_Files__Window__Gui})
 target_sources(libultraship PRIVATE ${Source_Files__Window__Gui})

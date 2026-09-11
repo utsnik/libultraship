@@ -22,6 +22,10 @@ bool gfx_wiiu_init_foreground(void);
 
 void gfx_wiiu_destroy_foreground(void);
 
+uint32_t gfx_wiiu_mem1_free(void);
+
+uint32_t gfx_wiiu_mem1_largest(void);
+
 void* gfx_wiiu_alloc_mem1(uint32_t size, uint32_t alignment);
 
 void gfx_wiiu_free_mem1(void* block);

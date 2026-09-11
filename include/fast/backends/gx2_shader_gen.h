@@ -28,6 +28,9 @@ struct ShaderGroup {
 
 int gx2GenerateShaderGroup(struct ShaderGroup* group, struct CCFeatures* cc_features);
 
+int gx2GenerateShaderGroupWithKey(struct ShaderGroup* group, struct CCFeatures* cc_features, uint64_t shader_id0,
+                                  uint32_t shader_id1);
+
 void gx2FreeShaderGroup(struct ShaderGroup* group);
 
 #ifdef __cplusplus

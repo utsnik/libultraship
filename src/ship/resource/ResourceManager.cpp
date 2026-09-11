@@ -1,4 +1,5 @@
 #include "ship/resource/ResourceManager.h"
+#include "port/wiiu/WiiUWatchdog.h"
 #include <spdlog/spdlog.h>
 #include "ship/resource/File.h"
 #include "ship/resource/archive/Archive.h"
@@ -8,6 +9,13 @@
 #include "ship/utils/Utils.h"
 #include "ship/config/ConsoleVariable.h"
 #include "ship/Context.h"
+#ifdef __WIIU__
+#include <coreinit/memory.h>
+#include <coreinit/memheap.h>
+#include <coreinit/memexpheap.h>
+#include <coreinit/memfrmheap.h>
+#include "fast/backends/gfx_wiiu.h"
+#endif
 
 namespace Ship {
 
@@ -75,7 +83,9 @@ bool ResourceManager::IsLoaded() {
 }
 
 std::shared_ptr<File> ResourceManager::LoadFileProcess(const std::string& filePath) {
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_ARCHIVE, filePath.c_str());
     auto file = mArchiveManager->LoadFile(filePath);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_ARCHIVE);
     if (file != nullptr) {
         SPDLOG_TRACE("Loaded File {} on ResourceManager", filePath);
     } else {
@@ -89,7 +99,9 @@ std::shared_ptr<File> ResourceManager::LoadFileProcess(const ResourceIdentifier&
         return LoadFileProcess(identifier.Path);
     }
     auto archive = identifier.Parent;
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_ARCHIVE, identifier.Path.c_str());
     auto file = archive->LoadFile(identifier.Path);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_ARCHIVE);
     if (file != nullptr) {
         SPDLOG_TRACE("Loaded File {} on ResourceManager", identifier.Path);
     } else {
@@ -100,6 +112,7 @@ std::shared_ptr<File> ResourceManager::LoadFileProcess(const ResourceIdentifier&
 
 std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceIdentifier& identifier, bool loadExact,
                                                                 std::shared_ptr<ResourceInitData> initData) {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_LOAD_RES, identifier.Path.c_str());
     // Check for and remove the OTR signature
     if (OtrSignatureCheck(identifier.Path.c_str())) {
         const auto newFilePath = identifier.Path.substr(7);
@@ -182,6 +195,75 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     }
 
     if (resource != nullptr) {
+        static uint32_t n = 0;
+        ++n;
+        if ((n % 50) == 0) {
+#ifdef __WIIU__
+            MEMHeapHandle mem1 = MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM1);
+            MEMHeapHandle mem2 = MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM2);
+            MEMHeapHandle fg = MEMGetBaseHeapHandle(MEM_BASE_HEAP_FG);
+
+            auto heapFreeFor = [](MEMHeapHandle heap) {
+                if (heap == nullptr) {
+                    return 0u;
+                }
+                if (heap->tag == MEM_EXPANDED_HEAP_TAG) {
+                    return MEMGetTotalFreeSizeForExpHeap(heap);
+                }
+                if (heap->tag == MEM_FRAME_HEAP_TAG) {
+                    return MEMGetAllocatableSizeForFrmHeapEx(heap, 4);
+                }
+                return 0u;
+            };
+            auto heapAllocatableFor = [](MEMHeapHandle heap) {
+                if (heap == nullptr) {
+                    return 0u;
+                }
+                if (heap->tag == MEM_EXPANDED_HEAP_TAG) {
+                    return MEMGetAllocatableSizeForExpHeapEx(heap, 4);
+                }
+                if (heap->tag == MEM_FRAME_HEAP_TAG) {
+                    return MEMGetAllocatableSizeForFrmHeapEx(heap, 4);
+                }
+                return 0u;
+            };
+
+            uint32_t mem1Addr = 0;
+            uint32_t mem1Size = 0;
+            int mem1Bound = OSGetMemBound(OS_MEM1, &mem1Addr, &mem1Size);
+            uint32_t mem2Addr = 0;
+            uint32_t mem2Size = 0;
+            int mem2Bound = OSGetMemBound(OS_MEM2, &mem2Addr, &mem2Size);
+            uint32_t fgAddr = 0;
+            uint32_t fgSize = 0;
+            BOOL fgBound = OSGetForegroundBucketFreeArea(&fgAddr, &fgSize);
+
+            uint32_t mem1Free = gfx_wiiu_mem1_free();
+            uint32_t mem1Largest = gfx_wiiu_mem1_largest();
+            uint32_t fgFree = heapFreeFor(fg);
+            uint32_t fgAlloc = heapAllocatableFor(fg);
+#else
+            uint32_t mem1Free = 0;
+            uint32_t mem1Largest = 0;
+            uint32_t fgFree = 0;
+            uint32_t fgAlloc = 0;
+#endif
+#ifdef __WIIU__
+            SPDLOG_INFO(
+                "PROBE/RES: n={} last={} handles(mem1={},mem2={},fg={}) mem1Free={} mem1Largest={} "
+                "heapFree(fg={}) heapAlloc(fg={}) memBound(mem1 rc={} addr=0x{:08X} size={} mem2 rc={} addr=0x{:08X} "
+                "size={}) fgFreeArea(ok={} addr=0x{:08X} size={})",
+                n, identifier.Path, static_cast<const void*>(mem1), static_cast<const void*>(mem2),
+                static_cast<const void*>(fg), mem1Free, mem1Largest, fgFree, fgAlloc, mem1Bound, mem1Addr, mem1Size,
+                mem2Bound, mem2Addr, mem2Size, static_cast<int>(fgBound), fgAddr, fgSize);
+#else
+            SPDLOG_INFO("PROBE/RES: n={} last={} mem1Free={} mem1Largest={} heapFree(fg={}) heapAlloc(fg={})", n,
+                        identifier.Path, mem1Free, mem1Largest, fgFree, fgAlloc);
+#endif
+        }
+        if (n > 500) {
+            SPDLOG_INFO("PROBE/RES: name={}", identifier.Path);
+        }
         SPDLOG_TRACE("Loaded Resource {} on ResourceManager", identifier.Path);
     } else {
         SPDLOG_TRACE("Resource load FAILED {} on ResourceManager", identifier.Path);

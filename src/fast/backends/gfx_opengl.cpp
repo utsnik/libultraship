@@ -19,6 +19,21 @@
 #endif
 
 #include "fast/backends/gfx_opengl.h"
+#ifdef __vita__
+#include "fast/backends/gfx_vita_shader.h"
+#define HAVE_GL_HEADERS 1
+#include <vitaGL.h>
+#undef HAVE_GL_HEADERS
+// vitaGL does not export the optional GLES2 detach entry point. Detaching
+// after linking is not required by the ImGui backend, so provide its legal
+// no-op fallback.
+extern "C" void glDetachShader(unsigned int, unsigned int) {
+}
+#ifndef GL_CG_VERTEX_SHADER_EXT
+#define GL_CG_VERTEX_SHADER_EXT 0x890E
+#define GL_CG_FRAGMENT_SHADER_EXT 0x890F
+#endif
+#endif
 #include "ship/window/gui/Gui.h"
 #include <prism/processor.h>
 #include <fstream>
@@ -73,6 +88,16 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
 
         GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
         glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
+#ifdef __vita__
+        if (mCurrentShaderProgram->usedTextures[0]) {
+            glUniform2f(mCurrentShaderProgram->tex_size_location[0], textures[mCurrentTextureIds[0]].width,
+                        textures[mCurrentTextureIds[0]].height);
+        }
+        if (mCurrentShaderProgram->usedTextures[1]) {
+            glUniform2f(mCurrentShaderProgram->tex_size_location[1], textures[mCurrentTextureIds[1]].width,
+                        textures[mCurrentTextureIds[1]].height);
+        }
+#endif
     }
 }
 
@@ -279,7 +304,12 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "SHADER_COMBINED", SHADER_COMBINED },
         { "SHADER_NOISE", SHADER_NOISE },
         { "o_three_point_filtering", mCurrentFilterMode == FILTER_THREE_POINT },
+#ifdef __vita__
+        { "append_formula", (InvokeFunc)VitaAppendFormula },
+        { "vita_texcoord_id", (InvokeFunc)VitaTexcoordId },
+#else
         { "append_formula", (InvokeFunc)append_formula },
+#endif
 #ifdef __APPLE__
         { "GLSL_VERSION", "#version 410 core" },
         { "attr", "in" },
@@ -309,10 +339,19 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
     init->ByteOrder = Ship::Endianness::Native;
     init->Format = RESOURCE_FORMAT_BINARY;
     const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
-    std::string path = "shaders/opengl/default.shader.glsl";
+    std::string path =
+#ifdef __vita__
+        "shaders/vita/default.shader.cg";
+#else
+        "shaders/opengl/default.shader.glsl";
+#endif
 
     if (nullptr != shaderName) {
+#ifdef __vita__
+        path = std::string(shaderName) + ".cg";
+#else
         path = std::string(shaderName) + ".glsl";
+#endif
     }
 
     auto res = static_pointer_cast<Ship::Shader>(
@@ -326,6 +365,9 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
     auto shader = static_cast<std::string*>(res->GetRawPointer());
     processor.load(*shader);
     processor.bind_include_loader(opengl_include_fs);
+#ifdef __vita__
+    ResetVitaTexcoordId();
+#endif
     auto result = processor.process();
     // SPDLOG_INFO("=========== FRAGMENT SHADER ============");
     // SPDLOG_INFO(result);
@@ -351,7 +393,9 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
                                      { "o_alpha", cc_features.opt_alpha },
                                      { "o_inputs", cc_features.numInputs },
                                      { "update_floats", (InvokeFunc)UpdateFloats },
-#ifdef __APPLE__
+#ifdef __vita__
+                                     { "vita_texcoord_id", (InvokeFunc)VitaTexcoordId }
+#elif defined(__APPLE__)
                                      { "GLSL_VERSION", "#version 410 core" },
                                      { "attr", "in" },
                                      { "out", "out" },
@@ -375,10 +419,19 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
     init->ByteOrder = Ship::Endianness::Native;
     init->Format = RESOURCE_FORMAT_BINARY;
     const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
-    std::string path = "shaders/opengl/default.shader.glsl";
+    std::string path =
+#ifdef __vita__
+        "shaders/vita/default.shader.cg";
+#else
+        "shaders/opengl/default.shader.glsl";
+#endif
 
     if (nullptr != shaderName) {
+#ifdef __vita__
+        path = std::string(shaderName) + ".cg";
+#else
         path = std::string(shaderName) + ".glsl";
+#endif
     }
 
     auto res = static_pointer_cast<Ship::Shader>(
@@ -392,6 +445,9 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
     auto shader = static_cast<std::string*>(res->GetRawPointer());
     processor.load(*shader);
     processor.bind_include_loader(opengl_include_fs);
+#ifdef __vita__
+    ResetVitaTexcoordId();
+#endif
     auto result = processor.process();
     // SPDLOG_INFO("=========== VERTEX SHADER ============");
     // SPDLOG_INFO(result);
@@ -412,8 +468,13 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     const GLint lengths[2] = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
     GLint success;
 
+#ifdef __vita__
+    GLuint vertex_shader = glCreateShader(GL_CG_VERTEX_SHADER_EXT);
+    glShaderSource(vertex_shader, 1, &sources[0], nullptr);
+#else
     GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
+#endif
     glCompileShader(vertex_shader);
     glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
     if (!success) {
@@ -426,8 +487,13 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         abort();
     }
 
+#ifdef __vita__
+    GLuint fragment_shader = glCreateShader(GL_CG_FRAGMENT_SHADER_EXT);
+    glShaderSource(fragment_shader, 1, &sources[1], nullptr);
+#else
     GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
+#endif
     glCompileShader(fragment_shader);
     glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
     if (!success) {
@@ -508,6 +574,10 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
     prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
     prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
+#ifdef __vita__
+    prg->tex_size_location[0] = glGetUniformLocation(shader_program, "texSize0");
+    prg->tex_size_location[1] = glGetUniformLocation(shader_program, "texSize1");
+#endif
 
     LoadShader(prg);
 
@@ -708,7 +778,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 }
 
 void GfxRenderingAPIOGL::Init() {
-#if !defined(__linux__) && !defined(__OpenBSD__)
+#if !defined(__linux__) && !defined(__OpenBSD__) && !defined(__vita__)
     glewInit();
 #endif
 
@@ -809,7 +879,11 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
             } else {
                 glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
+#ifdef __vita__
+                glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB8, width, height);
+#else
                 glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGB8, width, height);
+#endif
                 glBindRenderbuffer(GL_RENDERBUFFER, 0);
                 glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
             }
@@ -821,7 +895,11 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
             if (msaa_level <= 1) {
                 glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
             } else {
+#ifdef __vita__
+                glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+#else
                 glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_DEPTH24_STENCIL8, width, height);
+#endif
             }
             glBindRenderbuffer(GL_RENDERBUFFER, 0);
         }

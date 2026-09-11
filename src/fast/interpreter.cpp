@@ -1,6 +1,7 @@
 #define NOMINMAX
 
 #include <math.h>
+#include "port/wiiu/WiiUWatchdog.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,9 +9,9 @@
 #include <assert.h>
 #include <stdio.h>
 #ifndef _WIN32
-#ifndef __WIIU__
+#if !defined(__WIIU__) && !defined(__vita__)
 #include <dlfcn.h>
-#endif // wut has no dynamic loader; Wii U links everything statically.
+#endif // Wii U and Vita link everything statically and have no dladdr.
 #endif
 
 #include <any>
@@ -137,20 +138,42 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
 void Interpreter::Flush() {
+    static bool trace_first_flush = true;
+    const bool trace = trace_first_flush;
     if (mBufVboLen > 0) {
+        if (trace) {
+            SPDLOG_INFO("fast_interpreter: first frame Flush begin vertices={} triangles={}", mBufVboLen,
+                        mBufVboNumTris);
+        }
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
+        if (trace) {
+            SPDLOG_INFO("fast_interpreter: first frame Flush DrawTriangles complete");
+            trace_first_flush = false;
+        }
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
 }
 
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
+    static bool trace_first_shader_path = true;
+    const bool trace = trace_first_shader_path;
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame shader lookup begin id0=0x{:016X} id1=0x{:016X}", id0, id1);
+    }
     ShaderProgram* prg = mRapi->LookupShader(id0, id1);
     if (prg == nullptr) {
+        if (trace) {
+            SPDLOG_INFO("fast_interpreter: first frame shader lookup miss; CreateAndLoadNewShader ...");
+        }
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
         prg = mRapi->CreateAndLoadNewShader(id0, id1);
         mRenderingState.mShaderProgram = prg;
+    }
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame shader lookup complete result={}", static_cast<const void*>(prg));
+        trace_first_shader_path = false;
     }
     return prg;
 }
@@ -1227,6 +1250,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 }
 
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
+    static bool trace_first_texture_import = true;
     uint8_t fmt = mRdp->texture_tile[tile].fmt;
     uint8_t siz = mRdp->texture_tile[tile].siz;
     uint32_t texFlags = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags;
@@ -1234,7 +1258,16 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     uint8_t paletteIndex = mRdp->texture_tile[tile].palette;
     uint32_t origSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
 
+    if (trace_first_texture_import) {
+        SPDLOG_INFO("fast_interpreter: first frame texture import slot={} tile={} fmt={} siz={} replacement={}", i,
+                    tile, fmt, siz, importReplacement);
+        trace_first_texture_import = false;
+    }
+
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
+#ifdef __WIIU__
+    WDOG_TEXTURE_PATH(metadata->resource != nullptr ? metadata->resource->GetInitData()->Path.c_str() : nullptr);
+#endif
     const uint8_t* origAddr =
         importReplacement && (metadata->resource != nullptr)
             ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
@@ -1756,6 +1789,12 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
 }
 
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    static bool trace_first_triangle = true;
+    if (trace_first_triangle) {
+        SPDLOG_INFO("fast_interpreter: first frame GfxSpTri1 begin vtx=({}, {}, {}) rect={}", vtx1_idx, vtx2_idx,
+                    vtx3_idx, is_rect);
+        trace_first_triangle = false;
+    }
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
@@ -3953,9 +3992,10 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
     HMODULE module = nullptr;
     return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                               reinterpret_cast<LPCSTR>(addr), &module) != 0;
-#elif defined(__WIIU__)
-    // The Wii U links everything statically into a single RPX, so there are no
-    // dynamically loaded objects to interrogate and wut provides no dladdr.
+#elif defined(__WIIU__) || defined(__vita__)
+    // The Wii U and Vita link everything statically into a single executable,
+    // so there are no dynamically loaded objects to interrogate and their SDKs
+    // provide no dladdr.
     // Report "not a loaded object", i.e. treat the value as a genuine N64
     // segmented address. That is the conservative answer: segmented addresses are
     // overwhelmingly what lands in this range, and misreading one as a host
@@ -4863,9 +4903,18 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
 }
 
 static void gfx_step() {
+    static bool trace_first_display_list_step = true;
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+    bool has_handler = false;
+
+    if (trace_first_display_list_step) {
+        SPDLOG_INFO("fast_interpreter: first frame display-list step opcode=0x{:02X} name={} cmd={} w0=0x{:08X} w1=0x{:08X}",
+                    static_cast<uint8_t>(opcode), GfxGetOpcodeName(opcode), static_cast<const void*>(cmd),
+                    cmd->words.w0, cmd->words.w1);
+        trace_first_display_list_step = false;
+    }
 
 #ifdef USE_GBI_TRACE
     if (cmd->words.trace.valid &&
@@ -4889,6 +4938,7 @@ static void gfx_step() {
     }
 
     if (otrHandlers.contains(opcode)) {
+        has_handler = true;
         // OTR filepath handlers expect w1 to be a valid string pointer.
         // Guard against null or N64-segment addresses that would crash in strlen/strncmp.
         if (opcode == OTR_G_VTX_OTR_FILEPATH || opcode == OTR_G_SETTIMG_OTR_FILEPATH ||
@@ -4908,20 +4958,28 @@ static void gfx_step() {
             return;
         }
     } else if (rdpHandlers.contains(opcode)) {
+        has_handler = true;
         if (rdpHandlers.at(opcode).second(&cmd)) {
             return;
         }
     } else if (ucode_handler_index < ucode_handlers.size()) {
         if (ucode_handlers[ucode_handler_index]->contains(opcode)) {
+            has_handler = true;
             if (ucode_handlers[ucode_handler_index]->at(opcode).second(&cmd)) {
                 return;
             }
-        } else {
-            SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, for loaded ucode: {}", (uint8_t)opcode,
-                            (uint32_t)ucode_handler_index);
         }
-    } else {
-        SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, invalid ucode: {}", (uint8_t)opcode, (uint32_t)ucode_handler_index);
+    }
+
+    if (!has_handler) {
+#ifdef __WIIU__
+        Ship::WiiU::Watchdog::Emit("FAST3D: unhandled opcode=0x%02X w0=0x%08X w1=0x%08X cmd=%p depth=%u\n",
+                                   (unsigned int)(uint8_t)opcode, (unsigned int)cmd->words.w0,
+                                   (unsigned int)cmd->words.w1, (const void*)cmd,
+                                   (unsigned int)g_exec_stack.cmd_stack.size());
+#endif
+        g_exec_stack.stop();
+        return;
     }
 
     ++cmd;
@@ -5131,6 +5189,16 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+    static uint32_t n = 0;
+    ++n;
+    SPDLOG_INFO("PROBE/FRAME: Run enter #{}", n);
+    WDOG_FRAME(n);
+    static bool trace_first_run = true;
+    const bool trace = trace_first_run;
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame Run entered after IsFrameReady returned true commands={}",
+                    static_cast<const void*>(commands));
+    }
     SpReset();
 
     mGetPixelDepthPending.clear();
@@ -5140,17 +5208,39 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame Run mRapi->StartFrame ...");
+    }
     mRapi->StartFrame();
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame Run mRapi->StartFrame complete; framebuffer setup ...");
+    }
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame Run framebuffer setup complete; GfxExecStack::start ...");
+    }
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
 
     auto dbg = mGfxDebugger;
     g_exec_stack.start((F3DGfx*)commands);
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame GfxExecStack::start complete; display-list processing ...");
+    }
+    uint64_t steps = 0;
+    uint32_t spin_logs = 0;
     while (!g_exec_stack.cmd_stack.empty()) {
+        ++steps;
         auto cmd = g_exec_stack.cmd_stack.top();
+        WDOG_STEP((uint32_t)(cmd->words.w0 >> 24), (const void*)cmd, (uint32_t)steps);
+
+        if (steps > 2000000 && (steps % 500000) == 0 && spin_logs < 20) {
+            SPDLOG_INFO("PROBE/DL: SPIN steps={} cmd={} opcode=0x{:02X} depth={}", steps,
+                        (const void*)cmd, (unsigned)(cmd->words.w0 >> 24), (int)g_exec_stack.cmd_stack.size());
+            ++spin_logs;
+        }
 
         if (dbg->IsDebugging()) {
             g_exec_stack.gfx_path.push_back(cmd);
@@ -5168,8 +5258,17 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         }
         gfx_step();
     }
+    SPDLOG_INFO("PROBE/DL: frame={} steps={} done", n, steps);
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_FLUSH, "after display-list walk");
+
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame display-list processing complete; Flush ...");
+    }
 
     Flush();
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame Run Flush complete");
+    }
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
@@ -5193,13 +5292,39 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
         assert(0 && "active framebuffer was never reset back to original");
     }
+
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame Run complete");
+        trace_first_run = false;
+    }
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_FLUSH);
+    SPDLOG_INFO("PROBE/FRAME: Run exit #{}", n);
 }
 
 void Interpreter::EndFrame() {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_ENDFRAME, nullptr);
+    static bool trace_first_end_frame = true;
+    const bool trace = trace_first_end_frame;
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame EndFrame mRapi->EndFrame ...");
+    }
     mRapi->EndFrame();
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame EndFrame mRapi->EndFrame complete; SwapBuffersBegin ...");
+    }
     mWapi->SwapBuffersBegin();
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame EndFrame SwapBuffersBegin complete; FinishRender ...");
+    }
     mRapi->FinishRender();
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame EndFrame FinishRender complete; SwapBuffersEnd ...");
+    }
     mWapi->SwapBuffersEnd();
+    if (trace) {
+        SPDLOG_INFO("fast_interpreter: first frame EndFrame SwapBuffersEnd complete");
+        trace_first_end_frame = false;
+    }
 }
 
 void gfx_set_target_ucode(UcodeHandlers ucode) {

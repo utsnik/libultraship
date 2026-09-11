@@ -33,11 +33,13 @@ namespace Fast {
  */
 struct ShaderProgram {
     ShaderGroup group;
+    uint64_t shader_id0;
+    uint32_t shader_id1;
     uint8_t num_inputs;
     bool used_textures[2];
     bool used_noise;
     uint32_t window_params_offset;
-    int32_t samplers_location[2];
+    int32_t samplers_location[6];
 };
 
 

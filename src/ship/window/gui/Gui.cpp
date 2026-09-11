@@ -101,9 +101,11 @@ void Gui::Init() {
         mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     }
 
-    GetGuiWindow("Stats")->Init();
-    GetGuiWindow("Console")->Init();
-    GetGuiWindow("FileBrowser")->Init();
+    for (const char* name : { "Stats", "Console", "FileBrowser" }) {
+        if (auto window = GetGuiWindow(name)) {
+            window->Init();
+        }
+    }
     GetGameOverlay()->Init();
 
     Context::GetRawInstance()->GetResourceManager()->GetResourceLoader()->RegisterResourceFactory(
@@ -247,9 +249,11 @@ void Gui::DrawMenu() {
     // Mac interprets this as cmd+r when io.ConfigMacOSXBehavior is on (on by default)
     if ((ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl)) &&
         ImGui::IsKeyPressed(ImGuiKey_R, false)) {
-        std::reinterpret_pointer_cast<ConsoleWindow>(
-            Context::GetRawInstance()->GetWindow()->GetGui()->GetGuiWindow("Console"))
-            ->Dispatch("reset");
+        auto consoleWindow = std::reinterpret_pointer_cast<ConsoleWindow>(
+            Context::GetRawInstance()->GetWindow()->GetGui()->GetGuiWindow("Console"));
+        if (consoleWindow) {
+            consoleWindow->Dispatch("reset");
+        }
     }
 
     if (GetMenuBar()) {

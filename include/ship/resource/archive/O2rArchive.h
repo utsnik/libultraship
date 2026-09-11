@@ -75,7 +75,11 @@ class O2rArchive final : virtual public Archive {
     zip_t* GetZipHandle();
     /** @brief Returns a zip_t* handle back to the pool for reuse. */
     void ReleaseZipHandle(zip_t* handle);
+    /** @brief Opens a new libzip handle from the retained archive buffer. */
+    zip_t* OpenZipFromBuffer(int flags, zip_source_t** sourceOut = nullptr);
     zip_t* mZipArchive;
+    zip_source_t* mZipArchiveSource;
+    std::vector<uint8_t> mArchiveBuffer;
     std::mutex mPoolMutex;
     std::vector<zip_t*> mZipArchivePool;
 };

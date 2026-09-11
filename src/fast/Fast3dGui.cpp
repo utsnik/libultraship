@@ -10,6 +10,12 @@
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/resource/File.h"
 
+#ifdef __WIIU__
+#include "fast/backends/imgui_impl_gx2.h"
+#include "fast/backends/imgui_impl_wiiu.h"
+#include <spdlog/spdlog.h>
+#endif
+
 #ifdef __APPLE__
 #include <SDL_hints.h>
 #include <SDL_video.h>
@@ -89,6 +95,13 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
 
 void Fast3dGui::ImGuiWMInit() {
     switch (mImpl.Backend) {
+#ifdef __WIIU__
+        case WindowBackend::FAST3D_WIIU_GX2:
+            SPDLOG_INFO("Fast3dGui::ImGuiWMInit: ImGui_ImplWiiU_Init ...");
+            ImGui_ImplWiiU_Init();
+            SPDLOG_INFO("Fast3dGui::ImGuiWMInit: ImGui_ImplWiiU_Init ok");
+            break;
+#endif
         case WindowBackend::FAST3D_SDL_OPENGL:
             SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
             if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
@@ -146,6 +159,13 @@ void Fast3dGui::ImGuiBackendInit() {
     auto window = Ship::Context::GetRawInstance()->GetWindow();
     mInterpreter = std::dynamic_pointer_cast<Fast3dWindow>(window)->GetInterpreterWeak();
     switch (mImpl.Backend) {
+#ifdef __WIIU__
+        case WindowBackend::FAST3D_WIIU_GX2:
+            SPDLOG_INFO("Fast3dGui::ImGuiBackendInit: ImGui_ImplGX2_Init ...");
+            ImGui_ImplGX2_Init();
+            SPDLOG_INFO("Fast3dGui::ImGuiBackendInit: ImGui_ImplGX2_Init ok");
+            break;
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
 #ifdef __APPLE__
@@ -201,6 +221,21 @@ void Fast3dGui::ImGuiBackendShutdown() {
 
 void Fast3dGui::ImGuiBackendNewFrame() {
     switch (mImpl.Backend) {
+#ifdef __WIIU__
+        case WindowBackend::FAST3D_WIIU_GX2: {
+            static bool trace_first_renderer_new_frame = true;
+            const bool trace = trace_first_renderer_new_frame;
+            if (trace) {
+                SPDLOG_INFO("Fast3dGui::StartDraw: first frame ImGui_ImplGX2_NewFrame begin");
+            }
+            ImGui_ImplGX2_NewFrame();
+            if (trace) {
+                SPDLOG_INFO("Fast3dGui::StartDraw: first frame ImGui_ImplGX2_NewFrame complete");
+                trace_first_renderer_new_frame = false;
+            }
+            break;
+        }
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplOpenGL3_NewFrame();
@@ -227,6 +262,32 @@ void Fast3dGui::ImGuiBackendNewFrame() {
 
 void Fast3dGui::ImGuiWMNewFrame() {
     switch (mImpl.Backend) {
+#ifdef __WIIU__
+        case WindowBackend::FAST3D_WIIU_GX2: {
+            static bool trace_first_platform_new_frame = true;
+            const bool trace = trace_first_platform_new_frame;
+
+            // SDL's platform backend fills these fields from the drawable
+            // size before ImGui::NewFrame().  Wii U has no SDL window, so do
+            // the equivalent explicitly from the fixed GX2 scan-out size.
+            // Gui::DrawMenu() uses the main viewport to size the dock, and
+            // Fast3dGui::CalculateGameViewport() uses that dock size before
+            // applying gAdvancedResolution.
+            ImGuiIO& io = ImGui::GetIO();
+            io.DisplaySize = ImVec2(static_cast<float>(mImpl.Gx2.Width), static_cast<float>(mImpl.Gx2.Height));
+            io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+
+            if (trace) {
+                SPDLOG_INFO("Fast3dGui::StartDraw: first frame ImGui_ImplWiiU_NewFrame begin");
+            }
+            ImGui_ImplWiiU_NewFrame();
+            if (trace) {
+                SPDLOG_INFO("Fast3dGui::StartDraw: first frame ImGui_ImplWiiU_NewFrame complete");
+                trace_first_platform_new_frame = false;
+            }
+            break;
+        }
+#endif
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
 #ifndef __WIIU__
@@ -257,6 +318,11 @@ void Fast3dGui::RefreshImGuiGamepads() {
 
 void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
     switch (mImpl.Backend) {
+#ifdef __WIIU__
+        case WindowBackend::FAST3D_WIIU_GX2:
+            ImGui_ImplGX2_RenderDrawData(data);
+            break;
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplOpenGL3_RenderDrawData(data);

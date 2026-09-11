@@ -36,6 +36,19 @@
 #include <SDL2/SDL_opengles2.h>
 #endif
 
+#ifdef __vita__
+#include <vitasdk.h>
+extern "C" {
+GLboolean vglInitWithCustomThreshold(int pool_size, int width, int height, int ram_threshold, int cdram_threshold,
+                                     int phycont_threshold, int cdlg_threshold, SceGxmMultisampleMode msaa);
+void vglSetParamBufferSize(uint32_t size);
+void vglUseTripleBuffering(GLboolean usage);
+void vglSetVertexPoolSize(uint32_t size);
+void vglSwapBuffers(GLboolean);
+void vglSetDisplayBufferCount(int count);
+}
+#endif
+
 #include "ship/window/gui/Gui.h"
 #include "fast/Fast3dGui.h"
 
@@ -322,11 +335,22 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     mWindowWidth = width;
     mWindowHeight = height;
 
+#ifdef __vita__
+    mWindowWidth = 960;
+    mWindowHeight = 544;
+#endif
+
 #if SDL_VERSION_ATLEAST(2, 24, 0)
     /* fix DPI scaling issues on Windows */
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
+#ifdef __vita__
+    vglSetParamBufferSize(8 * 1024 * 1024);
+    vglUseTripleBuffering(GL_TRUE);
+    vglSetDisplayBufferCount(3);
+    vglInitWithCustomThreshold(0, 960, 544, 4 * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_4X);
+#endif
     SDL_Init(SDL_INIT_VIDEO);
 
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
@@ -405,11 +429,13 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     }
 
     if (use_opengl) {
+#ifndef __vita__
         SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
 
         if (startFullScreen) {
             SetFullscreenImpl(true, false);
         }
+#endif
 
         mCtx = SDL_GL_CreateContext(mWnd);
 
@@ -664,6 +690,30 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
 }
 
 void GfxWindowBackendSDL2::HandleEvents() {
+#ifdef __vita__
+    static uint32_t oldpad = 0;
+    SceCtrlData pad;
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+#define IS_PRESSED(x) ((pad.buttons & (x)) && !(oldpad & (x)))
+#define IS_RELEASED(x) ((oldpad & (x)) && !(pad.buttons & (x)))
+#define FAKE_KEY_EVENT(ev_type, ev_scancode, ev_keycode)                                                          \
+    {                                                                                                               \
+        SDL_Event sdlevent = {};                                                                                    \
+        sdlevent.type = (ev_type);                                                                                   \
+        sdlevent.key.keysym.scancode = (ev_scancode);                                                                \
+        sdlevent.key.keysym.sym = (ev_keycode);                                                                      \
+        SDL_PushEvent(&sdlevent);                                                                                    \
+    }
+    if (IS_PRESSED(SCE_CTRL_SELECT)) {
+        FAKE_KEY_EVENT(SDL_KEYDOWN, SDL_SCANCODE_F1, SDLK_F1);
+    } else if (IS_RELEASED(SCE_CTRL_SELECT)) {
+        FAKE_KEY_EVENT(SDL_KEYUP, SDL_SCANCODE_F1, SDLK_F1);
+    }
+    oldpad = pad.buttons;
+#undef FAKE_KEY_EVENT
+#undef IS_RELEASED
+#undef IS_PRESSED
+#endif
     SDL_Event event;
     SDL_PumpEvents();
     while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_CONTROLLERDEVICEADDED - 1) > 0) {
@@ -695,6 +745,26 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
 }
 
 void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
+#ifdef __vita__
+    if (FRAME_INTERVAL_US_DENOMINATOR >= 60) {
+        return;
+    }
+
+    uint64_t t = sceKernelGetProcessTimeLow();
+    const int64_t next = previous_time + FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;
+    const int64_t left = next - t;
+    if (left > 0) {
+        sceKernelDelayThread(static_cast<SceUInt>(left));
+    }
+
+    t = sceKernelGetProcessTimeLow();
+    if (left > 0 && t - next < 1000) {
+        // In case it takes some time for the application to wake up after sleep,
+        // or the timer is inaccurate, do not let that slow down the framerate.
+        t = next;
+    }
+    previous_time = t;
+#else
     uint64_t t = qpc_to_100ns(SDL_GetPerformanceCounter());
 
     const int64_t next = previous_time + 10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;
@@ -735,6 +805,7 @@ void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
         t = next;
     }
     previous_time = t;
+#endif
 }
 
 void GfxWindowBackendSDL2::SwapBuffersBegin() {

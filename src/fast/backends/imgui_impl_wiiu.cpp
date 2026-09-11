@@ -3,6 +3,7 @@
 #include "imgui_internal.h"
 #include "fast/backends/imgui_impl_wiiu.h"
 #include <stdlib.h> // malloc/free
+#include <spdlog/spdlog.h>
 
 // Software keyboard
 #include <nn/swkbd.h>
@@ -87,6 +88,23 @@ void     ImGui_ImplWiiU_Shutdown()
     io.BackendPlatformName = NULL;
     io.BackendPlatformUserData = NULL;
     IM_DELETE(bd);
+}
+
+void     ImGui_ImplWiiU_NewFrame()
+{
+    // Input is polled by gfx_wiiu_handle_events(); this frame hook must not
+    // touch SDL or wait on any Wii U service.
+    if (!ImGui::GetCurrentContext())
+    {
+        SPDLOG_ERROR("ImGui_ImplWiiU_NewFrame: no current ImGui context");
+        return;
+    }
+
+    if (!ImGui_ImplWiiU_GetBackendData())
+    {
+        SPDLOG_ERROR("ImGui_ImplWiiU_NewFrame: platform backend is not initialized");
+        return;
+    }
 }
 
 static void ImGui_ImplWiiU_UpdateKeyboardInput(ImGui_ImplWiiU_ControllerInput* input)

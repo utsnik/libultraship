@@ -5,6 +5,7 @@
 #ifdef ENABLE_GX2
 
 #include "fast/backends/gfx_gx2.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 #include "ship/window/Window.h"
 
@@ -12,6 +13,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <malloc.h>
+#include <spdlog/spdlog.h>
 
 #include <map>
 
@@ -95,6 +97,7 @@ struct Framebuffer {
 };
 
 static struct Framebuffer main_framebuffer;
+static std::map<int, struct Framebuffer*> framebuffer_registry = {{0, &main_framebuffer}};
 static GX2DepthBuffer depthReadBuffer;
 static struct Framebuffer* current_framebuffer;
 
@@ -110,9 +113,10 @@ static uint8_t* draw_buffer = nullptr;
 static uint8_t* draw_ptr = nullptr;
 
 static uint32_t frame_count;
+static bool gfx_gx2_trace_first_frame = true;
+static bool gfx_gx2_trace_first_draw = true;
 static float current_noise_scale;
 static FilteringMode current_filter_mode = FILTER_LINEAR;
-
 static BOOL current_depth_test = TRUE;
 static BOOL current_depth_write = TRUE;
 static GX2CompareFunction current_depth_compare_function = GX2_COMPARE_FUNC_LESS;
@@ -161,6 +165,7 @@ static int gfx_gx2_get_max_texture_size() {
 }
 
 static void gfx_gx2_init_framebuffer(struct Framebuffer* buffer, uint32_t width, uint32_t height) {
+    SPDLOG_INFO("gfx_gx2: framebuffer descriptor setup {}x{} ...", width, height);
     memset(&buffer->color_buffer, 0, sizeof(GX2ColorBuffer));
     buffer->color_buffer.surface.use = GX2_SURFACE_USE_TEXTURE_COLOR_BUFFER_TV;
     buffer->color_buffer.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
@@ -185,6 +190,7 @@ static void gfx_gx2_init_framebuffer(struct Framebuffer* buffer, uint32_t width,
     buffer->depth_buffer.surface.tileMode = GX2_TILE_MODE_DEFAULT;
     buffer->depth_buffer.viewNumSlices = 1;
     buffer->depth_buffer.depthClear = 1.0f;
+    SPDLOG_INFO("gfx_gx2: framebuffer descriptor setup {}x{} complete", width, height);
 }
 
 static struct GfxClipParameters gfx_gx2_get_clip_parameters(void) {
@@ -192,9 +198,18 @@ static struct GfxClipParameters gfx_gx2_get_clip_parameters(void) {
 }
 
 static void gfx_gx2_set_uniforms(struct ShaderProgram* prg) {
+    static bool trace_first_uniform_upload = true;
+    const bool trace = trace_first_uniform_upload;
     float window_params_array[4] = { current_noise_scale, (float)frame_count, 0.0f, 0.0f };
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame shader: GX2SetPixelUniformReg ... offset={}", prg->window_params_offset);
+    }
     GX2SetPixelUniformReg(prg->window_params_offset, 4, window_params_array);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame shader: GX2SetPixelUniformReg complete");
+        trace_first_uniform_upload = false;
+    }
 }
 
 static void gfx_gx2_unload_shader(struct ShaderProgram* old_prg) {
@@ -202,26 +217,75 @@ static void gfx_gx2_unload_shader(struct ShaderProgram* old_prg) {
 }
 
 static void gfx_gx2_load_shader(struct ShaderProgram* new_prg) {
+    static bool trace_first_shader_load = true;
+    const bool trace = trace_first_shader_load;
     current_shader_program = new_prg;
 
-    GX2SetFetchShader(&new_prg->group.fetchShader);
-    GX2SetVertexShader(&new_prg->group.vertexShader);
-    GX2SetPixelShader(&new_prg->group.pixelShader);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader load: GX2SetFetchShader ...");
+    }
+    {
+        WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_FETCH_SHADER,
+                       "shader_id0=0x%016llX shader_id1=0x%08X", static_cast<unsigned long long>(new_prg->shader_id0),
+                       static_cast<unsigned int>(new_prg->shader_id1));
+        GX2SetFetchShader(&new_prg->group.fetchShader);
+    }
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader load: GX2SetFetchShader complete; GX2SetVertexShader ...");
+    }
+    {
+        WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_VERTEX_SHADER,
+                       "shader_id0=0x%016llX shader_id1=0x%08X", static_cast<unsigned long long>(new_prg->shader_id0),
+                       static_cast<unsigned int>(new_prg->shader_id1));
+        GX2SetVertexShader(&new_prg->group.vertexShader);
+    }
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader load: GX2SetVertexShader complete; GX2SetPixelShader ...");
+    }
+    {
+        WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_PIXEL_SHADER,
+                       "shader_id0=0x%016llX shader_id1=0x%08X", static_cast<unsigned long long>(new_prg->shader_id0),
+                       static_cast<unsigned int>(new_prg->shader_id1));
+        GX2SetPixelShader(&new_prg->group.pixelShader);
+    }
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader load: GX2SetPixelShader complete; uniforms ...");
+    }
 
     gfx_gx2_set_uniforms(new_prg);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader load complete");
+        trace_first_shader_load = false;
+    }
 }
 
 static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_id0, uint32_t shader_id1) {
+    static bool trace_first_shader_creation = true;
+    const bool trace = trace_first_shader_creation;
     struct CCFeatures cc_features;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader creation begin id0=0x{:016X} id1=0x{:08X}", shader_id0, shader_id1);
+    }
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
     struct ShaderProgram* prg = &shader_program_pool[std::make_pair(shader_id0, shader_id1)];
+    prg->shader_id0 = shader_id0;
+    prg->shader_id1 = shader_id1;
 
     printf("Generating shader: %016llx-%08x\n", shader_id0, shader_id1);
-    if (gx2GenerateShaderGroup(&prg->group, &cc_features) != 0) {
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader creation: GX2 shader compile/generate (gx2GenerateShaderGroup) ...");
+    }
+    const int shader_result = gx2GenerateShaderGroupWithKey(&prg->group, &cc_features, shader_id0, shader_id1);
+    if (shader_result != 0) {
+        SPDLOG_ERROR("gfx_gx2: shader creation: gx2GenerateShaderGroup failed result={}", shader_result);
         printf("Failed to generate shader\n");
         current_shader_program = nullptr;
+        trace_first_shader_creation = false;
         return nullptr;
+    }
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader creation: GX2 shader compile/generate returned; shader upload/invalidate path ...");
     }
 
     prg->num_inputs = cc_features.numInputs;
@@ -229,6 +293,9 @@ static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_
     prg->used_textures[1] = cc_features.usedTextures[1];
 
     gfx_gx2_load_shader(prg);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader creation: sampler/uniform lookup ...");
+    }
 
     prg->window_params_offset = GX2GetPixelUniformVarOffset(&prg->group.pixelShader, "window_params");
     prg->samplers_location[0] = GX2GetPixelSamplerVarLocation(&prg->group.pixelShader, "uTex0");
@@ -241,6 +308,12 @@ static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_
     prg->used_noise = cc_features.opt_alpha && cc_features.opt_noise;
 
     printf("Generated and loaded shader\n");
+
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: shader creation complete; shader program upload and GX2Invalidate calls returned id0=0x{:016X} id1=0x{:08X}",
+                    shader_id0, shader_id1);
+        trace_first_shader_creation = false;
+    }
 
     return prg;
 }
@@ -276,8 +349,22 @@ static void gfx_gx2_delete_texture(uint32_t texture_id) {
     free((void*)tex);
 }
 
+static void gfx_gx2_set_pixel_texture(int tile, int32_t sampler_location, GX2Texture* texture) {
+    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_PIXEL_TEXTURE,
+                   "tile=%d samplerLocation=%d width=%u height=%u pitch=%u imageSize=%u", tile, sampler_location,
+                   static_cast<unsigned int>(texture->surface.width), static_cast<unsigned int>(texture->surface.height),
+                   static_cast<unsigned int>(texture->surface.pitch), static_cast<unsigned int>(texture->surface.imageSize));
+    GX2SetPixelTexture(texture, sampler_location);
+}
+
 static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
+    static bool trace_first_texture_select = true;
+    const bool trace = trace_first_texture_select;
     struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
+    if (!tex) {
+        SPDLOG_ERROR("gfx_gx2: texture selection received a null texture");
+        return;
+    }
     current_texture = tex;
     current_tile = tile;
 
@@ -285,24 +372,53 @@ static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
         int32_t sampler_location = current_shader_program->samplers_location[tile];
         if (sampler_location != -1) {
             if (tex->texture_uploaded) {
-                GX2SetPixelTexture(&tex->texture, sampler_location);
+                if (trace) {
+                    SPDLOG_INFO("gfx_gx2: first frame texture select: GX2SetPixelTexture ... tile={} location={}", tile,
+                                sampler_location);
+                }
+                gfx_gx2_set_pixel_texture(tile, sampler_location, &tex->texture);
+                if (trace) {
+                    SPDLOG_INFO("gfx_gx2: first frame texture select: GX2SetPixelTexture complete");
+                }
             }
 
             if (tex->sampler_set) {
+                if (trace) {
+                    SPDLOG_INFO("gfx_gx2: first frame texture select: GX2SetPixelSampler ... tile={} location={}", tile,
+                                sampler_location);
+                }
                 GX2SetPixelSampler(&tex->sampler, sampler_location);
+                if (trace) {
+                    SPDLOG_INFO("gfx_gx2: first frame texture select: GX2SetPixelSampler complete");
+                }
             }
         }
+    }
+    if (trace) {
+        trace_first_texture_select = false;
     }
 }
 
 static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD, WDOG_TEXTURE_DETAIL());
+    static bool trace_first_texture_upload = true;
+    const bool trace = trace_first_texture_upload;
     struct GX2TextureEntry* tex = current_texture;
-    assert(tex);
+    if (!tex) {
+        SPDLOG_ERROR("gfx_gx2: texture upload requested without a current texture");
+        return;
+    }
 
     if ((tex->texture.surface.width != width) || (tex->texture.surface.height != height) ||
         !tex->texture.surface.image) {
 
         if (tex->texture.surface.image) {
+            // The GPU may still be sampling this texture from an earlier draw.
+            // Freeing it here lets the allocator hand the block to something
+            // else while the GPU is still reading it, which wedges the GPU and
+            // hard-freezes the console with no CPU-side error at all. The
+            // framebuffer path already guards its frees this way.
+            GX2DrawDone();
             free(tex->texture.surface.image);
             tex->texture.surface.image = nullptr;
         }
@@ -323,26 +439,87 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
         tex->texture.viewNumSlices = 1;
         tex->texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
 
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame texture: GX2CalcSurfaceSizeAndAlignment ...");
+        }
         GX2CalcSurfaceSizeAndAlignment(&tex->texture.surface);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame texture: GX2CalcSurfaceSizeAndAlignment complete size=0x{:X}",
+                        tex->texture.surface.imageSize);
+            SPDLOG_INFO("gfx_gx2: first frame texture: GX2InitTextureRegs ...");
+        }
         GX2InitTextureRegs(&tex->texture);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame texture: GX2InitTextureRegs complete; allocation ...");
+        }
+        WDOG_ENTER(::Ship::WiiU::Watchdog::PH_TEX_ALLOC, nullptr);
 
         tex->texture.surface.image = memalign(tex->texture.surface.alignment, tex->texture.surface.imageSize);
+        WDOG_TEXALLOC(tex->texture.surface.image, tex->texture.surface.imageSize);
+        const uint32_t mem1Free = gfx_wiiu_mem1_free();
+        const uint32_t mem1Largest = gfx_wiiu_mem1_largest();
+        if (!tex->texture.surface.image) {
+            SPDLOG_ERROR("gfx_gx2: !! texture allocation failed dimensions={}x{} imageSize={} ptr={} mem1Free={} "
+                         "mem1Largest={}",
+                         width, height, tex->texture.surface.imageSize,
+                         static_cast<const void*>(tex->texture.surface.image), mem1Free, mem1Largest);
+        } else {
+            SPDLOG_INFO("gfx_gx2: texture allocation dimensions={}x{} imageSize={} ptr={} mem1Free={} mem1Largest={}",
+                        width, height, tex->texture.surface.imageSize,
+                        static_cast<const void*>(tex->texture.surface.image), mem1Free, mem1Largest);
+        }
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame texture: allocation returned ptr={}",
+                        static_cast<const void*>(tex->texture.surface.image));
+        }
+        WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_ALLOC);
     }
 
     uint8_t* buf = (uint8_t*)tex->texture.surface.image;
-    assert(buf);
+    if (!buf) {
+        SPDLOG_ERROR("gfx_gx2: texture upload allocation failed");
+        return;
+    }
+
+    // Temporary: the console hard-freezes between a resource load and the next
+    // shader generation, twice at the same 26x16 font glyph. Log the surface
+    // geometry for every upload so we can see whether the row writes stay
+    // inside imageSize -- an overrun here corrupts the heap silently.
+    const uint32_t needed = (height ? ((height - 1) * tex->texture.surface.pitch * 4) + (width * 4) : 0);
+    if (needed > tex->texture.surface.imageSize) {
+        SPDLOG_ERROR("gfx_gx2: refusing texture upload that would overrun the surface");
+        return;
+    }
 
     for (uint32_t y = 0; y < height; ++y) {
         memcpy(buf + (y * tex->texture.surface.pitch * 4), rgba32_buf + (y * width * 4), width * 4);
     }
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame texture: GX2Invalidate ...");
+    }
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD, "GX2Invalidate");
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame texture: GX2Invalidate complete");
+    }
 
     if (current_shader_program && current_shader_program->samplers_location[current_tile] != -1) {
-        GX2SetPixelTexture(&tex->texture, current_shader_program->samplers_location[current_tile]);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame texture: GX2SetPixelTexture ...");
+        }
+        gfx_gx2_set_pixel_texture(current_tile, current_shader_program->samplers_location[current_tile], &tex->texture);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame texture: GX2SetPixelTexture complete");
+        }
     }
 
     tex->texture_uploaded = true;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame texture upload complete size={}x{}", width, height);
+        trace_first_texture_upload = false;
+    }
 }
 
 static GX2TexClampMode gfx_cm_to_gx2(uint32_t val) {
@@ -361,33 +538,67 @@ static GX2TexClampMode gfx_cm_to_gx2(uint32_t val) {
 }
 
 static void gfx_gx2_set_sampler_parameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
+    static bool trace_first_sampler_update = true;
+    const bool trace = trace_first_sampler_update;
     struct GX2TextureEntry* tex = current_texture;
-    assert(tex);
+    if (!tex) {
+        SPDLOG_ERROR("gfx_gx2: sampler update requested without a current texture");
+        return;
+    }
 
     current_tile = tile;
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame sampler: GX2InitSampler ...");
+    }
     GX2InitSampler(&tex->sampler, GX2_TEX_CLAMP_MODE_CLAMP,
                    (linear_filter && current_filter_mode == FILTER_LINEAR) ? GX2_TEX_XY_FILTER_MODE_LINEAR
                                                                            : GX2_TEX_XY_FILTER_MODE_POINT);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame sampler: GX2InitSampler complete; GX2InitSamplerClamping ...");
+    }
 
     GX2InitSamplerClamping(&tex->sampler, gfx_cm_to_gx2(cms), gfx_cm_to_gx2(cmt), GX2_TEX_CLAMP_MODE_WRAP);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame sampler: GX2InitSamplerClamping complete");
+    }
 
     if (current_shader_program && current_shader_program->samplers_location[tile] != -1) {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame sampler: GX2SetPixelSampler ...");
+        }
         GX2SetPixelSampler(&tex->sampler, current_shader_program->samplers_location[tile]);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame sampler: GX2SetPixelSampler complete");
+        }
     }
 
     tex->sampler_set = true;
+    if (trace) {
+        trace_first_sampler_update = false;
+    }
 }
 
 static void gfx_gx2_set_depth_test_and_mask(bool depth_test, bool z_upd) {
+    static bool trace_first_depth_state = true;
+    const bool trace = trace_first_depth_state;
     current_depth_test = depth_test || z_upd;
     current_depth_write = z_upd;
     current_depth_compare_function = depth_test ? GX2_COMPARE_FUNC_LEQUAL : GX2_COMPARE_FUNC_ALWAYS;
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetDepthOnlyControl ...");
+    }
     GX2SetDepthOnlyControl(current_depth_test, current_depth_write, current_depth_compare_function);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetDepthOnlyControl complete");
+        trace_first_depth_state = false;
+    }
 }
 
 static void gfx_gx2_set_zmode_decal(bool zmode_decal) {
+    static bool trace_first_zmode_state = true;
+    const bool trace = trace_first_zmode_state;
     current_zmode_decal = zmode_decal;
     if (zmode_decal) {
         // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
@@ -415,17 +626,39 @@ static void gfx_gx2_set_zmode_decal(bool zmode_decal) {
         }
 
         current_SSDB = SSDB;
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset(decal) ...");
+        }
         GX2SetPolygonOffset(SSDB, SSDB, SSDB, SSDB, 0.0f);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset(decal) complete; GX2SetPolygonControl ...");
+        }
         GX2SetPolygonControl(GX2_FRONT_FACE_CCW, FALSE, FALSE, TRUE, GX2_POLYGON_MODE_TRIANGLE,
                              GX2_POLYGON_MODE_TRIANGLE, TRUE, TRUE, FALSE);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonControl(decal) complete");
+            trace_first_zmode_state = false;
+        }
     } else {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset ...");
+        }
         GX2SetPolygonOffset(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset complete; GX2SetPolygonControl ...");
+        }
         GX2SetPolygonControl(GX2_FRONT_FACE_CCW, FALSE, FALSE, FALSE, GX2_POLYGON_MODE_TRIANGLE,
                              GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonControl complete");
+            trace_first_zmode_state = false;
+        }
     }
 }
 
 static void gfx_gx2_set_viewport(int x, int y, int width, int height) {
+    static bool trace_first_viewport_state = true;
+    const bool trace = trace_first_viewport_state;
     uint32_t buffer_height = current_framebuffer->color_buffer.surface.height;
 
     current_viewport_x = x;
@@ -433,10 +666,20 @@ static void gfx_gx2_set_viewport(int x, int y, int width, int height) {
     current_viewport_width = width;
     current_viewport_height = height;
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetViewport ... x={} y={} width={} height={}", current_viewport_x,
+                    current_viewport_y, current_viewport_width, current_viewport_height);
+    }
     GX2SetViewport(current_viewport_x, current_viewport_y, current_viewport_width, current_viewport_height, 0.0f, 1.0f);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetViewport complete");
+        trace_first_viewport_state = false;
+    }
 }
 
 static void gfx_gx2_set_scissor(int x, int y, int width, int height) {
+    static bool trace_first_scissor_state = true;
+    const bool trace = trace_first_scissor_state;
     uint32_t buffer_height = current_framebuffer->color_buffer.surface.height;
     uint32_t buffer_width = current_framebuffer->color_buffer.surface.width;
 
@@ -445,17 +688,53 @@ static void gfx_gx2_set_scissor(int x, int y, int width, int height) {
     current_scissor_width = std::min((uint32_t)width, buffer_width);
     current_scissor_height = std::min((uint32_t)height, buffer_height);
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetScissor ... x={} y={} width={} height={}", current_scissor_x,
+                    current_scissor_y, current_scissor_width, current_scissor_height);
+    }
     GX2SetScissor(current_scissor_x, current_scissor_y, current_scissor_width, current_scissor_height);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetScissor complete");
+        trace_first_scissor_state = false;
+    }
 }
 
 static void gfx_gx2_set_use_alpha(bool use_alpha) {
+    static bool trace_first_alpha_state = true;
+    const bool trace = trace_first_alpha_state;
     current_use_alpha = use_alpha;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetColorControl ... use_alpha={}", use_alpha);
+    }
     GX2SetColorControl(GX2_LOGIC_OP_COPY, use_alpha ? 0xff : 0, FALSE, TRUE);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetColorControl complete");
+        trace_first_alpha_state = false;
+    }
 }
 
 static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_DRAW_TRIANGLES, "draw triangles");
+    const bool trace = gfx_gx2_trace_first_draw;
     if (!current_shader_program) {
+        if (trace) {
+            SPDLOG_ERROR("gfx_gx2: first draw skipped: no current shader");
+            gfx_gx2_trace_first_draw = false;
+        }
         return;
+    }
+
+    if (!draw_buffer || !draw_ptr) {
+        if (trace) {
+            SPDLOG_ERROR("gfx_gx2: first draw skipped: draw buffer is not initialized");
+            gfx_gx2_trace_first_draw = false;
+        }
+        return;
+    }
+
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first draw begin vertices={} triangles={} bytes={}", buf_vbo_len,
+                    buf_vbo_num_tris, sizeof(float) * buf_vbo_len);
     }
 
     size_t vbo_len = sizeof(float) * buf_vbo_len;
@@ -469,30 +748,71 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
     float* new_vbo = (float*)draw_ptr;
     draw_ptr += ALIGN(vbo_len, GX2_VERTEX_BUFFER_ALIGNMENT);
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first draw: OSBlockMove ...");
+    }
     OSBlockMove(new_vbo, buf_vbo, vbo_len, FALSE);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first draw: OSBlockMove complete; GX2Invalidate ...");
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, new_vbo, vbo_len);
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first draw: GX2Invalidate complete; GX2SetAttribBuffer ...");
+    }
     GX2SetAttribBuffer(0, vbo_len, current_shader_program->group.stride, new_vbo);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first draw: GX2SetAttribBuffer complete; GX2DrawEx ...");
+    }
     GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 3 * buf_vbo_num_tris, 0, 1);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first draw: GX2DrawEx complete");
+        gfx_gx2_trace_first_draw = false;
+    }
 }
 
 static void gfx_gx2_init(void) {
+    SPDLOG_INFO("gfx_gx2_init: framebuffer setup begin {}x{}", WIIU_DEFAULT_FB_WIDTH, WIIU_DEFAULT_FB_HEIGHT);
     // Init the default framebuffer
     gfx_gx2_init_framebuffer(&main_framebuffer, WIIU_DEFAULT_FB_WIDTH, WIIU_DEFAULT_FB_HEIGHT);
 
+    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(color) ...");
     GX2CalcSurfaceSizeAndAlignment(&main_framebuffer.color_buffer.surface);
+    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(color) complete size=0x{:X} alignment=0x{:X}",
+                main_framebuffer.color_buffer.surface.imageSize, main_framebuffer.color_buffer.surface.alignment);
+    SPDLOG_INFO("gfx_gx2_init: GX2InitColorBufferRegs ...");
     GX2InitColorBufferRegs(&main_framebuffer.color_buffer);
+    SPDLOG_INFO("gfx_gx2_init: GX2InitColorBufferRegs complete");
 
+    SPDLOG_INFO("gfx_gx2_init: main color-buffer allocation ... size=0x{:X}",
+                main_framebuffer.color_buffer.surface.imageSize);
     main_framebuffer.color_buffer.surface.image = gfx_wiiu_alloc_mem1(main_framebuffer.color_buffer.surface.imageSize,
                                                                       main_framebuffer.color_buffer.surface.alignment);
-    assert(main_framebuffer.color_buffer.surface.image);
+    SPDLOG_INFO("gfx_gx2_init: main color-buffer allocation returned ptr={}",
+                main_framebuffer.color_buffer.surface.image);
+    if (!main_framebuffer.color_buffer.surface.image) {
+        SPDLOG_ERROR("gfx_gx2: failed to allocate main color buffer");
+        return;
+    }
 
+    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(depth) ...");
     GX2CalcSurfaceSizeAndAlignment(&main_framebuffer.depth_buffer.surface);
+    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(depth) complete size=0x{:X} alignment=0x{:X}",
+                main_framebuffer.depth_buffer.surface.imageSize, main_framebuffer.depth_buffer.surface.alignment);
+    SPDLOG_INFO("gfx_gx2_init: GX2InitDepthBufferRegs ...");
     GX2InitDepthBufferRegs(&main_framebuffer.depth_buffer);
+    SPDLOG_INFO("gfx_gx2_init: GX2InitDepthBufferRegs complete");
 
+    SPDLOG_INFO("gfx_gx2_init: main depth-buffer allocation ... size=0x{:X}",
+                main_framebuffer.depth_buffer.surface.imageSize);
     main_framebuffer.depth_buffer.surface.image = gfx_wiiu_alloc_mem1(main_framebuffer.depth_buffer.surface.imageSize,
                                                                       main_framebuffer.depth_buffer.surface.alignment);
-    assert(main_framebuffer.depth_buffer.surface.image);
+    SPDLOG_INFO("gfx_gx2_init: main depth-buffer allocation returned ptr={}",
+                main_framebuffer.depth_buffer.surface.image);
+    if (!main_framebuffer.depth_buffer.surface.image) {
+        SPDLOG_ERROR("gfx_gx2: failed to allocate main depth buffer");
+        return;
+    }
 
     main_framebuffer.imtex.Texture = &main_framebuffer.texture;
     main_framebuffer.imtex.Sampler = &main_framebuffer.sampler;
@@ -504,32 +824,55 @@ static void gfx_gx2_init(void) {
     depthReadBuffer.surface.width = 32;
     depthReadBuffer.surface.height = 1;
 
+    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(depth readback) ...");
     GX2CalcSurfaceSizeAndAlignment(&depthReadBuffer.surface);
+    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(depth readback) complete size=0x{:X} alignment=0x{:X}",
+                depthReadBuffer.surface.imageSize, depthReadBuffer.surface.alignment);
 
+    SPDLOG_INFO("gfx_gx2_init: depth readback allocation ... size=0x{:X}", depthReadBuffer.surface.imageSize);
     depthReadBuffer.surface.image =
-        gfx_wiiu_alloc_mem1(depthReadBuffer.surface.alignment, depthReadBuffer.surface.imageSize);
-    assert(depthReadBuffer.surface.image);
+        gfx_wiiu_alloc_mem1(depthReadBuffer.surface.imageSize, depthReadBuffer.surface.alignment);
+    SPDLOG_INFO("gfx_gx2_init: depth readback allocation returned ptr={}", depthReadBuffer.surface.image);
+    if (!depthReadBuffer.surface.image) {
+        SPDLOG_ERROR("gfx_gx2: failed to allocate depth readback buffer");
+        return;
+    }
+    SPDLOG_INFO("gfx_gx2_init: depth readback GX2Invalidate ...");
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_DEPTH_BUFFER, depthReadBuffer.surface.image,
                   depthReadBuffer.surface.imageSize);
+    SPDLOG_INFO("gfx_gx2_init: depth readback GX2Invalidate complete");
 
+    SPDLOG_INFO("gfx_gx2_init: GX2SetColorBuffer ...");
     GX2SetColorBuffer(&main_framebuffer.color_buffer, GX2_RENDER_TARGET_0);
+    SPDLOG_INFO("gfx_gx2_init: GX2SetColorBuffer complete; GX2SetDepthBuffer ...");
     GX2SetDepthBuffer(&main_framebuffer.depth_buffer);
+    SPDLOG_INFO("gfx_gx2_init: GX2SetDepthBuffer complete");
 
     current_framebuffer = &main_framebuffer;
 
     // allocate draw buffer
+    SPDLOG_INFO("gfx_gx2_init: draw-buffer allocation ... size=0x{:X}", DRAW_BUFFER_SIZE);
     draw_buffer = (uint8_t*)memalign(GX2_VERTEX_BUFFER_ALIGNMENT, DRAW_BUFFER_SIZE);
-    assert(draw_buffer);
+    SPDLOG_INFO("gfx_gx2_init: draw-buffer allocation returned ptr={}", static_cast<const void*>(draw_buffer));
+    if (!draw_buffer) {
+        SPDLOG_ERROR("gfx_gx2: failed to allocate draw buffer");
+        return;
+    }
     draw_ptr = draw_buffer;
 
+    SPDLOG_INFO("gfx_gx2_init: GX2SetRasterizerClipControl ...");
     GX2SetRasterizerClipControl(TRUE, FALSE);
+    SPDLOG_INFO("gfx_gx2_init: GX2SetRasterizerClipControl complete; GX2SetBlendControl ...");
 
     GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA,
                        GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ZERO, GX2_BLEND_MODE_ZERO,
                        GX2_BLEND_COMBINE_MODE_ADD);
+    SPDLOG_INFO("gfx_gx2_init: GX2SetBlendControl complete; framebuffer setup complete");
 }
 
 void gfx_gx2_shutdown(void) {
+    Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown enter\n");
+
     if (has_foreground) {
         GX2DrawDone();
 
@@ -554,71 +897,140 @@ void gfx_gx2_shutdown(void) {
         draw_buffer = nullptr;
         draw_ptr = nullptr;
     }
+
+    Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown exit\n");
 }
 
 static void gfx_gx2_on_resize(void) {
 }
 
 static void gfx_gx2_start_frame(void) {
+    const bool trace = gfx_gx2_trace_first_frame;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state setup begin");
+    }
     // Restore state since ImGui modified it when rendering
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetViewport (restore) ...");
+    }
     GX2SetViewport(current_viewport_x, current_viewport_y, current_viewport_width, current_viewport_height, 0.0f, 1.0f);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetViewport (restore) complete; GX2SetScissor ...");
+    }
     GX2SetScissor(current_scissor_x, current_scissor_y, current_scissor_width, current_scissor_height);
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetScissor (restore) complete; GX2SetColorControl ...");
+    }
     GX2SetColorControl(GX2_LOGIC_OP_COPY, current_use_alpha ? 0xff : 0, FALSE, TRUE);
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetColorControl complete; GX2SetBlendControl ...");
+    }
     GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA,
                        GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ZERO, GX2_BLEND_MODE_ZERO,
                        GX2_BLEND_COMBINE_MODE_ADD);
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetBlendControl complete; GX2SetDepthOnlyControl ...");
+    }
     GX2SetDepthOnlyControl(current_depth_test, current_depth_write, current_depth_compare_function);
 
     if (current_zmode_decal) {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset (restore decal) ...");
+        }
         GX2SetPolygonOffset(current_SSDB, current_SSDB, current_SSDB, current_SSDB, 0.0f);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset complete; GX2SetPolygonControl ...");
+        }
         GX2SetPolygonControl(GX2_FRONT_FACE_CCW, FALSE, FALSE, TRUE, GX2_POLYGON_MODE_TRIANGLE,
                              GX2_POLYGON_MODE_TRIANGLE, TRUE, TRUE, FALSE);
     } else {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset (restore) ...");
+        }
         GX2SetPolygonOffset(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonOffset complete; GX2SetPolygonControl ...");
+        }
         GX2SetPolygonControl(GX2_FRONT_FACE_CCW, FALSE, FALSE, FALSE, GX2_POLYGON_MODE_TRIANGLE,
                              GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
     }
 
     frame_count++;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonControl complete; state setup complete");
+    }
 }
 
 static void gfx_gx2_end_frame(void) {
+    const bool trace = gfx_gx2_trace_first_frame;
     draw_ptr = draw_buffer;
 
+    {
+        WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_DRAW_DONE, "GX2DrawDone");
+        GX2DrawDone();
+    }
+
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame: GX2CopyColorBufferToScanBuffer(TV) ...");
+    }
     GX2CopyColorBufferToScanBuffer(&main_framebuffer.color_buffer, GX2_SCAN_TARGET_TV);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame: GX2CopyColorBufferToScanBuffer(TV) complete; DRC ...");
+    }
     GX2CopyColorBufferToScanBuffer(&main_framebuffer.color_buffer, GX2_SCAN_TARGET_DRC);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame: GX2CopyColorBufferToScanBuffer(DRC) complete");
+        gfx_gx2_trace_first_frame = false;
+    }
 }
 
 static void gfx_gx2_finish_render(void) {
 }
 
 static int gfx_gx2_create_framebuffer(void) {
+    SPDLOG_INFO("gfx_gx2: CreateFramebuffer begin");
     struct Framebuffer* buffer = (struct Framebuffer*)calloc(1, sizeof(struct Framebuffer));
-    assert(buffer);
+    if (!buffer) {
+        SPDLOG_ERROR("gfx_gx2: framebuffer allocation failed");
+        return 0;
+    }
 
+    SPDLOG_INFO("gfx_gx2: CreateFramebuffer: GX2InitSampler ...");
     GX2InitSampler(&buffer->sampler, GX2_TEX_CLAMP_MODE_WRAP, GX2_TEX_XY_FILTER_MODE_LINEAR);
+    SPDLOG_INFO("gfx_gx2: CreateFramebuffer: GX2InitSampler complete");
 
     buffer->imtex.Texture = &buffer->texture;
     buffer->imtex.Sampler = &buffer->sampler;
 
     // some more 32-bit shenanigans :D
-    return (int)buffer;
+    SPDLOG_INFO("gfx_gx2: CreateFramebuffer complete ptr={}", static_cast<const void*>(buffer));
+    const int framebuffer_id = static_cast<int>(reinterpret_cast<uintptr_t>(buffer));
+    framebuffer_registry[framebuffer_id] = buffer;
+    return framebuffer_id;
+}
+
+static struct Framebuffer* gfx_gx2_lookup_framebuffer(int framebuffer_id) {
+    const auto framebuffer = framebuffer_registry.find(framebuffer_id);
+    return framebuffer == framebuffer_registry.end() ? nullptr : framebuffer->second;
 }
 
 static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                   bool opengl_invert_y, bool render_target, bool has_depth_buffer,
                                                   bool can_extract_depth) {
+    SPDLOG_INFO("gfx_gx2: UpdateFramebufferParameters fb={} size={}x{} msaa={} ...", fb, width, height, msaa_level);
     struct Framebuffer* buffer = (struct Framebuffer*)fb;
 
     // we don't support updating the main buffer (fb 0)
     if (!buffer) {
+        SPDLOG_INFO("gfx_gx2: UpdateFramebufferParameters fb=0 uses the initialized main framebuffer");
         return;
     }
 
     if (buffer->texture.surface.width == width && buffer->texture.surface.height == height) {
+        SPDLOG_INFO("gfx_gx2: UpdateFramebufferParameters unchanged; complete");
         return;
     }
 
@@ -654,11 +1066,18 @@ static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32
     if (!buffer->depth_buffer.surface.image) {
         buffer->depth_buffer.surface.image =
             memalign(buffer->depth_buffer.surface.alignment, buffer->depth_buffer.surface.imageSize);
+        if (!buffer->depth_buffer.surface.image) {
+            SPDLOG_ERROR("gfx_gx2: !! depth-buffer MEM2 fallback allocation FAILED size={}",
+                         buffer->depth_buffer.surface.imageSize);
+        }
         buffer->depthBufferMem1 = false;
     } else {
         buffer->depthBufferMem1 = true;
     }
-    assert(buffer->depth_buffer.surface.image);
+    if (!buffer->depth_buffer.surface.image) {
+        SPDLOG_ERROR("gfx_gx2: framebuffer depth-buffer allocation failed");
+        return;
+    }
 
     GX2CalcSurfaceSizeAndAlignment(&buffer->color_buffer.surface);
     GX2InitColorBufferRegs(&buffer->color_buffer);
@@ -683,23 +1102,35 @@ static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32
     GX2InitTextureRegs(&buffer->texture);
 
     // the texture and color buffer share a buffer
-    assert(buffer->color_buffer.surface.imageSize == buffer->texture.surface.imageSize);
+    if (buffer->color_buffer.surface.imageSize != buffer->texture.surface.imageSize) {
+        SPDLOG_ERROR("gfx_gx2: framebuffer color/texture sizes differ");
+        return;
+    }
 
     buffer->texture.surface.image =
         gfx_wiiu_alloc_mem1(buffer->texture.surface.imageSize, buffer->texture.surface.alignment);
     // fall back to mem2
     if (!buffer->texture.surface.image) {
         buffer->texture.surface.image = memalign(buffer->texture.surface.alignment, buffer->texture.surface.imageSize);
+        if (!buffer->texture.surface.image) {
+            SPDLOG_ERROR("gfx_gx2: !! framebuffer-texture MEM2 fallback allocation FAILED size={}",
+                         buffer->texture.surface.imageSize);
+        }
         buffer->colorBufferMem1 = false;
     } else {
         buffer->colorBufferMem1 = true;
     }
-    assert(buffer->texture.surface.image);
+    if (!buffer->texture.surface.image) {
+        SPDLOG_ERROR("gfx_gx2: framebuffer color-buffer allocation failed");
+        return;
+    }
 
     buffer->color_buffer.surface.image = buffer->texture.surface.image;
+    SPDLOG_INFO("gfx_gx2: UpdateFramebufferParameters complete fb={} size={}x{}", fb, width, height);
 }
 
 void gfx_gx2_start_draw_to_framebuffer(int fb, float noise_scale) {
+    const bool trace = gfx_gx2_trace_first_frame;
     struct Framebuffer* buffer = (struct Framebuffer*)fb;
 
     // fb 0 = main buffer
@@ -707,55 +1138,107 @@ void gfx_gx2_start_draw_to_framebuffer(int fb, float noise_scale) {
         buffer = &main_framebuffer;
     }
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame: StartDrawToFramebuffer ptr={} ...", static_cast<const void*>(buffer));
+    }
+
     if (noise_scale != 0.0f) {
         current_noise_scale = 1.0f / noise_scale;
     }
 
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame: GX2SetColorBuffer ...");
+    }
     GX2SetColorBuffer(&buffer->color_buffer, GX2_RENDER_TARGET_0);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame: GX2SetColorBuffer complete; GX2SetDepthBuffer ...");
+    }
     GX2SetDepthBuffer(&buffer->depth_buffer);
 
     current_framebuffer = buffer;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame: GX2SetDepthBuffer complete; StartDrawToFramebuffer complete");
+    }
 }
 
 void gfx_gx2_clear_framebuffer(bool clear_color, bool clear_depth) {
+    const bool trace = gfx_gx2_trace_first_frame;
     struct Framebuffer* buffer = current_framebuffer;
+
+    if (!buffer) {
+        SPDLOG_ERROR("gfx_gx2: ClearFramebuffer skipped: no current framebuffer");
+        return;
+    }
 
     // The old C interface always cleared both attachments. The modern interface
     // asks for them independently, and Fast3D issues depth-only clears between
     // framebuffer passes -- clearing colour there would wipe the scene.
     if (clear_color) {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2ClearColor ...");
+        }
         GX2ClearColor(&buffer->color_buffer, 0.0f, 0.0f, 0.0f, 1.0f);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2ClearColor complete");
+        }
     }
 
     if (clear_depth) {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2ClearDepthStencilEx ...");
+        }
         GX2ClearDepthStencilEx(&buffer->depth_buffer, buffer->depth_buffer.depthClear,
                                buffer->depth_buffer.stencilClear, GX2_CLEAR_FLAGS_BOTH);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2ClearDepthStencilEx complete");
+        }
     }
 
     if (clear_color || clear_depth) {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2SetContextState ...");
+        }
         gfx_wiiu_set_context_state();
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2SetContextState complete");
+        }
     }
 }
 
 void gfx_gx2_resolve_msaa_color_buffer(int fb_id_target, int fb_id_source) {
-    struct Framebuffer* src_buffer = (struct Framebuffer*)fb_id_source;
-    struct Framebuffer* target_buffer = (struct Framebuffer*)fb_id_target;
+    const bool trace = gfx_gx2_trace_first_frame;
+    struct Framebuffer* src_buffer = gfx_gx2_lookup_framebuffer(fb_id_source);
+    struct Framebuffer* target_buffer = gfx_gx2_lookup_framebuffer(fb_id_target);
 
-    // fb 0 = main buffer
-    if (!src_buffer) {
-        src_buffer = &main_framebuffer;
-    }
-    if (!target_buffer) {
-        target_buffer = &main_framebuffer;
+    if (!src_buffer || !target_buffer) {
+        static uint32_t rejection_logs = 0;
+        if (rejection_logs < 4) {
+            ++rejection_logs;
+            Ship::WiiU::Watchdog::Emit("GX2: rejected framebuffer copy source=%d target=%d\n", fb_id_source,
+                                       fb_id_target);
+        }
+        return;
     }
 
     if (src_buffer->color_buffer.surface.aa == GX2_AA_MODE1X) {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2CopySurface (resolve) ...");
+        }
         GX2CopySurface(&src_buffer->color_buffer.surface, src_buffer->color_buffer.viewMip,
                        src_buffer->color_buffer.viewFirstSlice, &target_buffer->color_buffer.surface,
                        target_buffer->color_buffer.viewMip, target_buffer->color_buffer.viewFirstSlice);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2CopySurface (resolve) complete");
+        }
     } else {
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2ResolveAAColorBuffer ...");
+        }
         GX2ResolveAAColorBuffer(&src_buffer->color_buffer, &target_buffer->color_buffer.surface,
                                 target_buffer->color_buffer.viewMip, target_buffer->color_buffer.viewFirstSlice);
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first frame: GX2ResolveAAColorBuffer complete");
+        }
     }
 }
 
@@ -772,11 +1255,17 @@ void* gfx_gx2_get_framebuffer_texture_id(int fb_id) {
 
 void gfx_gx2_select_texture_fb(int fb) {
     struct Framebuffer* buffer = (struct Framebuffer*)fb;
-    assert(buffer);
+    if (!buffer) {
+        SPDLOG_ERROR("gfx_gx2: texture framebuffer selection received a null framebuffer");
+        return;
+    }
 
-    assert(current_shader_program);
+    if (!current_shader_program) {
+        SPDLOG_ERROR("gfx_gx2: texture framebuffer selection has no current shader");
+        return;
+    }
     uint32_t location = current_shader_program->samplers_location[0];
-    GX2SetPixelTexture(&buffer->texture, location);
+    gfx_gx2_set_pixel_texture(0, location, &buffer->texture);
     GX2SetPixelSampler(&buffer->sampler, location);
 }
 

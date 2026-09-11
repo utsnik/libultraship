@@ -76,6 +76,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
     include(cmake/dependencies/wiiu.cmake)
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "PSVita")
+    include(cmake/dependencies/vita.cmake)
+endif()
+
 # === Platform Specific Configuration ===
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     include(cmake/ios-toolchain-populate.cmake)

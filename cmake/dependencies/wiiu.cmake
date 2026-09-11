@@ -30,6 +30,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(spdlog)
 
+# spdlog's MDC helper is header-only and otherwise declares a function-local
+# thread_local map even when SPDLOG_NO_TLS is enabled. Make that one dormant
+# feature plain storage on CafeOS so it cannot emit .tbss sections.
+file(READ "${spdlog_SOURCE_DIR}/include/spdlog/mdc.h" SPDLOG_MDC_HEADER)
+string(REPLACE
+    "static thread_local mdc_map_t context;"
+    "static mdc_map_t context;"
+    SPDLOG_MDC_HEADER "${SPDLOG_MDC_HEADER}")
+file(WRITE "${spdlog_SOURCE_DIR}/include/spdlog/mdc.h" "${SPDLOG_MDC_HEADER}")
+
 #=================== ImGui ===================
 #
 # The Wii U has no SDL3 in devkitPro's portlibs and no OpenGL at all, so unlike

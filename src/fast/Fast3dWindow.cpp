@@ -20,6 +20,7 @@
 #include "fast/Fast3dGui.h"
 
 #include <fstream>
+#include <spdlog/spdlog.h>
 
 namespace Fast {
 
@@ -212,6 +213,7 @@ bool Fast3dWindow::IsFrameReady() {
 
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
+    static bool trace_first_frame = true;
 
     // Skip dropped frames
     if (!wnd->IsFrameReady()) {
@@ -220,13 +222,44 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
 
     auto gui = wnd->GetGui();
     // Setup mouse state manager
+#ifdef __WIIU__
+    if (trace_first_frame) {
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame mouse StartFrame skipped on Wii U");
+    }
+#else
+    if (trace_first_frame) {
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame mouse StartFrame begin");
+    }
     wnd->GetMouseStateManager()->StartFrame();
+#endif
+    if (trace_first_frame) {
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame mouse StartFrame complete");
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame gui StartDraw begin");
+    }
     // Setup of the backend frames and draw initial Window and GUI menus
-    gui->StartDraw();
+    if (gui) {
+        gui->StartDraw();
+    } else {
+        SPDLOG_ERROR("Fast3dWindow::DrawAndRunGraphicsCommands: GUI is null on first frame");
+        trace_first_frame = false;
+        return false;
+    }
+    if (trace_first_frame) {
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame gui StartDraw complete");
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame interpreter StartFrame begin");
+    }
     // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
+    if (trace_first_frame) {
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame interpreter StartFrame complete");
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame interpreter Run begin");
+    }
     // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
+    if (trace_first_frame) {
+        SPDLOG_INFO("Fast3dWindow::DrawAndRunGraphicsCommands: first frame interpreter Run complete");
+        trace_first_frame = false;
+    }
     // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
     // Finalize swap buffers

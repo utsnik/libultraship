@@ -25,5 +25,6 @@ enum ImGui_ImplWiiU_KeyboardOverlayType
 
 IMGUI_IMPL_API bool     ImGui_ImplWiiU_Init();
 IMGUI_IMPL_API void     ImGui_ImplWiiU_Shutdown();
+IMGUI_IMPL_API void     ImGui_ImplWiiU_NewFrame();
 IMGUI_IMPL_API bool     ImGui_ImplWiiU_ProcessInput(ImGui_ImplWiiU_ControllerInput* input);
 IMGUI_IMPL_API void     ImGui_ImplWiiU_DrawKeyboardOverlay(ImGui_ImplWiiU_KeyboardOverlayType type = ImGui_KeyboardOverlay_Auto);

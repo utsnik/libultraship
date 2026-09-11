@@ -1,5 +1,90 @@
 #include "ship/audio/SDLAudioPlayer.h"
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <spdlog/spdlog.h>
+
+namespace {
+
+constexpr const char* kPcmDumpPath1 = "audiodump.raw";
+constexpr const char* kPcmDumpPath2 = "fs:/vol/external01/wiiu/apps/spaghettify/audiodump.raw";
+constexpr size_t kPcmDumpStagingSize = 512 * 1024;
+constexpr size_t kPcmDumpCap = 4 * 1024 * 1024;
+static uint8_t gPcmDumpBuffer[kPcmDumpStagingSize];
+static size_t gPcmDumpUsed = 0;
+static size_t gPcmDumpTotal = 0;
+static bool gPcmDumpDone = false;
+static bool gPcmDumpTapLogged = false;
+static bool gPcmDumpOpenedLogged = false;
+
+FILE* OpenPcmDump(const char* mode, const char*& chosenPath, int& e1, int& e2) {
+    FILE* fp = fopen(kPcmDumpPath1, mode);
+    if (fp) {
+        chosenPath = kPcmDumpPath1;
+        return fp;
+    }
+    e1 = errno;
+
+    fp = fopen(kPcmDumpPath2, mode);
+    if (fp) {
+        chosenPath = kPcmDumpPath2;
+        return fp;
+    }
+    e2 = errno;
+    return nullptr;
+}
+
+void FlushPcm() {
+    const char* chosenPath = nullptr;
+    int e1 = 0;
+    int e2 = 0;
+    const char* mode = gPcmDumpTotal == 0 ? "wb" : "ab";
+    FILE* fp = OpenPcmDump(mode, chosenPath, e1, e2);
+    if (!fp) {
+        SPDLOG_ERROR("PROBE/PCM: fopen failed p1={} e1={} p2={} e2={}", kPcmDumpPath1, e1, kPcmDumpPath2, e2);
+        gPcmDumpDone = true;
+        return;
+    }
+
+    if (!gPcmDumpOpenedLogged) {
+        SPDLOG_INFO("PROBE/PCM: opened path={}", chosenPath);
+        gPcmDumpOpenedLogged = true;
+    }
+    fwrite(gPcmDumpBuffer, 1, gPcmDumpUsed, fp);
+    fclose(fp);
+    gPcmDumpTotal += gPcmDumpUsed;
+    SPDLOG_INFO("PROBE/PCM: flushed {} of {} bytes", gPcmDumpTotal, kPcmDumpCap);
+    gPcmDumpUsed = 0;
+    if (gPcmDumpTotal >= kPcmDumpCap) {
+        gPcmDumpDone = true;
+    }
+}
+
+void CapturePcm(const uint8_t* buf, size_t len) {
+    if (!gPcmDumpTapLogged) {
+        SPDLOG_INFO("PROBE/PCM: tap reached, len={}", len);
+        gPcmDumpTapLogged = true;
+    }
+
+    if (gPcmDumpDone) {
+        return;
+    }
+
+    while (len > 0 && !gPcmDumpDone) {
+        const size_t remaining = kPcmDumpStagingSize - gPcmDumpUsed;
+        const size_t copySize = len < remaining ? len : remaining;
+        std::memcpy(gPcmDumpBuffer + gPcmDumpUsed, buf, copySize);
+        gPcmDumpUsed += copySize;
+        buf += copySize;
+        len -= copySize;
+
+        if (gPcmDumpUsed == kPcmDumpStagingSize) {
+            FlushPcm();
+        }
+    }
+}
+
+} // namespace
 
 namespace Ship {
 
@@ -43,7 +128,11 @@ bool SDLAudioPlayer::DoInit() {
         return false;
     }
 
-    SPDLOG_INFO("SDL Audio initialized: {} channels, {} Hz", mNumChannels, this->GetSampleRate());
+    SPDLOG_INFO("SDL Audio initialized: requested {} channels at {} Hz; negotiated {} channels at {} Hz; negotiated format {}; requested format {}",
+                mNumChannels, this->GetSampleRate(), have.channels, have.freq, have.format, want.format);
+    if (have.channels != want.channels || have.freq != want.freq || have.format != want.format) {
+        SPDLOG_WARN("SDL Audio device format differs from the requested format");
+    }
 
     SDL_PauseAudioDevice(mDevice, 0);
     return true;
@@ -54,9 +143,13 @@ int SDLAudioPlayer::Buffered() {
 }
 
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
+    CapturePcm(buf, len);
+
     if (Buffered() < 6000) {
         // Don't fill the audio buffer too much in case this happens
-        SDL_QueueAudio(mDevice, buf, len);
+        if (SDL_QueueAudio(mDevice, buf, len) != 0) {
+            SPDLOG_ERROR("SDL_QueueAudio failed: {}", SDL_GetError());
+        }
     }
 }
 } // namespace Ship

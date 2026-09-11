@@ -211,6 +211,15 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
         SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
         $<$<BOOL:${GFX_DEBUG_DISASSEMBLER}>:GFX_DEBUG_DISASSEMBLER>
     )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "PSVita")
+    target_compile_definitions(libultraship PRIVATE
+        ENABLE_OPENGL
+        __vita__
+        $<$<CONFIG:Debug>:_DEBUG>
+        $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+        SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
+        $<$<BOOL:${GFX_DEBUG_DISASSEMBLER}>:GFX_DEBUG_DISASSEMBLER>
+    )
 else()
     target_compile_definitions(libultraship PRIVATE
         ENABLE_OPENGL

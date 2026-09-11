@@ -17,6 +17,11 @@ void SDLAddRemoveDeviceEventHandler::DrawElement() {
 }
 
 void SDLAddRemoveDeviceEventHandler::UpdateElement() {
+#ifdef __WIIU__
+    // Wii U input is VPAD/KPAD, not SDL game controllers. In particular, do not
+    // pump or inspect SDL controller events on the GX2 path.
+    return;
+#else
     SDL_PumpEvents();
     SDL_Event event;
     bool changed = false;
@@ -46,5 +51,6 @@ void SDLAddRemoveDeviceEventHandler::UpdateElement() {
             window->GetGui()->RefreshImGuiGamepads();
         }
     }
+#endif
 }
 } // namespace Ship

@@ -1,13 +1,16 @@
 #include "ship/resource/archive/O2rArchive.h"
 
 #include "ship/Context.h"
+#include "ship/utils/filesystemtools/FileHelper.h"
 #include "ship/window/Window.h"
 #include "spdlog/spdlog.h"
+#include <fstream>
 #include <unordered_map>
 
 namespace Ship {
 O2rArchive::O2rArchive(const std::string& archivePath) : Archive(archivePath) {
     mZipArchive = nullptr;
+    mZipArchiveSource = nullptr;
 }
 
 O2rArchive::~O2rArchive() {
@@ -22,7 +25,32 @@ zip_t* O2rArchive::GetZipHandle() {
         mZipArchivePool.pop_back();
         return handle;
     }
-    return zip_open(GetPath().c_str(), ZIP_RDONLY, nullptr);
+    return OpenZipFromBuffer(ZIP_RDONLY);
+}
+
+zip_t* O2rArchive::OpenZipFromBuffer(int flags, zip_source_t** sourceOut) {
+    if (sourceOut != nullptr) {
+        *sourceOut = nullptr;
+    }
+
+    zip_source_t* source = nullptr;
+    if (mZipArchive != nullptr) {
+        source = zip_source_buffer(mZipArchive, mArchiveBuffer.data(), mArchiveBuffer.size(), 0);
+    } else {
+        source = zip_source_buffer_create(mArchiveBuffer.data(), mArchiveBuffer.size(), 0, nullptr);
+    }
+
+    if (source == nullptr) {
+        return nullptr;
+    }
+
+    zip_t* archive = zip_open_from_source(source, flags, nullptr);
+    if (archive == nullptr) {
+        zip_source_free(source);
+    } else if (sourceOut != nullptr) {
+        *sourceOut = source;
+    }
+    return archive;
 }
 
 void O2rArchive::ReleaseZipHandle(zip_t* handle) {
@@ -95,11 +123,34 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 }
 
 bool O2rArchive::Open() {
-    mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
-    if (mZipArchive == nullptr) {
+    std::ifstream file(GetPath(), std::ios::in | std::ios::binary | std::ios::ate);
+    if (!file) {
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;
     }
+
+    const std::streamoff fileSize = file.tellg();
+    if (fileSize < 0) {
+        SPDLOG_ERROR("Failed to determine size of zip file \"{}\"", GetPath());
+        return false;
+    }
+
+    mArchiveBuffer.resize(static_cast<size_t>(fileSize));
+    file.seekg(0, std::ios::beg);
+    if (!mArchiveBuffer.empty() &&
+        !file.read(reinterpret_cast<char*>(mArchiveBuffer.data()), static_cast<std::streamsize>(mArchiveBuffer.size()))) {
+        mArchiveBuffer.clear();
+        SPDLOG_ERROR("Failed to read zip file \"{}\"", GetPath());
+        return false;
+    }
+
+    mZipArchive = OpenZipFromBuffer(ZIP_CREATE, &mZipArchiveSource);
+    if (mZipArchive == nullptr) {
+        mArchiveBuffer.clear();
+        SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
+        return false;
+    }
+    zip_source_keep(mZipArchiveSource);
 
     auto zipNumEntries = zip_get_num_entries(mZipArchive, 0);
     for (auto i = 0; i < zipNumEntries; i++) {
@@ -137,10 +188,19 @@ bool O2rArchive::Close() {
     }
     mZipArchivePool.clear();
 
+    if (mZipArchiveSource != nullptr) {
+        zip_source_free(mZipArchiveSource);
+        mZipArchiveSource = nullptr;
+    }
+    mArchiveBuffer.clear();
+    mArchiveBuffer.shrink_to_fit();
+
     return success;
 }
 
 bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_t>& data) {
+    bool success = true;
+
     if (!mZipArchive) {
         SPDLOG_ERROR("Cannot write to zip: Archive is not open.");
         return false;
@@ -160,37 +220,83 @@ bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_
         return false;
     }
 
-    // Save changes to disk
+    // Commit changes to the in-memory source.
     if (zip_close(mZipArchive) < 0) {
         zip_error_t* error = zip_get_error(mZipArchive);
         SPDLOG_ERROR("Failed to save changes to zip archive: {} ({})", zip_error_strerror(error),
                      zip_error_code_zip(error));
         zip_discard(mZipArchive); // Close zip and discard changes
+        mZipArchive = nullptr;
+        if (mZipArchiveSource != nullptr) {
+            zip_source_free(mZipArchiveSource);
+            mZipArchiveSource = nullptr;
+        }
         return false;
     }
+    mZipArchive = nullptr;
 
-    // Clear the pool as the file on disk has likely changed
+    // Clear the pool before replacing the shared buffer.
     {
         std::lock_guard<std::mutex> lock(mPoolMutex);
         for (auto* handle : mZipArchivePool) {
-            zip_close(handle);
+            if (zip_close(handle) == -1) {
+                success = false;
+            }
         }
         mZipArchivePool.clear();
     }
 
+    zip_stat_t sourceStat;
+    zip_stat_init(&sourceStat);
+    if (mZipArchiveSource == nullptr || zip_source_stat(mZipArchiveSource, &sourceStat) != 0 ||
+        sourceStat.size > static_cast<zip_uint64_t>(SIZE_MAX) || zip_source_open(mZipArchiveSource) != 0) {
+        SPDLOG_ERROR("Failed to read updated zip archive \"{}\" from memory", GetPath());
+        if (mZipArchiveSource != nullptr) {
+            zip_source_free(mZipArchiveSource);
+            mZipArchiveSource = nullptr;
+        }
+        return false;
+    }
+
+    mArchiveBuffer.resize(static_cast<size_t>(sourceStat.size));
+    size_t bytesRead = 0;
+    while (bytesRead < mArchiveBuffer.size()) {
+        const zip_int64_t read = zip_source_read(mZipArchiveSource, mArchiveBuffer.data() + bytesRead,
+                                                 mArchiveBuffer.size() - bytesRead);
+        if (read <= 0) {
+            zip_source_close(mZipArchiveSource);
+            zip_source_free(mZipArchiveSource);
+            mZipArchiveSource = nullptr;
+            SPDLOG_ERROR("Failed to read updated zip archive \"{}\" from memory", GetPath());
+            return false;
+        }
+        bytesRead += static_cast<size_t>(read);
+    }
+    if (zip_source_close(mZipArchiveSource) != 0) {
+        zip_source_free(mZipArchiveSource);
+        mZipArchiveSource = nullptr;
+        SPDLOG_ERROR("Failed to close updated zip archive source \"{}\"", GetPath());
+        return false;
+    }
+
+    zip_source_free(mZipArchiveSource);
+    mZipArchiveSource = nullptr;
+    FileHelper::WriteAllBytes(GetPath(), mArchiveBuffer);
+
     SPDLOG_INFO("Successfully wrote file: {}", filePath);
 
-    // Reopen the zip file so that it may continued to be used by libultraship
-    mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
+    // Reopen the zip from the refreshed in-memory buffer so reads never return to disk.
+    mZipArchive = OpenZipFromBuffer(ZIP_CREATE, &mZipArchiveSource);
     if (mZipArchive == nullptr) {
         SPDLOG_ERROR("Failed to reopen zip file after writing.");
         return false;
     }
+    zip_source_keep(mZipArchiveSource);
 
     IndexFile(filePath);
 
     // Success
-    return true;
+    return success;
 }
 
 } // namespace Ship

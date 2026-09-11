@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdint.h>     // intptr_t
 #include <malloc.h>     // memalign
+#include <spdlog/spdlog.h>
 
 // GX2 includes
 #include <whb/gfx.h>
@@ -66,11 +67,26 @@ void    ImGui_ImplGX2_Shutdown()
 
 void    ImGui_ImplGX2_NewFrame()
 {
+    if (!ImGui::GetCurrentContext())
+    {
+        SPDLOG_ERROR("ImGui_ImplGX2_NewFrame: no current ImGui context");
+        return;
+    }
+
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
-    IM_ASSERT(bd != NULL && "Did you call ImGui_ImplGX2_Init()?");
+    if (!bd)
+    {
+        SPDLOG_ERROR("ImGui_ImplGX2_NewFrame: renderer backend is not initialized");
+        return;
+    }
 
     if (!bd->ShaderGroup)
-        ImGui_ImplGX2_CreateDeviceObjects();
+    {
+        if (!ImGui_ImplGX2_CreateDeviceObjects())
+        {
+            SPDLOG_ERROR("ImGui_ImplGX2_NewFrame: device object creation failed");
+        }
+    }
 }
 
 static void ImGui_ImplGX2_SetupRenderState(ImDrawData* draw_data, int fb_width, int fb_height)
@@ -293,11 +309,23 @@ void ImGui_ImplGX2_DestroyFontsTexture()
 bool    ImGui_ImplGX2_CreateDeviceObjects()
 {
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
+    if (!bd)
+    {
+        SPDLOG_ERROR("ImGui_ImplGX2_CreateDeviceObjects: renderer backend is not initialized");
+        return false;
+    }
+
     bd->ShaderGroup = IM_NEW(WHBGfxShaderGroup)();
+    if (!bd->ShaderGroup)
+    {
+        SPDLOG_ERROR("ImGui_ImplGX2_CreateDeviceObjects: shader group allocation failed");
+        return false;
+    }
 
     if (!WHBGfxLoadGFDShaderGroup(bd->ShaderGroup, 0, shader_gsh))
     {
         IM_DELETE(bd->ShaderGroup);
+        bd->ShaderGroup = NULL;
         return false;
     }
 
@@ -308,6 +336,7 @@ bool    ImGui_ImplGX2_CreateDeviceObjects()
     if (!WHBGfxInitFetchShader(bd->ShaderGroup))
     {
         IM_DELETE(bd->ShaderGroup);
+        bd->ShaderGroup = NULL;
         return false;
     }
 

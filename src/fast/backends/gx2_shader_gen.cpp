@@ -6,9 +6,12 @@
 
 #include "fast/interpreter.h"  // full CCFeatures definition
 #include "fast/backends/gx2_shader_gen.h"
+#include "port/wiiu/WiiUWatchdog.h"
+#include <spdlog/spdlog.h>
 #include "fast/backends/gx2_shader_inl.h"
 
 #include <malloc.h>
+#include <string>
 #include <gx2/mem.h>
 
 #define ROUNDUP(x, align) (((x) + ((align) -1)) & ~((align) -1))
@@ -35,6 +38,39 @@ struct RegTable {
     uint8_t used;
     uint8_t regs[128];
 };
+
+struct ShaderWriter {
+    uint64_t* buffer;
+    size_t capacity;
+    size_t offset;
+    size_t high_water_offset;
+    bool failed;
+};
+
+static bool shader_set_offset(ShaderWriter* writer, size_t offset) {
+    if (writer->failed || offset > writer->capacity) {
+        writer->failed = true;
+        return false;
+    }
+    writer->offset = offset;
+    if (offset > writer->high_water_offset) {
+        writer->high_water_offset = offset;
+    }
+    return true;
+}
+
+static bool shader_write(ShaderWriter* writer, const uint64_t* data, size_t count) {
+    if (writer->failed || count > writer->capacity - writer->offset) {
+        writer->failed = true;
+        return false;
+    }
+    memcpy(writer->buffer + writer->offset, data, count * sizeof(uint64_t));
+    writer->offset += count;
+    if (writer->offset > writer->high_water_offset) {
+        writer->high_water_offset = writer->offset;
+    }
+    return true;
+}
 
 static inline int reg_table_find_free(struct RegTable* tbl, bool reuse_texinfo) {
     for (int i = 0; i < 128; i++) {
@@ -156,11 +192,12 @@ static uint8_t get_reg(struct RegTable* tbl, uint8_t c) {
 }
 
 #define ADD_INSTR(...) \
-    uint64_t tmp[] = {__VA_ARGS__}; \
-    memcpy(*alu_ptr, tmp, sizeof(tmp)); \
-    *alu_ptr += sizeof(tmp) / sizeof(uint64_t)
+    do { \
+        uint64_t tmp[] = {__VA_ARGS__}; \
+        shader_write(writer, tmp, sizeof(tmp) / sizeof(uint64_t)); \
+    } while (0)
 
-static void add_tex_clamp_S_T(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t tex) {
+static void add_tex_clamp_S_T(struct RegTable* tbl, struct ShaderWriter* writer, uint8_t tex) {
     uint8_t texinfo_reg = get_reg(tbl, (tex == 0) ? SHADER_TEXINFO0 : SHADER_TEXINFO1);
     uint8_t texcoord_reg = (tex == 0) ? _R1 : _R2;
 
@@ -194,7 +231,7 @@ static void add_tex_clamp_S_T(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t 
     );
 }
 
-static void add_tex_clamp_S(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t tex) {
+static void add_tex_clamp_S(struct RegTable* tbl, struct ShaderWriter* writer, uint8_t tex) {
     uint8_t texinfo_reg = get_reg(tbl, (tex == 0) ? SHADER_TEXINFO0 : SHADER_TEXINFO1);
     uint8_t texcoord_reg = (tex == 0) ? _R1 : _R2;
 
@@ -219,7 +256,7 @@ static void add_tex_clamp_S(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t te
     );
 }
 
-static void add_tex_clamp_T(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t tex) {
+static void add_tex_clamp_T(struct RegTable* tbl, struct ShaderWriter* writer, uint8_t tex) {
     uint8_t texinfo_reg = get_reg(tbl, (tex == 0) ? SHADER_TEXINFO0 : SHADER_TEXINFO1);
     uint8_t texcoord_reg = (tex == 0) ? _R1 : _R2;
 
@@ -244,7 +281,7 @@ static void add_tex_clamp_T(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t te
     );
 }
 
-static void add_mov(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t src, bool single) {
+static void add_mov(struct RegTable* tbl, struct ShaderWriter* writer, uint8_t src, bool single) {
     bool src_alpha = (src == SHADER_TEXEL0A) || (src == SHADER_TEXEL1A);
     src = get_reg(tbl, src);
 
@@ -264,7 +301,7 @@ static void add_mov(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t src, bool 
     }
 }
 
-static void add_mul(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t src0, uint8_t src1, bool single) {
+static void add_mul(struct RegTable* tbl, struct ShaderWriter* writer, uint8_t src0, uint8_t src1, bool single) {
     bool src0_alpha = (src0 == SHADER_TEXEL0A) || (src0 == SHADER_TEXEL1A);
     bool src1_alpha = (src1 == SHADER_TEXEL0A) || (src1 == SHADER_TEXEL1A);
     src0 = get_reg(tbl, src0);
@@ -286,7 +323,7 @@ static void add_mul(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t src0, uint
     }
 }
 
-static void add_mix(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t src0, uint8_t src1, uint8_t src2, uint8_t src3, bool single) {
+static void add_mix(struct RegTable* tbl, struct ShaderWriter* writer, uint8_t src0, uint8_t src1, uint8_t src2, uint8_t src3, bool single) {
     bool src0_alpha = (src0 == SHADER_TEXEL0A) || (src0 == SHADER_TEXEL1A);
     bool src1_alpha = (src1 == SHADER_TEXEL0A) || (src1 == SHADER_TEXEL1A);
     bool src2_alpha = (src2 == SHADER_TEXEL0A) || (src2 == SHADER_TEXEL1A);
@@ -321,25 +358,25 @@ static void add_mix(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t src0, uint
 }
 #undef ADD_INSTR
 
-static void append_tex_clamp(struct RegTable* tbl, uint64_t **alu_ptr, uint8_t tex, bool s, bool t) {
+static void append_tex_clamp(struct RegTable* tbl, struct ShaderWriter* writer, uint8_t tex, bool s, bool t) {
     if (s && t) {
-        add_tex_clamp_S_T(tbl, alu_ptr, tex);
+        add_tex_clamp_S_T(tbl, writer, tex);
     } else if (s) {
-        add_tex_clamp_S(tbl, alu_ptr, tex);
+        add_tex_clamp_S(tbl, writer, tex);
     } else {
-        add_tex_clamp_T(tbl, alu_ptr, tex);
+        add_tex_clamp_T(tbl, writer, tex);
     }
 }
 
-static void append_formula(struct RegTable* tbl, uint64_t **alu_ptr, int c[2][4], bool do_single, bool do_multiply, bool do_mix, bool only_alpha) {
+static void append_formula(struct RegTable* tbl, struct ShaderWriter* writer, int c[2][4], bool do_single, bool do_multiply, bool do_mix, bool only_alpha) {
     if (do_single) {
-        add_mov(tbl, alu_ptr, c[only_alpha][3], only_alpha);
+        add_mov(tbl, writer, c[only_alpha][3], only_alpha);
     } else if (do_multiply) {
-        add_mul(tbl, alu_ptr, c[only_alpha][0], c[only_alpha][2], only_alpha);
+        add_mul(tbl, writer, c[only_alpha][0], c[only_alpha][2], only_alpha);
     } else if (do_mix) {
-        add_mix(tbl, alu_ptr, c[only_alpha][0], c[only_alpha][1], c[only_alpha][2], c[only_alpha][1], only_alpha);
+        add_mix(tbl, writer, c[only_alpha][0], c[only_alpha][1], c[only_alpha][2], c[only_alpha][1], only_alpha);
     } else {
-        add_mix(tbl, alu_ptr, c[only_alpha][0], c[only_alpha][1], c[only_alpha][2], c[only_alpha][3], only_alpha);
+        add_mix(tbl, writer, c[only_alpha][0], c[only_alpha][1], c[only_alpha][2], c[only_alpha][3], only_alpha);
     }
 }
 
@@ -444,12 +481,11 @@ static GX2SamplerVar samplerVars[] = {
 #define ADD_INSTR(...) \
     do { \
     uint64_t tmp[] = {__VA_ARGS__}; \
-    memcpy(cur_buf, tmp, sizeof(tmp)); \
-    cur_buf += sizeof(tmp) / sizeof(uint64_t); \
+    shader_write(&writer, tmp, sizeof(tmp) / sizeof(uint64_t)); \
     } while (0)
 
 static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_features) {
-    static const size_t max_program_buf_size = 512 * sizeof(uint64_t);
+    static const size_t max_program_buf_size = 4096 * sizeof(uint64_t);
     uint64_t *program_buf = (uint64_t *)memalign(GX2_SHADER_PROGRAM_ALIGNMENT, max_program_buf_size);
     if (!program_buf) {
         return -1;
@@ -459,7 +495,7 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
 
     // start placing alus at offset 32
     static const uint32_t base_alu_offset = 32;
-    uint64_t *cur_buf = NULL;
+    ShaderWriter writer = { program_buf, max_program_buf_size / sizeof(uint64_t), 0, 0, false };
 
     // check if we need to clamp
     bool texclamp[2] = { false, false };
@@ -496,21 +532,22 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
 
     if (texclamp[0] || texclamp[1]) {
         // texclamp alu
-        cur_buf = program_buf + texclamp_alu_offset;
+        if (!shader_set_offset(&writer, texclamp_alu_offset)) { free(program_buf); return -1; }
 
         for (int i = 0; i < 2; i++) {
             if (cc_features->usedTextures[i] && texclamp[i]) {
-                append_tex_clamp(&reg_table, &cur_buf, i, cc_features->clamp[i][0], cc_features->clamp[i][1]);
+                append_tex_clamp(&reg_table, &writer, i, cc_features->clamp[i][0], cc_features->clamp[i][1]);
             }
         }
 
-        texclamp_alu_size = (uintptr_t) cur_buf - ((uintptr_t) (program_buf + texclamp_alu_offset));
+        if (writer.failed) { free(program_buf); return -1; }
+        texclamp_alu_size = (writer.offset - texclamp_alu_offset) * sizeof(uint64_t);
         texclamp_alu_cnt = texclamp_alu_size / sizeof(uint64_t);
     }
 
     // main alu0
     uint32_t main_alu0_offset = texclamp_alu_offset + texclamp_alu_cnt;
-    cur_buf = program_buf + main_alu0_offset;
+    if (!shader_set_offset(&writer, main_alu0_offset)) { free(program_buf); return -1; }
 
     for (int i = 0; i < 2; i++) {
         if (cc_features->usedTextures[i] && cc_features->used_masks[i]) {
@@ -542,14 +579,13 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
 
     // do noise calculation for SHADER_NOISE if necessary
     if (needs_noise) {
-        memcpy(cur_buf, noise_instructions, sizeof(noise_instructions));
-        cur_buf += sizeof(noise_instructions) / sizeof(uint64_t);
+        shader_write(&writer, noise_instructions, sizeof(noise_instructions) / sizeof(uint64_t));
     }
 
     for (int c = 0; c < (cc_features->opt_2cyc ? 2 : 1); c++) {
-        append_formula(&reg_table, &cur_buf, cc_features->c[c], cc_features->do_single[c][0], cc_features->do_multiply[c][0], cc_features->do_mix[c][0], false);
+        append_formula(&reg_table, &writer, cc_features->c[c], cc_features->do_single[c][0], cc_features->do_multiply[c][0], cc_features->do_mix[c][0], false);
         if (cc_features->opt_alpha) {
-            append_formula(&reg_table, &cur_buf, cc_features->c[c], cc_features->do_single[c][1], cc_features->do_multiply[c][1], cc_features->do_mix[c][1], true);
+            append_formula(&reg_table, &writer, cc_features->c[c], cc_features->do_single[c][1], cc_features->do_multiply[c][1], cc_features->do_mix[c][1], true);
         }
     }
 
@@ -578,13 +614,14 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
         );
     }
 
-    const uint32_t main_alu0_size = (uintptr_t) cur_buf - ((uintptr_t) (program_buf + main_alu0_offset));
+    if (writer.failed) { free(program_buf); return -1; }
+    const uint32_t main_alu0_size = (writer.offset - main_alu0_offset) * sizeof(uint64_t);
     const uint32_t main_alu0_cnt = main_alu0_size / sizeof(uint64_t);
 
     // main alu1
     // place the following instructions into a new alu, in case the other alu uses KILL
     const uint32_t main_alu1_offset = main_alu0_offset + main_alu0_cnt;
-    cur_buf = program_buf + main_alu1_offset;
+    if (!shader_set_offset(&writer, main_alu1_offset)) { free(program_buf); return -1; }
 
     if (cc_features->opt_alpha && cc_features->opt_noise) {
         ADD_INSTR(
@@ -660,7 +697,8 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
         }
     }
 
-    const uint32_t main_alu1_size = (uintptr_t) cur_buf - ((uintptr_t) (program_buf + main_alu1_offset));
+    if (writer.failed) { free(program_buf); return -1; }
+    const uint32_t main_alu1_size = (writer.offset - main_alu1_offset) * sizeof(uint64_t);
     const uint32_t main_alu1_cnt = main_alu1_size / sizeof(uint64_t);
 
     // tex
@@ -668,7 +706,7 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
     uint32_t num_texinfo = texclamp[0] + texclamp[1];
 
     uint32_t texinfo_offset = ROUNDUP(main_alu1_offset + main_alu1_cnt, 16);
-    uint32_t cur_tex_offset = texinfo_offset;
+    if (!shader_set_offset(&writer, texinfo_offset)) { free(program_buf); return -1; }
 
     for (int i = 0; i < 2; i++) {
         if (cc_features->usedTextures[i]) {
@@ -680,13 +718,14 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
                     TEX_GET_TEXTURE_INFO(dst_reg, _x, _y, _m, _m, _R1, _0, _0, _0, _0,  _t(loc), _s(loc))
                 };
 
-                memcpy(program_buf + cur_tex_offset, texinfo_buf, sizeof(texinfo_buf));
-                cur_tex_offset += sizeof(texinfo_buf) / sizeof(uint64_t);
+                if (!shader_write(&writer, texinfo_buf, sizeof(texinfo_buf) / sizeof(uint64_t))) {
+                    free(program_buf); return -1;
+                }
             }
         }
     }
 
-    uint32_t texsample_offset = cur_tex_offset;
+    const uint32_t texsample_offset = writer.offset;
 
     for (int i = 0; i < 2; i++) {
         if (cc_features->usedTextures[i]) {
@@ -701,8 +740,9 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
                     TEX_SAMPLE(dst_reg, _x, _y, _z, _w, texcoord_reg, _x, _y, _0, _x, _t(loc), _s(loc))
                 };
 
-                memcpy(program_buf + cur_tex_offset, tex_buf, sizeof(tex_buf));
-                cur_tex_offset += sizeof(tex_buf) / sizeof(uint64_t);
+                if (!shader_write(&writer, tex_buf, sizeof(tex_buf) / sizeof(uint64_t))) {
+                    free(program_buf); return -1;
+                }
 
                 num_textures++;
             }
@@ -715,8 +755,9 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
                     TEX_SAMPLE(dst_reg, _x, _y, _z, _w, texcoord_reg, _x, _y, _0, _x, _t(loc), _s(loc))
                 };
 
-                memcpy(program_buf + cur_tex_offset, tex_buf, sizeof(tex_buf));
-                cur_tex_offset += sizeof(tex_buf) / sizeof(uint64_t);
+                if (!shader_write(&writer, tex_buf, sizeof(tex_buf) / sizeof(uint64_t))) {
+                    free(program_buf); return -1;
+                }
 
                 num_textures++;
             }
@@ -728,41 +769,43 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
                 TEX_SAMPLE(dst_reg, _x, _y, _z, _w, texcoord_reg, _x, _y, _0, _x, _t(loc), _s(loc))
             };
 
-            memcpy(program_buf + cur_tex_offset, tex_buf, sizeof(tex_buf));
-            cur_tex_offset += sizeof(tex_buf) / sizeof(uint64_t);
+            if (!shader_write(&writer, tex_buf, sizeof(tex_buf) / sizeof(uint64_t))) {
+                free(program_buf); return -1;
+            }
 
             num_textures++;
         }
     }
 
-    // make sure we didn't overflow the buffer
-    const uint32_t total_program_size = cur_tex_offset * sizeof(uint64_t);
-    assert(total_program_size <= max_program_buf_size);
-
     // cf
-    uint32_t cur_cf_offset = 0;
+    if (!shader_set_offset(&writer, 0)) { free(program_buf); return -1; }
 
     // if we use texclamp place those alus first
     if (texclamp[0] || texclamp[1]) {
-        program_buf[cur_cf_offset++] = TEX(texinfo_offset, num_texinfo);
-        program_buf[cur_cf_offset++] = ALU(texclamp_alu_offset, texclamp_alu_cnt);
+        ADD_INSTR(
+            TEX(texinfo_offset, num_texinfo),
+            ALU(texclamp_alu_offset, texclamp_alu_cnt),
+        );
     }
 
     if (num_textures > 0) {
-        program_buf[cur_cf_offset++] = TEX(texsample_offset, num_textures) VALID_PIX;
+        ADD_INSTR(TEX(texsample_offset, num_textures) VALID_PIX);
     }
 
-    program_buf[cur_cf_offset++] = ALU(main_alu0_offset, main_alu0_cnt);
+    ADD_INSTR(ALU(main_alu0_offset, main_alu0_cnt));
 
     if (main_alu1_cnt > 0) {
-        program_buf[cur_cf_offset++] = ALU(main_alu1_offset, main_alu1_cnt);
+        ADD_INSTR(ALU(main_alu1_offset, main_alu1_cnt));
     }
 
     if (cc_features->opt_alpha) {
-        program_buf[cur_cf_offset++] = EXP_DONE(PIX0, TEXEL_REG, _x, _y, _z, _w) END_OF_PROGRAM;
+        ADD_INSTR(EXP_DONE(PIX0, TEXEL_REG, _x, _y, _z, _w) END_OF_PROGRAM);
     } else {
-        program_buf[cur_cf_offset++] = EXP_DONE(PIX0, TEXEL_REG, _x, _y, _z, _1) END_OF_PROGRAM;
+        ADD_INSTR(EXP_DONE(PIX0, TEXEL_REG, _x, _y, _z, _1) END_OF_PROGRAM);
     }
+
+    if (writer.failed) { free(program_buf); return -1; }
+    const uint32_t total_program_size = writer.high_water_offset * sizeof(uint64_t);
 
     // regs
     const uint32_t num_ps_inputs = 4 + cc_features->numInputs;
@@ -806,6 +849,8 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
     psh->samplerVars = samplerVars;
     psh->samplerVarCount = sizeof(samplerVars) / sizeof(GX2SamplerVar);
 
+    Ship::WiiU::Watchdog::Emit("GX2: generated pixel shader size=%u bytes\n", total_program_size);
+
     return 0;
 }
 
@@ -825,7 +870,7 @@ static GX2AttribVar attribVars[] = {
 };
 
 static int generateVertexShader(GX2VertexShader *vsh, struct CCFeatures *cc_features) {
-    static const size_t max_program_buf_size = 16 * sizeof(uint64_t);
+    static const size_t max_program_buf_size = 256 * sizeof(uint64_t);
     uint64_t *program_buf = (uint64_t *)memalign(GX2_SHADER_PROGRAM_ALIGNMENT, max_program_buf_size);
     if (!program_buf) {
         return -1;
@@ -833,7 +878,7 @@ static int generateVertexShader(GX2VertexShader *vsh, struct CCFeatures *cc_feat
 
     const uint32_t num_ps_inputs = 4 + cc_features->numInputs;
 
-    uint64_t *cur_buf = program_buf;
+    ShaderWriter writer = { program_buf, max_program_buf_size / sizeof(uint64_t), 0, 0, false };
 
     // aVtxPos
     ADD_INSTR(
@@ -854,8 +899,8 @@ static int generateVertexShader(GX2VertexShader *vsh, struct CCFeatures *cc_feat
         END_OF_PROGRAM,
     );
 
-    const uint32_t program_size = (uintptr_t) cur_buf - ((uintptr_t) program_buf);
-    assert(program_size <= max_program_buf_size);
+    if (writer.failed) { free(program_buf); return -1; }
+    const uint32_t program_size = writer.high_water_offset * sizeof(uint64_t);
 
     // regs
     vsh->regs.sq_pgm_resources_vs = (num_ps_inputs + 2) // num_gprs
@@ -907,6 +952,8 @@ static int generateVertexShader(GX2VertexShader *vsh, struct CCFeatures *cc_feat
 
     vsh->mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
 
+    Ship::WiiU::Watchdog::Emit("GX2: generated vertex shader size=%u bytes\n", program_size);
+
     // attribs
     vsh->attribVarCount = num_ps_inputs + 5;
     vsh->attribVars = attribVars;
@@ -915,7 +962,23 @@ static int generateVertexShader(GX2VertexShader *vsh, struct CCFeatures *cc_feat
 }
 #undef ADD_INSTR
 
-int gx2GenerateShaderGroup(struct ShaderGroup *group, struct CCFeatures *cc_features) {
+static decltype(GX2_ATTRIB_FORMAT_FLOAT_32) gx2AttribFormatForSize(uint32_t size) {
+    switch (size) {
+        case 1:
+            return GX2_ATTRIB_FORMAT_FLOAT_32;
+        case 2:
+            return GX2_ATTRIB_FORMAT_FLOAT_32_32;
+        case 3:
+            return GX2_ATTRIB_FORMAT_FLOAT_32_32_32;
+        case 4:
+            return GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32;
+        default:
+            assert(false && "Unsupported GX2 vertex attribute size");
+            return GX2_ATTRIB_FORMAT_FLOAT_32;
+    }
+}
+
+static int gx2GenerateShaderGroupImpl(struct ShaderGroup *group, struct CCFeatures *cc_features) {
     memset(group, 0, sizeof(struct ShaderGroup));
 
     // generate the pixel shader
@@ -931,43 +994,58 @@ int gx2GenerateShaderGroup(struct ShaderGroup *group, struct CCFeatures *cc_feat
     }
 
     uint32_t attribOffset = 0;
+    uint32_t attribSizes[13] = {};
+
+    auto addAttribute = [&](uint32_t semantic, uint32_t size) {
+        const uint32_t attributeIndex = group->numAttributes++;
+        attribSizes[attributeIndex] = size;
+        group->attributes[attributeIndex] =
+            (GX2AttribStream) { semantic, 0, attribOffset, gx2AttribFormatForSize(size), GX2_ATTRIB_INDEX_PER_VERTEX, 0,
+                                 GX2_COMP_SEL(_x, _y, _z, _w), GX2_ENDIAN_SWAP_DEFAULT };
+        attribOffset += size * sizeof(float);
+    };
 
     // aVtxPos
-    group->attributes[group->numAttributes++] = 
-        (GX2AttribStream) { 0, 0, attribOffset, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32, GX2_ATTRIB_INDEX_PER_VERTEX, 0, GX2_COMP_SEL(_x, _y, _z, _w), GX2_ENDIAN_SWAP_DEFAULT };
-    attribOffset += 4 * sizeof(float);
+    addAttribute(0, 4);
 
+    // aTexCoordX packs the two coordinates and any optional S/T clamp values
+    // into the same GX2 vector, matching the layout written by the interpreter.
     for (int i = 0; i < 2; i++) {
         if (cc_features->usedTextures[i]) {
-            // aTexCoordX
-            group->attributes[group->numAttributes++] = 
-                (GX2AttribStream) { 1 + i, 0, attribOffset, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32, GX2_ATTRIB_INDEX_PER_VERTEX, 0, GX2_COMP_SEL(_x, _y, _z, _w), GX2_ENDIAN_SWAP_DEFAULT };
-            attribOffset += 4 * sizeof(float);
+            addAttribute(1 + i, 2 + cc_features->clamp[i][0] + cc_features->clamp[i][1]);
         }
     }
 
     // aFog
     if (cc_features->opt_fog) {
-        group->attributes[group->numAttributes++] = 
-            (GX2AttribStream) { 3, 0, attribOffset, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32, GX2_ATTRIB_INDEX_PER_VERTEX, 0, GX2_COMP_SEL(_x, _y, _z, _w), GX2_ENDIAN_SWAP_DEFAULT };
-        attribOffset += 4 * sizeof(float);
+        addAttribute(3, 4);
     }
 
     // aGrayscaleColor
     if (cc_features->opt_grayscale) {
-        group->attributes[group->numAttributes++] = 
-            (GX2AttribStream) { 4, 0, attribOffset, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32, GX2_ATTRIB_INDEX_PER_VERTEX, 0, GX2_COMP_SEL(_x, _y, _z, _w), GX2_ENDIAN_SWAP_DEFAULT };
-        attribOffset += 4 * sizeof(float);
+        addAttribute(4, 4);
     }
 
     // aInput
     for (int i = 0; i < cc_features->numInputs; i++) {
-        group->attributes[group->numAttributes++] = 
-            (GX2AttribStream) { 5 + i, 0, attribOffset, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32, GX2_ATTRIB_INDEX_PER_VERTEX, 0, GX2_COMP_SEL(_x, _y, _z, _w), GX2_ENDIAN_SWAP_DEFAULT };
-        attribOffset += 4 * sizeof(float);
+        addAttribute(5 + i, cc_features->opt_alpha ? 4 : 3);
     }
 
     group->stride = attribOffset;
+
+    static bool trace_first_shader_layout = true;
+    if (trace_first_shader_layout) {
+        std::string sizes;
+        for (uint32_t i = 0; i < group->numAttributes; i++) {
+            if (i != 0) {
+                sizes += ",";
+            }
+            sizes += std::to_string(attribSizes[i]);
+        }
+        SPDLOG_INFO("gfx_gx2: first shader vertex layout: stride={} bytes ({} floats), attribute sizes=[{}]",
+                    group->stride, group->stride / sizeof(float), sizes);
+        trace_first_shader_layout = false;
+    }
 
     // init the fetch shader
     group->fetchShader.size = GX2CalcFetchShaderSizeEx(group->numAttributes, GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
@@ -979,12 +1057,40 @@ int gx2GenerateShaderGroup(struct ShaderGroup *group, struct CCFeatures *cc_feat
 
     GX2InitFetchShaderEx(&group->fetchShader, (uint8_t *)group->fetchShader.program, group->numAttributes, group->attributes, GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
 
-    // invalidate all programs
+    // Invalidate all programs after the CPU-side shader compilation/generation.
+    static bool trace_first_shader_invalidate = true;
+    const bool trace = trace_first_shader_invalidate;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame shader upload: GX2Invalidate(vertex shader) ... ptr={} size=0x{:X}",
+                    group->vertexShader.program, group->vertexShader.size);
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, group->vertexShader.program, group->vertexShader.size);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame shader upload: GX2Invalidate(vertex shader) complete; pixel ...");
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, group->pixelShader.program, group->pixelShader.size);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame shader upload: GX2Invalidate(pixel shader) complete; fetch ...");
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, (uint8_t *)group->fetchShader.program, group->fetchShader.size);
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first frame shader upload: GX2Invalidate(fetch shader) complete");
+        trace_first_shader_invalidate = false;
+    }
 
     return 0;
+}
+
+int gx2GenerateShaderGroup(struct ShaderGroup *group, struct CCFeatures *cc_features) {
+    return gx2GenerateShaderGroupImpl(group, cc_features);
+}
+
+int gx2GenerateShaderGroupWithKey(struct ShaderGroup *group, struct CCFeatures *cc_features, uint64_t shader_id0,
+                                  uint32_t shader_id1) {
+    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_GENERATE_SHADER,
+                   "shader_id0=0x%016llX shader_id1=0x%08X", static_cast<unsigned long long>(shader_id0),
+                   static_cast<unsigned int>(shader_id1));
+    return gx2GenerateShaderGroupImpl(group, cc_features);
 }
 
 void gx2FreeShaderGroup(struct ShaderGroup *group) {

@@ -157,9 +157,11 @@ ImVec2 GameOverlay::CalculateTextSize(const char* text, const char* textEnd, boo
 }
 
 void GameOverlay::Init() {
-    Context::GetRawInstance()->GetResourceManager()->GetResourceLoader()->RegisterResourceFactory(
-        std::make_shared<ResourceFactoryBinaryFontV0>(), RESOURCE_FORMAT_BINARY, "Font",
-        static_cast<uint32_t>(RESOURCE_TYPE_FONT), 0);
+    auto loader = Context::GetRawInstance()->GetResourceManager()->GetResourceLoader();
+    if (loader->GetResourceType("Font") == 0) {
+        loader->RegisterResourceFactory(std::make_shared<ResourceFactoryBinaryFontV0>(), RESOURCE_FORMAT_BINARY,
+                                        "Font", static_cast<uint32_t>(RESOURCE_TYPE_FONT), 0);
+    }
 }
 
 void GameOverlay::SetCurrentFont(const std::string& name) {

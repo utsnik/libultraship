@@ -1,6 +1,7 @@
 #include "ship/Context.h"
 #include "ship/controller/controldevice/controller/mapping/keyboard/KeyboardScancodes.h"
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <SDL2/SDL.h>
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -31,6 +32,35 @@
 
 namespace Ship {
 std::unique_ptr<Context> Context::mContext;
+
+namespace {
+void LogDirectoryCreationFailure(const std::filesystem::path& path, const std::string& message) {
+    if (Context* context = Context::GetRawInstance(); context != nullptr && context->GetLogger() != nullptr) {
+        SPDLOG_ERROR("Could not create directory '{}': {}", path.generic_string(), message);
+    } else {
+        std::cerr << "Could not create directory '" << path.generic_string() << "': " << message << std::endl;
+    }
+}
+
+bool CreateDirectoriesSafely(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return true;
+    }
+
+    try {
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+        if (ec) {
+            LogDirectoryCreationFailure(path, ec.message());
+            return false;
+        }
+    } catch (const std::exception& ex) {
+        LogDirectoryCreationFailure(path, ex.what());
+        return false;
+    }
+    return true;
+}
+} // namespace
 
 Context* Context::GetRawInstance() {
     return mContext.get();
@@ -102,11 +132,43 @@ Context* Context::CreateUninitializedInstance(const std::string& name, const std
 
 Context::Context(std::string name, std::string shortName, std::string configFilePath)
     : mConfigFilePath(std::move(configFilePath)), mName(std::move(name)), mShortName(std::move(shortName)) {
+#ifdef __vita__
+    // app0: is the read-only application bundle. Create the complete writable
+    // tree before logging/configuration can attempt to open anything there.
+    CreateDirectoriesSafely(GetAppDirectoryPath());
+    CreateDirectoriesSafely(GetPathRelativeToAppDirectory("logs"));
+    CreateDirectoriesSafely(GetPathRelativeToAppDirectory("mods"));
+#endif
 }
 
 bool Context::Init(const std::vector<std::string>& archivePaths, const std::unordered_set<uint32_t>& validHashes,
                    uint32_t reservedThreadCount, AudioSettings audioSettings, std::shared_ptr<Window> window,
                    std::shared_ptr<ControlDeck> controlDeck) {
+#ifdef __WIIU__
+    // Wii U bring-up: name every stage so a hang is pinned to one call. The logger is
+    // synchronous here (see InitLogging), so the last line on the SD card IS the stage
+    // that hung. Remove once the port boots.
+#define LUS_WIIU_STAGE(expr, name)                                                                 \
+    ([&]() {                                                                                       \
+        SPDLOG_INFO("Wii U stage: {} ...", name);                                                  \
+        bool ok = (expr);                                                                          \
+        SPDLOG_INFO("Wii U stage: {} -> {}", name, ok ? "ok" : "FAILED");                           \
+        return ok;                                                                                 \
+    }())
+    return LUS_WIIU_STAGE(InitLogging(), "InitLogging") &&
+           LUS_WIIU_STAGE(InitConfiguration(), "InitConfiguration") &&
+           LUS_WIIU_STAGE(InitConsoleVariables(), "InitConsoleVariables") &&
+           LUS_WIIU_STAGE(InitResourceManager(archivePaths, validHashes, reservedThreadCount),
+                          "InitResourceManager") &&
+           LUS_WIIU_STAGE(InitControlDeck(controlDeck), "InitControlDeck") &&
+           LUS_WIIU_STAGE(InitCrashHandler(), "InitCrashHandler") &&
+           LUS_WIIU_STAGE(InitConsole(), "InitConsole") &&
+           LUS_WIIU_STAGE(InitWindow(window), "InitWindow") &&
+           LUS_WIIU_STAGE(InitAudio(audioSettings), "InitAudio") &&
+           LUS_WIIU_STAGE(InitEventSystem(), "InitEventSystem") &&
+           LUS_WIIU_STAGE(InitFileDropMgr(), "InitFileDropMgr");
+#undef LUS_WIIU_STAGE
+#else
     return InitLogging() && InitConfiguration() && InitConsoleVariables() &&
            InitResourceManager(archivePaths, validHashes, reservedThreadCount) && InitControlDeck(controlDeck) &&
            InitCrashHandler() && InitConsole() && InitWindow(window) && InitAudio(audioSettings) &&
@@ -114,6 +176,7 @@ bool Context::Init(const std::vector<std::string>& archivePaths, const std::unor
            InitEventSystem() && InitFileDropMgr() && InitScriptLoader();
 #else
            InitEventSystem() && InitFileDropMgr();
+#endif
 #endif
 }
 
@@ -125,7 +188,12 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
 
     try {
         // Setup Logging
+#if !defined(__WIIU__) && !defined(__vita__)
+        // Wii U and Vita use a synchronous logger (see below); creating spdlog's async thread pool here
+        // would spawn the very background thread that setup exists to avoid. Threads under wut's
+        // newlib have hung this port before, so do not create one just to throw it away.
         spdlog::init_thread_pool(8192, 1);
+#endif
         std::vector<spdlog::sink_ptr> sinks;
 
 #if (!defined(_WIN32)) || defined(_DEBUG)
@@ -165,12 +233,36 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         sinks.push_back(systemConsoleSink);
 #endif
 
-        auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetName() + ".log"));
-        auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
-        sinks.push_back(fileSink);
-#ifdef _DEBUG
+#if !defined(__WIIU__)
+        const auto logDirectory = GetPathRelativeToAppDirectory("logs");
+        CreateDirectoriesSafely(logDirectory);
+        const auto logPath = logDirectory + "/" + GetName() + ".log";
+        try {
+            auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
+            sinks.push_back(fileSink);
+        } catch (const spdlog::spdlog_ex& ex) {
+            std::cerr << "Log file initialization failed: " << ex.what() << std::endl;
+        }
+#endif
+#if defined(__WIIU__)
+        // The Wii U watchdog is the only runtime diagnostic channel. Keep spdlog
+        // constructed for the rest of the platform, but make every Wii U sink inert.
+        for (const auto& sink : sinks) {
+            sink->set_level(spdlog::level::off);
+        }
+#endif
+#if defined(_DEBUG) || defined(__WIIU__) || defined(__vita__)
+        // Wii U and Vita: use the SYNCHRONOUS logger. The release path below builds an
+        // spdlog::async_logger backed by a thread_pool, i.e. it spawns a background
+        // logging thread - which hangs under wut's newlib threading, and also means
+        // queued messages are never written, so the on-device log comes out EMPTY and
+        // the hang cannot be located. Synchronous + flush_on(trace) makes every line
+        // hit the SD card immediately, which is what makes on-device debugging possible.
         mLogger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
         GetLogger()->set_level(debugBuildLogLevel);
+#if defined(__WIIU__)
+        GetLogger()->set_level(spdlog::level::off);
+#endif
         GetLogger()->flush_on(spdlog::level::trace);
 #else
         mLogThreadPool = std::make_shared<spdlog::details::thread_pool>(8192, 1);
@@ -231,7 +323,7 @@ bool Context::InitResourceManager(const std::vector<std::string>& archivePaths,
     InitKeystore();
 #endif
 
-    mMainPath = GetConfig()->GetString("Game.Main Archive", GetAppDirectoryPath());
+    mMainPath = GetConfig()->GetString("Game.Main Archive", LocateFileAcrossAppDirs("mk64.o2r"));
     mPatchesPath = GetConfig()->GetString("Game.Patches Archive", GetAppDirectoryPath() + "/mods");
     if (archivePaths.empty()) {
         std::vector<std::string> paths = std::vector<std::string>();
@@ -246,8 +338,10 @@ bool Context::InitResourceManager(const std::vector<std::string>& archivePaths,
     }
 
     if (!allowEmptyPaths && !GetResourceManager()->IsLoaded()) {
+#ifndef __WIIU__
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OTR file not found",
                                  "Main OTR file not found. Please generate one", nullptr);
+#endif
         SPDLOG_ERROR("Main OTR file not found!");
 #ifdef __IOS__
         // We need this exit to close the app when we dismiss the dialog
@@ -274,12 +368,17 @@ bool Context::InitControlDeck(std::shared_ptr<ControlDeck> controlDeck) {
     // Bring up the SDL game-controller subsystem here rather than in osContInit, so controllers work
     // in pre-game UI (e.g. navigating extraction prompts). osContInit still runs ControlDeck::Init(),
     // which needs the game's controllerBits.
+#if defined(__WIIU__) || defined(__vita__)
+    // The Wii U and Vita have no SDL game controllers - input comes from their native
+    // controller APIs via the platform window/control paths - and there is no
+    // gamecontrollerdb.txt to load.
+    SPDLOG_INFO("{}: skipping SDL game-controller init; input is native platform controller API",
 #ifdef __WIIU__
-    // The Wii U has no SDL game controllers - input comes from VPAD/KPAD via the GX2 window
-    // backend - and there is no gamecontrollerdb.txt to load. SDL_INIT_GAMECONTROLLER also
-    // spawns a joystick thread (SDL_HINT_JOYSTICK_THREAD) which hangs under wut's newlib
-    // threading. The on-device log ended exactly here, so this whole block is skipped.
-    SPDLOG_INFO("Wii U: skipping SDL game-controller init; input is VPAD/KPAD");
+                "Wii U"
+#else
+                "PS Vita"
+#endif
+    );
 #else
     std::string controllerDb = LocateFileAcrossAppDirs("gamecontrollerdb.txt");
     int mappingsAdded = SDL_GameControllerAddMappingsFromFile(controllerDb.c_str());
@@ -308,6 +407,10 @@ bool Context::InitCrashHandler() {
         SPDLOG_ERROR("Failed to initialize crash handler");
         return false;
     }
+
+#ifdef __WIIU__
+    SPDLOG_WARN("Crash handler is not registered on Wii U");
+#endif
 
     return true;
 }
@@ -494,6 +597,10 @@ std::string Context::GetAppBundlePath() {
     return std::string(home) + "/Documents";
 #endif
 
+#ifdef __vita__
+    return "app0:";
+#endif
+
 #ifdef NON_PORTABLE
     return CMAKE_INSTALL_PREFIX;
 #else
@@ -557,6 +664,10 @@ std::string Context::GetAppDirectoryPath(const std::string& appName) {
     return std::string(home) + "/Documents";
 #endif
 
+#ifdef __vita__
+    return "ux0:data/SPAGHETTY";
+#endif
+
 #if defined(__APPLE__)
     FolderManager foldermanager;
     if (char* fpath = std::getenv("SHIP_HOME")) {
@@ -593,7 +704,13 @@ std::string Context::GetAppDirectoryPath(const std::string& appName) {
 }
 
 std::string Context::GetPathRelativeToAppBundle(const std::string& path) {
+#ifdef __vita__
+    // vitasdk's filesystem layer does not reliably resolve an explicit app0:
+    // prefix. Asset lookups must remain relative to the current directory.
+    return "./" + path;
+#else
     return GetAppBundlePath() + "/" + path;
+#endif
 }
 
 std::string Context::GetPathRelativeToAppDirectory(const std::string& path, const std::string& appName) {

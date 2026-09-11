@@ -39,6 +39,9 @@ struct ShaderProgram {
     GLint texture_width_location;
     GLint texture_height_location;
     GLint texture_filtering_location;
+#ifdef __vita__
+    GLint tex_size_location[2];
+#endif
 };
 
 struct FramebufferOGL {
