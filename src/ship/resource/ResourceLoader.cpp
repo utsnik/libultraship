@@ -8,6 +8,10 @@
 #include "ship/utils/binarytools/BinaryReader.h"
 #include "ship/resource/factory/JsonFactory.h"
 #include "ship/resource/factory/ShaderFactory.h"
+#include "ship/window/gui/resource/Font.h"
+#include "ship/window/gui/resource/FontFactory.h"
+#include "ship/window/gui/resource/GuiTexture.h"
+#include "ship/window/gui/resource/GuiTextureFactory.h"
 #include <spdlog/spdlog.h>
 #include <tinyxml2.h>
 #include "nlohmann/json.hpp"
@@ -26,6 +30,16 @@ void ResourceLoader::RegisterGlobalResourceFactories() {
                             static_cast<uint32_t>(ResourceType::Json), 0);
     RegisterResourceFactory(std::make_shared<ResourceFactoryBinaryShaderV0>(), RESOURCE_FORMAT_BINARY, "Shader",
                             static_cast<uint32_t>(ResourceType::Shader), 0);
+    // Font and GuiTexture used to be registered from Gui::Init()/GameOverlay::Init(),
+    // which run late in startup. A port that asks for either before its window exists
+    // got a null factory back - and on Wii U a null font is then handed to GX2 as a
+    // texture, which locks the memory bus and stops all three PowerPC cores dead.
+    // They are plain binary factories with no GUI state, so register them here with
+    // the other global ones and the request order stops mattering.
+    RegisterResourceFactory(std::make_shared<ResourceFactoryBinaryFontV0>(), RESOURCE_FORMAT_BINARY, "Font",
+                            static_cast<uint32_t>(RESOURCE_TYPE_FONT), 0);
+    RegisterResourceFactory(std::make_shared<ResourceFactoryBinaryGuiTextureV0>(), RESOURCE_FORMAT_BINARY, "GuiTexture",
+                            static_cast<uint32_t>(RESOURCE_TYPE_GUI_TEXTURE), 0);
 }
 
 bool ResourceLoader::RegisterResourceFactory(std::shared_ptr<ResourceFactory> factory, uint32_t format,

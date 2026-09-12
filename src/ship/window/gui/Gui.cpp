@@ -108,9 +108,17 @@ void Gui::Init() {
     }
     GetGameOverlay()->Init();
 
-    Context::GetRawInstance()->GetResourceManager()->GetResourceLoader()->RegisterResourceFactory(
-        std::make_shared<ResourceFactoryBinaryGuiTextureV0>(), RESOURCE_FORMAT_BINARY, "GuiTexture",
-        static_cast<uint32_t>(RESOURCE_TYPE_GUI_TEXTURE), 0);
+    // Registered globally in ResourceLoader::RegisterGlobalResourceFactories() so it is
+    // available before the window exists; kept here only for the case where it was not.
+    // Re-registering the same key logs an error and returns false, so it must be guarded.
+    {
+        auto loader = Context::GetRawInstance()->GetResourceManager()->GetResourceLoader();
+        if (loader->GetResourceType("GuiTexture") == 0) {
+            loader->RegisterResourceFactory(std::make_shared<ResourceFactoryBinaryGuiTextureV0>(),
+                                            RESOURCE_FORMAT_BINARY, "GuiTexture",
+                                            static_cast<uint32_t>(RESOURCE_TYPE_GUI_TEXTURE), 0);
+        }
+    }
 
     ImGuiWMInit();
     ImGuiBackendInit();
