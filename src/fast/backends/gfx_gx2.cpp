@@ -330,8 +330,15 @@ static void gfx_gx2_shader_get_info(struct ShaderProgram* prg, uint8_t* num_inpu
 }
 
 static uint32_t gfx_gx2_new_texture(void) {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_NEW_TEXTURE, nullptr);
     // some 32-bit trickery :P
     struct GX2TextureEntry* tex = (struct GX2TextureEntry*)calloc(1, sizeof(struct GX2TextureEntry));
+    if (!tex) {
+        // Was an unchecked dereference of null on the next line.
+        WDOG_EMIT("GX2TEX: !! new_texture calloc failed size=%u\n", (unsigned int)sizeof(struct GX2TextureEntry));
+        SPDLOG_ERROR("gfx_gx2: texture entry allocation failed");
+        return 0;
+    }
 
     tex->imtex.Texture = &tex->texture;
     tex->imtex.Sampler = &tex->sampler;
@@ -358,6 +365,8 @@ static void gfx_gx2_set_pixel_texture(int tile, int32_t sampler_location, GX2Tex
 }
 
 static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
+    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SELECT_TEXTURE, "tile=%d id=0x%08X", tile,
+                   (unsigned int)texture_id);
     static bool trace_first_texture_select = true;
     const bool trace = trace_first_texture_select;
     struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
@@ -400,7 +409,11 @@ static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
 }
 
 static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
-    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD, WDOG_TEXTURE_DETAIL());
+    // Distinct phase from the inner GX2Invalidate breadcrumb below. Both used to report
+    // "gx2-tex-upload(returned)" with the same detail, so a frozen breadcrumb could not say
+    // whether the wedge was after GX2Invalidate or after this whole function returned.
+    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD_FN, "%ux%u path=%s", (unsigned int)width,
+                   (unsigned int)height, WDOG_TEXTURE_DETAIL());
     static bool trace_first_texture_upload = true;
     const bool trace = trace_first_texture_upload;
     struct GX2TextureEntry* tex = current_texture;
@@ -472,6 +485,14 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
             SPDLOG_INFO("gfx_gx2: first frame texture: allocation returned ptr={}",
                         static_cast<const void*>(tex->texture.surface.image));
         }
+        // Raw channel, not spdlog: the 2026-09-12 capture ends inside this function and
+        // contains none of the SPDLOG lines above it, so the spdlog path is lossy exactly
+        // where it matters. These numbers are the ones that identify a bogus surface.
+        WDOG_EMIT("GX2TEX: alloc %ux%u pitch=%u imageSize=%u align=%u ptr=0x%08X mem1Free=%u count=%u\n",
+                  (unsigned int)width, (unsigned int)height, (unsigned int)tex->texture.surface.pitch,
+                  (unsigned int)tex->texture.surface.imageSize, (unsigned int)tex->texture.surface.alignment,
+                  (unsigned int)(uintptr_t)tex->texture.surface.image, (unsigned int)mem1Free,
+                  (unsigned int)::Ship::WiiU::Watchdog::gTexCount);
         WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_ALLOC);
     }
 
@@ -498,7 +519,10 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame texture: GX2Invalidate ...");
     }
-    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD, "GX2Invalidate");
+    WDOG_ENTER_FMT(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD, "GX2Invalidate ptr=0x%08X size=%u %ux%u pitch=%u",
+                   (unsigned int)(uintptr_t)tex->texture.surface.image,
+                   (unsigned int)tex->texture.surface.imageSize, (unsigned int)width, (unsigned int)height,
+                   (unsigned int)tex->texture.surface.pitch);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
     if (trace) {
@@ -538,6 +562,8 @@ static GX2TexClampMode gfx_cm_to_gx2(uint32_t val) {
 }
 
 static void gfx_gx2_set_sampler_parameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
+    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_SAMPLER, "tile=%d linear=%d cms=%u cmt=%u", tile,
+                   linear_filter ? 1 : 0, (unsigned int)cms, (unsigned int)cmt);
     static bool trace_first_sampler_update = true;
     const bool trace = trace_first_sampler_update;
     struct GX2TextureEntry* tex = current_texture;

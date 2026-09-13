@@ -171,6 +171,9 @@ volatile uint32_t gTexBytes = 0;
 volatile uint32_t gTexCount = 0;
 volatile uint32_t gLastTexPtr = 0;
 volatile uint32_t gFlipCount = 0;
+// On by default in this diagnosis build: see the header for why the 500 ms tick is the
+// blind spot rather than the breadcrumbs.
+volatile uint32_t gEventStream = 1;
 
 static OSThread sThread;
 // 32 KB, statically reserved. The watchdog must survive a stall inside the allocator,
@@ -211,6 +214,22 @@ static const char* PhaseName(uint32_t phase) {
             return "gx2-set-vertex-shader";
         case PH_GX2_SET_PIXEL_SHADER:
             return "gx2-set-pixel-shader";
+        case PH_TEX_UPLOAD_FN:
+            return "gx2-upload-texture-fn";
+        case PH_GX2_NEW_TEXTURE:
+            return "gx2-new-texture";
+        case PH_GX2_SELECT_TEXTURE:
+            return "gx2-select-texture";
+        case PH_GX2_SET_SAMPLER:
+            return "gx2-set-sampler";
+        case PH_GUI_TEXTURE:
+            return "gui-texture-load";
+        case PH_IMGUI_FONT_TEX:
+            return "imgui-fonts-texture";
+        case PH_IMGUI_DEVICE_OBJECTS:
+            return "imgui-device-objects";
+        case PH_IMGUI_NEW_FRAME:
+            return "imgui-new-frame";
         default:
             return "?";
     }
@@ -220,7 +239,12 @@ static const char* PhaseName(uint32_t phase) {
 // no allocation - see the header for why that matters.
 void Emit(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void Emit(const char* fmt, ...) {
-    static char line[512];
+    // MUST stay a stack local. With gEventStream on, the main thread (Enter/Leave) and the
+    // watchdog thread (tick lines) call this concurrently; a shared static buffer would
+    // interleave them and the channel would lie - the third time instrumentation would have
+    // lied in this hunt. 512 bytes fits the watchdog's 32 KB stack, and stack use keeps
+    // Emit allocation-free, which is the one rule this file exists to obey.
+    char line[512];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
@@ -241,10 +265,10 @@ void Emit(const char* fmt, ...) {
 }
 
 void TraceEvent(uint32_t phase, const char* event) {
-    if (gTraceState != TRACE_ACTIVE) {
+    if (gTraceState != TRACE_ACTIVE && gEventStream == 0) {
         return;
     }
-    if (phase == PH_TEX_UPLOAD && strcmp(event, "enter") == 0 &&
+    if (gTraceState == TRACE_ACTIVE && phase == PH_TEX_UPLOAD && strcmp(event, "enter") == 0 &&
         gTraceStepState == TRACE_STEPS_WAITING && strstr(gDetail, "font_letter") != nullptr) {
         gTraceStepState = TRACE_STEPS_ACTIVE;
         gTraceStepsRemaining = WDOG_TRACE_STEP_COUNT;

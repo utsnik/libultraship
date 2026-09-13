@@ -9,6 +9,7 @@
 #include "fast/resource/type/Texture.h"
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/resource/File.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 #ifdef __WIIU__
 #include "fast/backends/imgui_impl_gx2.h"
@@ -228,7 +229,10 @@ void Fast3dGui::ImGuiBackendNewFrame() {
             if (trace) {
                 SPDLOG_INFO("Fast3dGui::StartDraw: first frame ImGui_ImplGX2_NewFrame begin");
             }
-            ImGui_ImplGX2_NewFrame();
+            {
+                WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_IMGUI_NEW_FRAME, "first frame");
+                ImGui_ImplGX2_NewFrame();
+            }
             if (trace) {
                 SPDLOG_INFO("Fast3dGui::StartDraw: first frame ImGui_ImplGX2_NewFrame complete");
                 trace_first_renderer_new_frame = false;
@@ -638,6 +642,9 @@ void Fast3dGui::LoadTextureFromRawImage(const std::string& name, const std::stri
 }
 
 void Fast3dGui::LoadTextureFromResource(const std::string& name, std::shared_ptr<Ship::GuiTexture> texture) {
+    // Named breadcrumb: the Banjo boot wedges during this burst of GUI-texture loads, and
+    // until now the frozen breadcrumb could not say which texture.
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GUI_TEXTURE, name.c_str());
     GfxRenderingAPI* api = mInterpreter.lock()->GetCurrentRenderingAPI();
 
     // TODO: Nothing ever unloads the texture from Fast3D here.
@@ -651,6 +658,7 @@ void Fast3dGui::LoadTextureFromResource(const std::string& name, std::shared_ptr
 
 void Fast3dGui::LoadGuiTexture(const std::string& name, const Fast::Texture& res, const std::string& palettePath,
                                const ImVec4& tint) {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GUI_TEXTURE, name.c_str());
     GfxRenderingAPI* api = mInterpreter.lock()->GetCurrentRenderingAPI();
     std::vector<uint8_t> texBuffer;
     texBuffer.reserve(res.Width * res.Height * 4);

@@ -38,6 +38,18 @@ enum Phase : uint32_t {
     PH_GX2_SET_FETCH_SHADER,  // GX2SetFetchShader()
     PH_GX2_SET_VERTEX_SHADER, // GX2SetVertexShader()
     PH_GX2_SET_PIXEL_SHADER,  // GX2SetPixelShader()
+    // Added for the Banjo "wedge after gx2-tex-upload returned" hunt. The old vocabulary
+    // could not tell the inner GX2Invalidate leave apart from the upload function's own
+    // scope leave - both printed "gx2-tex-upload(returned)" with the same detail - and the
+    // texture *setup* calls around an upload were not instrumented at all.
+    PH_TEX_UPLOAD_FN,         // gfx_gx2_upload_texture() as a whole
+    PH_GX2_NEW_TEXTURE,       // gfx_gx2_new_texture()
+    PH_GX2_SELECT_TEXTURE,    // gfx_gx2_select_texture()
+    PH_GX2_SET_SAMPLER,       // gfx_gx2_set_sampler_parameters()
+    PH_GUI_TEXTURE,           // Fast3dGui GUI-texture load (named)
+    PH_IMGUI_FONT_TEX,        // ImGui_ImplGX2_CreateFontsTexture()
+    PH_IMGUI_DEVICE_OBJECTS,  // ImGui_ImplGX2_CreateDeviceObjects()
+    PH_IMGUI_NEW_FRAME,       // ImGui_ImplGX2_NewFrame()
     PH_COUNT
 };
 
@@ -68,6 +80,12 @@ extern volatile uint32_t gCmd;    // command pointer, as an integer
 extern volatile uint32_t gFrame;
 extern char gDetail[128];
 extern char gTexturePath[128];
+// Diagnosis switch: when non-zero every Enter/Leave transmits its own line immediately,
+// instead of only being visible if a 500 ms tick happens to sample it. The wedge being
+// hunted kills the whole PowerPC within one tick of the last breadcrumb, so the tick is
+// the blind spot - not the instrumentation. Deliberately independent of gTraceState so it
+// does not arm the MK64 display-list step flood.
+extern volatile uint32_t gEventStream;
 extern volatile uint32_t gTraceState;
 extern volatile uint32_t gTraceFramesRemaining;
 extern volatile uint32_t gTraceStepState;
@@ -140,6 +158,17 @@ inline void SetDetailV(const char* fmt, va_list ap) {
 
 inline void Enter(uint32_t phase, const char* detail) {
     SetDetail(detail);
+    gPhase = phase;
+    ++gSeq;
+    TraceEvent(phase, "enter");
+}
+
+inline void EnterFmt(uint32_t phase, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+inline void EnterFmt(uint32_t phase, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    SetDetailV(fmt, ap);
+    va_end(ap);
     gPhase = phase;
     ++gSeq;
     TraceEvent(phase, "enter");
@@ -221,6 +250,8 @@ void Start();
 #define WDOG_CAT(a, b) WDOG_CAT_(a, b)
 
 #define WDOG_ENTER(phase, detail) ::Ship::WiiU::Watchdog::Enter(phase, detail)
+#define WDOG_ENTER_FMT(phase, fmt, ...) ::Ship::WiiU::Watchdog::EnterFmt(phase, fmt, __VA_ARGS__)
+#define WDOG_EMIT(...) ::Ship::WiiU::Watchdog::Emit(__VA_ARGS__)
 #define WDOG_LEAVE(phase) ::Ship::WiiU::Watchdog::Leave(phase)
 #define WDOG_STEP(op, cmd, steps) ::Ship::WiiU::Watchdog::Step(op, cmd, steps)
 #define WDOG_FRAME(n) ::Ship::WiiU::Watchdog::Frame(n)
@@ -234,6 +265,8 @@ void Start();
 #else
 
 #define WDOG_ENTER(phase, detail) ((void)0)
+#define WDOG_ENTER_FMT(phase, fmt, ...) ((void)0)
+#define WDOG_EMIT(...) ((void)0)
 #define WDOG_LEAVE(phase) ((void)0)
 #define WDOG_STEP(op, cmd, steps) ((void)0)
 #define WDOG_FRAME(n) ((void)0)

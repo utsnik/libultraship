@@ -14,6 +14,8 @@
 #include <gx2/mem.h>
 #include <gx2r/surface.h>
 
+#include "port/wiiu/WiiUWatchdog.h"
+
 // Include shader data
 #include "shaders/shader.h"
 
@@ -238,6 +240,7 @@ void    ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
 
 bool ImGui_ImplGX2_CreateFontsTexture()
 {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX, "enter");
     ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
 
@@ -249,7 +252,16 @@ bool ImGui_ImplGX2_CreateFontsTexture()
     // Build texture atlas
     unsigned char* src_pixels;
     int width, height;
-    io.Fonts->GetTexDataAsRGBA32(&src_pixels, &width, &height);   // Load as RGBA 32-bit (75% of the memory is wasted, but default font is so small) because it is more likely to be compatible with user's existing shaders.
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX, "GetTexDataAsRGBA32");
+    io.Fonts->GetTexDataAsRGBA32(&src_pixels, &width, &height);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX);
+    WDOG_EMIT("IMGUIFONT: atlas %dx%d src=0x%08X\n", width, height, (unsigned int)(uintptr_t)src_pixels);
+    if (!src_pixels || width <= 0 || height <= 0)
+    {
+        WDOG_EMIT("IMGUIFONT: !! no atlas pixels - refusing to build the texture\n");
+        SPDLOG_ERROR("ImGui_ImplGX2_CreateFontsTexture: font atlas has no pixels ({}x{})", width, height);
+        return false;
+    }   // Load as RGBA 32-bit (75% of the memory is wasted, but default font is so small) because it is more likely to be compatible with user's existing shaders.
 
     bd->FontTexture = IM_NEW(ImGui_ImplGX2_Texture)();
 
@@ -271,16 +283,52 @@ bool ImGui_ImplGX2_CreateFontsTexture()
     // swapped for endianness
     tex->compMap = GX2_COMP_MAP(GX2_SQ_SEL_A, GX2_SQ_SEL_B, GX2_SQ_SEL_G, GX2_SQ_SEL_R);
 
-    GX2RCreateSurface(&tex->surface, GX2R_RESOURCE_BIND_TEXTURE | GX2R_RESOURCE_USAGE_CPU_WRITE | GX2R_RESOURCE_USAGE_GPU_READ);
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX, "GX2RCreateSurface");
+    const BOOL surfaceOk = GX2RCreateSurface(&tex->surface, GX2R_RESOURCE_BIND_TEXTURE | GX2R_RESOURCE_USAGE_CPU_WRITE | GX2R_RESOURCE_USAGE_GPU_READ);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX);
+    WDOG_EMIT("IMGUIFONT: surface ok=%d pitch=%u imageSize=%u align=%u image=0x%08X\n", (int)surfaceOk,
+              (unsigned int)tex->surface.pitch, (unsigned int)tex->surface.imageSize,
+              (unsigned int)tex->surface.alignment, (unsigned int)(uintptr_t)tex->surface.image);
+    if (!surfaceOk)
+    {
+        // Was unchecked. A failed GX2R allocation left surface.image null and the lock below
+        // handed the memcpy a bogus destination - a silent whole-system kill, no CPU fault.
+        WDOG_EMIT("IMGUIFONT: !! GX2RCreateSurface failed\n");
+        SPDLOG_ERROR("ImGui_ImplGX2_CreateFontsTexture: GX2RCreateSurface failed for a {}x{} atlas", width, height);
+        return false;
+    }
     GX2InitTextureRegs(tex);
 
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX, "GX2RLockSurfaceEx");
     unsigned char* dst_pixels = (unsigned char*) GX2RLockSurfaceEx(&tex->surface, 0, GX2R_RESOURCE_BIND_NONE);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX);
+    // Also unchecked, and the copy below is unbounded: the same overrun guard the Fast3D
+    // upload path already carries. pitch is in pixels, so the last row ends at
+    // (height-1)*pitch*4 + width*4 bytes.
+    const uint32_t neededBytes = (uint32_t)((height - 1) * (int)tex->surface.pitch * 4) + (uint32_t)(width * 4);
+    WDOG_EMIT("IMGUIFONT: lock dst=0x%08X needed=%u imageSize=%u\n", (unsigned int)(uintptr_t)dst_pixels,
+              (unsigned int)neededBytes, (unsigned int)tex->surface.imageSize);
+    if (!dst_pixels || neededBytes > tex->surface.imageSize)
+    {
+        WDOG_EMIT("IMGUIFONT: !! refusing the atlas copy\n");
+        SPDLOG_ERROR("ImGui_ImplGX2_CreateFontsTexture: refusing atlas copy dst={} needed={} imageSize={}",
+                     static_cast<const void*>(dst_pixels), neededBytes, tex->surface.imageSize);
+        if (dst_pixels)
+        {
+            GX2RUnlockSurfaceEx(&tex->surface, 0, GX2R_RESOURCE_BIND_NONE);
+        }
+        return false;
+    }
 
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX, "atlas copy");
     for (int y = 0; y < height; y++) {
         memcpy(dst_pixels + (y * tex->surface.pitch * 4), src_pixels + (y * width * 4), width * 4);
     }
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX);
 
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX, "GX2RUnlockSurfaceEx");
     GX2RUnlockSurfaceEx(&tex->surface, 0, GX2R_RESOURCE_BIND_NONE);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX);
 
     bd->FontTexture->Sampler = IM_NEW(GX2Sampler)();
     GX2InitSampler(bd->FontTexture->Sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_LINEAR);
@@ -308,6 +356,7 @@ void ImGui_ImplGX2_DestroyFontsTexture()
 
 bool    ImGui_ImplGX2_CreateDeviceObjects()
 {
+    WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_IMGUI_DEVICE_OBJECTS, "enter");
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
     if (!bd)
     {
