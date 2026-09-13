@@ -60,6 +60,10 @@ constexpr uint32_t PH_DONE = 0x8000u;
 constexpr uint32_t WDOG_TICK_INTERVAL_MS = 500u;
 constexpr uint32_t WDOG_TRACE_FRAME_COUNT = 30u;
 constexpr uint32_t WDOG_TRACE_STEP_COUNT = 3000u;
+// How long the main thread must be frozen before the watchdog tries to rescue the console by
+// returning to the system menu. Generous on purpose: a legitimate 3-second font stall has been
+// measured on this port and must not trip it.
+constexpr uint32_t WDOG_STALL_RESCUE_MS = 15000u;
 
 enum TraceState : uint32_t {
     TRACE_OFF = 0,
