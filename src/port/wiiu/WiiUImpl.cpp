@@ -50,6 +50,118 @@ static bool hasKpad[4] = { false };
 static KPADError kpadError[4] = { KPAD_ERROR_OK };
 static KPADStatus kpadStatus[4];
 
+// This is the only storage used by the exception path.  It must remain independent of
+// the heap, locks, sockets, and the game's renderer: OSFatal owns the last step.
+static char sExceptionMessage[768];
+static const char sExceptionHexDigits[] = "0123456789ABCDEF";
+static const char* const sExceptionGprNames[] = {
+    "GPR0",  "GPR1",  "GPR2",  "GPR3",  "GPR4",  "GPR5",  "GPR6",
+    "GPR7",  "GPR8",  "GPR9",  "GPR10", "GPR11", "GPR12",
+};
+
+static char* AppendExceptionText(char* destination, const char* source) {
+    while (*source != '\0') {
+        *destination++ = *source++;
+    }
+    return destination;
+}
+
+static char* AppendExceptionHex(char* destination, uint32_t value) {
+    *destination++ = '0';
+    *destination++ = 'x';
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        *destination++ = sExceptionHexDigits[(value >> shift) & 0xF];
+    }
+    return destination;
+}
+
+static char* AppendExceptionRegister(char* destination, const char* name, uint32_t value) {
+    destination = AppendExceptionText(destination, name);
+    *destination++ = '=';
+    destination = AppendExceptionHex(destination, value);
+    *destination++ = ' ';
+    return destination;
+}
+
+static void FormatExceptionMessage(const char* typeName, const OSContext* context) {
+    char* destination = sExceptionMessage;
+    destination = AppendExceptionText(destination, "Wii U ");
+    destination = AppendExceptionText(destination, typeName);
+    destination = AppendExceptionText(destination, " exception\n");
+
+    if (context == nullptr) {
+        destination = AppendExceptionText(destination, "exception context unavailable\n");
+        *destination = '\0';
+        return;
+    }
+
+    destination = AppendExceptionRegister(destination, "SRR0", context->srr0);
+    destination = AppendExceptionRegister(destination, "SRR1", context->srr1);
+    *destination++ = '\n';
+    destination = AppendExceptionRegister(destination, "DAR", context->dar);
+    destination = AppendExceptionRegister(destination, "DSISR", context->dsisr);
+    *destination++ = '\n';
+    destination = AppendExceptionRegister(destination, "LR", context->lr);
+    *destination++ = '\n';
+
+    // r0-r12 cover the volatile call state, stack pointer, TOC, and argument registers.
+    for (int gpr = 0; gpr <= 12; ++gpr) {
+        destination = AppendExceptionRegister(destination, sExceptionGprNames[gpr], context->gpr[gpr]);
+        if (gpr == 3 || gpr == 6 || gpr == 9 || gpr == 12) {
+            *destination++ = '\n';
+        }
+    }
+    *destination = '\0';
+}
+
+static BOOL FatalException(const char* typeName, OSContext* context) {
+    FormatExceptionMessage(typeName, context);
+    OSFatal(sExceptionMessage);
+    return FALSE;
+}
+
+static BOOL DsiExceptionCallback(OSContext* context) {
+    return FatalException("DSI", context);
+}
+
+static BOOL IsiExceptionCallback(OSContext* context) {
+    return FatalException("ISI", context);
+}
+
+static BOOL ProgramExceptionCallback(OSContext* context) {
+    return FatalException("PROGRAM", context);
+}
+
+static BOOL MachineCheckExceptionCallback(OSContext* context) {
+    return FatalException("MACHINE_CHECK", context);
+}
+
+static BOOL AlignmentExceptionCallback(OSContext* context) {
+    return FatalException("ALIGNMENT", context);
+}
+
+static BOOL FloatingPointExceptionCallback(OSContext* context) {
+    return FatalException("FLOATING_POINT", context);
+}
+
+// All six types the previous socket-based version covered. ALIGNMENT in particular is
+// worth keeping on PowerPC: this port reads little-endian archive data, and a misaligned
+// or swapped access is a live failure mode here, not a theoretical one.
+//
+// OSSetExceptionCallbackEx(GLOBAL_ALL_CORES) replaces the old per-core OSSetExceptionCallback,
+// which needed a thread spawned on each of the three cores to install itself.
+static void InstallExceptionCallbacks() {
+    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_DSI, DsiExceptionCallback);
+    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_ISI, IsiExceptionCallback);
+    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_PROGRAM, ProgramExceptionCallback);
+    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_MACHINE_CHECK,
+                             MachineCheckExceptionCallback);
+    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_ALIGNMENT,
+                             AlignmentExceptionCallback);
+    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_FLOATING_POINT,
+                             FloatingPointExceptionCallback);
+}
+
 #if 1 /* force UDP logging: no other way to diagnose on-device */
 extern "C" {
 void __wrap_abort() {
@@ -88,6 +200,8 @@ static const devoptab_t dotab_stdout = {
 #endif
 
 void Init(const std::string& shortName) {
+    InstallExceptionCallbacks();
+
 #if 1 /* force UDP logging: no other way to diagnose on-device */
     WHBLogUdpInit();
     WHBLogPrint("Hello World!");
@@ -330,83 +444,6 @@ void ArmTraceAfterTrackLoad() {
     gTraceState = TRACE_ARMED;
 }
 
-static BOOL EmitException(OSExceptionType type, const char* typeName, OSContext* context) {
-    Emit("EXC: core=%u\n", (unsigned int)OSGetCoreId());
-    Emit("EXC: type=%s (%u)\n", typeName, (unsigned int)type);
-    Emit("EXC: srr0=0x%08X\n", context->srr0);
-    Emit("EXC: srr1=0x%08X\n", context->srr1);
-    Emit("EXC: dar=0x%08X\n", context->dar);
-    Emit("EXC: dsisr=0x%08X\n", context->dsisr);
-    Emit("EXC: lr=0x%08X\n", context->lr);
-    // FALSE = "not handled": the kernel then takes exactly the path it took in all six
-    // previous freezes, so this build only ADDS information and does not change the
-    // failure. Returning TRUE would resume at srr0, re-run the faulting instruction and
-    // fault again forever, flooding the channel and altering what we are measuring.
-    return FALSE;
-}
-
-static BOOL DsiExceptionCallback(OSContext* context) {
-    return EmitException(OS_EXCEPTION_TYPE_DSI, "DSI", context);
-}
-
-static BOOL IsiExceptionCallback(OSContext* context) {
-    return EmitException(OS_EXCEPTION_TYPE_ISI, "ISI", context);
-}
-
-static BOOL ProgramExceptionCallback(OSContext* context) {
-    return EmitException(OS_EXCEPTION_TYPE_PROGRAM, "PROGRAM", context);
-}
-
-static BOOL MachineCheckExceptionCallback(OSContext* context) {
-    return EmitException(OS_EXCEPTION_TYPE_MACHINE_CHECK, "MACHINE_CHECK", context);
-}
-
-static BOOL AlignmentExceptionCallback(OSContext* context) {
-    return EmitException(OS_EXCEPTION_TYPE_ALIGNMENT, "ALIGNMENT", context);
-}
-
-static BOOL FloatingPointExceptionCallback(OSContext* context) {
-    return EmitException(OS_EXCEPTION_TYPE_FLOATING_POINT, "FLOATING_POINT", context);
-}
-
-static int RegisterExceptionCallbacks(int, const char**) {
-    OSSetExceptionCallback(OS_EXCEPTION_TYPE_MACHINE_CHECK, MachineCheckExceptionCallback);
-    OSSetExceptionCallback(OS_EXCEPTION_TYPE_DSI, DsiExceptionCallback);
-    OSSetExceptionCallback(OS_EXCEPTION_TYPE_ISI, IsiExceptionCallback);
-    OSSetExceptionCallback(OS_EXCEPTION_TYPE_ALIGNMENT, AlignmentExceptionCallback);
-    OSSetExceptionCallback(OS_EXCEPTION_TYPE_PROGRAM, ProgramExceptionCallback);
-    OSSetExceptionCallback(OS_EXCEPTION_TYPE_FLOATING_POINT, FloatingPointExceptionCallback);
-    Emit("EXC: registered core=%u\n", (unsigned int)OSGetCoreId());
-    return 0;
-}
-
-static void RegisterExceptionCallbacksOnAllCores() {
-    static OSThread threads[3];
-    static uint8_t stacks[3][4 * 1024] __attribute__((aligned(16)));
-    static const OSThreadAttributes attributes[3] = {
-        (OSThreadAttributes)OS_THREAD_ATTRIB_AFFINITY_CPU0,
-        (OSThreadAttributes)OS_THREAD_ATTRIB_AFFINITY_CPU1,
-        (OSThreadAttributes)OS_THREAD_ATTRIB_AFFINITY_CPU2,
-    };
-    bool started[3] = { false, false, false };
-
-    for (int core = 0; core < 3; ++core) {
-        if (!OSCreateThread(&threads[core], RegisterExceptionCallbacks, 0, nullptr,
-                            stacks[core] + sizeof(stacks[core]), sizeof(stacks[core]), 5, attributes[core])) {
-            Emit("EXC: registration thread failed core=%d\n", core);
-            continue;
-        }
-        started[core] = true;
-        OSResumeThread(&threads[core]);
-    }
-
-    for (int core = 0; core < 3; ++core) {
-        if (started[core]) {
-            OSJoinThread(&threads[core], nullptr);
-        }
-    }
-}
-
 static int Main(int, const char**) {
     Emit("WDOG: online core=%d - if you never see this line the socket is the problem, not the game\n",
          (int)OSGetCoreId());
@@ -526,8 +563,6 @@ void Start() {
          "watchdog cannot report and its silence means nothing)\n",
          sSocket, testRc, (unsigned int)((kLogHostAddr >> 24) & 0xFF), (unsigned int)((kLogHostAddr >> 16) & 0xFF),
          (unsigned int)((kLogHostAddr >> 8) & 0xFF), (unsigned int)(kLogHostAddr & 0xFF));
-
-    RegisterExceptionCallbacksOnAllCores();
 
     // Core 2. The game loop runs on core 1, so a stalled main thread cannot hold this off.
     // Priority 5 is above the main thread's 16 (lower number wins on Cafe OS).
