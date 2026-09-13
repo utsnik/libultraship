@@ -83,6 +83,21 @@ static char* AppendExceptionRegister(char* destination, const char* name, uint32
     return destination;
 }
 
+static void EmitExceptionMessage() {
+    const char* line = sExceptionMessage;
+    while (*line != '\0') {
+        const char* end = line;
+        while (*end != '\0' && *end != '\n') {
+            ++end;
+        }
+        if (*end == '\n') {
+            ++end;
+        }
+        Watchdog::Emit("EXC: %.*s", (int)(end - line), line);
+        line = end;
+    }
+}
+
 static void FormatExceptionMessage(const char* typeName, const OSContext* context) {
     char* destination = sExceptionMessage;
     destination = AppendExceptionText(destination, "Wii U ");
@@ -116,6 +131,7 @@ static void FormatExceptionMessage(const char* typeName, const OSContext* contex
 
 static BOOL FatalException(const char* typeName, OSContext* context) {
     FormatExceptionMessage(typeName, context);
+    EmitExceptionMessage();
     OSFatal(sExceptionMessage);
     return FALSE;
 }
@@ -162,6 +178,37 @@ static void InstallExceptionCallbacks() {
                              FloatingPointExceptionCallback);
 }
 
+static OSThread sCrashTestThread;
+static uint8_t sCrashTestStack[4 * 1024] __attribute__((aligned(16)));
+
+static int CrashTestMain(int, const char**) {
+    OSSleepTicks(OSMillisecondsToTicks(1000));
+    Watchdog::Emit("EXC: CRASHTEST triggering DSI\n");
+    *(volatile uint32_t*)0xdeadc0d0 = 0xcafebabe;
+    return 0;
+}
+
+static void ArmCrashTestIfRequested() {
+    // Init has already chdir'd into /vol/external01/wiiu/apps/<shortName>, and "sd:" is not a
+    // mount wut provides - use the real device path so a missing file means "not requested"
+    // rather than "wrong path".
+    FILE* marker = fopen("CRASHTEST", "rb");
+    if (marker == nullptr) {
+        return;
+    }
+    fclose(marker);
+
+    Watchdog::Emit("EXC: CRASHTEST found; DSI scheduled in 1000ms\n");
+    if (!OSCreateThread(&sCrashTestThread, CrashTestMain, 0, nullptr,
+                        sCrashTestStack + sizeof(sCrashTestStack), sizeof(sCrashTestStack), 5,
+                        (OSThreadAttributes)OS_THREAD_ATTRIB_AFFINITY_CPU1)) {
+        Watchdog::Emit("EXC: CRASHTEST thread creation failed\n");
+        return;
+    }
+    OSSetThreadName(&sCrashTestThread, "Wii U crash test");
+    OSResumeThread(&sCrashTestThread);
+}
+
 #if 1 /* force UDP logging: no other way to diagnose on-device */
 extern "C" {
 void __wrap_abort() {
@@ -200,8 +247,6 @@ static const devoptab_t dotab_stdout = {
 #endif
 
 void Init(const std::string& shortName) {
-    InstallExceptionCallbacks();
-
 #if 1 /* force UDP logging: no other way to diagnose on-device */
     WHBLogUdpInit();
     WHBLogPrint("Hello World!");
@@ -221,6 +266,9 @@ void Init(const std::string& shortName) {
     WPADEnableURCC(true);
 
     Watchdog::Start();
+    InstallExceptionCallbacks();
+    Watchdog::Emit("EXC: exception handlers installed successfully\n");
+    ArmCrashTestIfRequested();
 }
 
 void Exit() {
