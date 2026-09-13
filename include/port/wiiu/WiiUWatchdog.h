@@ -87,6 +87,14 @@ extern char gTexturePath[128];
 // the blind spot - not the instrumentation. Deliberately independent of gTraceState so it
 // does not arm the MK64 display-list step flood.
 extern volatile uint32_t gEventStream;
+// Channel health. Measured 2026-09-13: at 322 datagrams/second the UDP output stopped dead -
+// spdlog's WHBLogUdp broadcast and this file's own broadcast socket together - while the game
+// ran on to GameEngine::Create: exit (proved by the card log, which is not on this channel).
+// Silence on this channel is therefore NOT evidence about the game. These counters, plus the
+// sequence number now carried on every streamed line, make loss measurable instead of
+// invisible.
+extern volatile uint32_t gEmitOk;
+extern volatile uint32_t gEmitFail;
 extern volatile uint32_t gTraceState;
 extern volatile uint32_t gTraceFramesRemaining;
 extern volatile uint32_t gTraceStepState;

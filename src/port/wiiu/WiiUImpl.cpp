@@ -174,6 +174,14 @@ volatile uint32_t gFlipCount = 0;
 // On by default in this diagnosis build: see the header for why the 500 ms tick is the
 // blind spot rather than the breadcrumbs.
 volatile uint32_t gEventStream = 1;
+volatile uint32_t gEmitOk = 0;
+volatile uint32_t gEmitFail = 0;
+
+// UNICAST, not broadcast. Broadcast is what died at 322 datagrams/second on 2026-09-13 and
+// took every diagnostic line with it, which then read as a PowerPC-wide wedge for two
+// sessions. This is the workstation running wiiu/udplog.py; udplog.py binds 0.0.0.0 so it
+// receives unicast without any change. If the listener moves, this constant moves with it.
+static const uint32_t kLogHostAddr = 0x0A0104ABu; // 10.1.4.171
 
 static OSThread sThread;
 // 32 KB, statically reserved. The watchdog must survive a stall inside the allocator,
@@ -268,8 +276,14 @@ void Emit(const char* fmt, ...) {
     memset(&to, 0, sizeof(to));
     to.sin_family = AF_INET;
     to.sin_port = htons(4405);
-    to.sin_addr.s_addr = INADDR_BROADCAST;
-    sendto(sSocket, line, n, 0, (struct sockaddr*)&to, sizeof(to));
+    to.sin_addr.s_addr = htonl(kLogHostAddr);
+    // The return value was ignored, so a channel that had stopped delivering was
+    // indistinguishable from a console that had stopped running.
+    if (sendto(sSocket, line, n, 0, (struct sockaddr*)&to, sizeof(to)) < 0) {
+        ++gEmitFail;
+    } else {
+        ++gEmitOk;
+    }
 }
 
 void TraceEvent(uint32_t phase, const char* event) {
@@ -281,7 +295,10 @@ void TraceEvent(uint32_t phase, const char* event) {
         gTraceStepState = TRACE_STEPS_ACTIVE;
         gTraceStepsRemaining = WDOG_TRACE_STEP_COUNT;
     }
-    Emit("WDOG: trace frame=%u phase=%s event=%s detail=%s\n", gFrame, PhaseName(phase), event, gDetail);
+    // gSeq on every line: the receiver can now tell "the game stopped" from "the datagrams
+    // stopped arriving" by whether the next line it sees skipped sequence numbers.
+    Emit("WDOG: trace seq=%u frame=%u phase=%s event=%s detail=%s\n", gSeq, gFrame, PhaseName(phase), event,
+         gDetail);
 }
 
 void TraceStep(uint32_t opcode, const void* cmd, uint32_t steps) {
@@ -426,8 +443,9 @@ static int Main(int, const char**) {
             // ExpHeap" assumption is WRONG and the field is dropped rather than left lying.
             // texCount/texBytes/lastTexPtr are our own counters and are kept.
             (void)mem2;
-            Emit("WDOG: mem texCount=%u texBytes=%u lastTexPtr=0x%08X audioSeq=%u audioPhase=%u flips=%u\n",
-                 gTexCount, gTexBytes, gLastTexPtr, gAudioSeq, gAudioPhase, gFlipCount);
+            Emit("WDOG: mem texCount=%u texBytes=%u lastTexPtr=0x%08X audioSeq=%u audioPhase=%u flips=%u "
+                 "emitOk=%u emitFail=%u\n",
+                 gTexCount, gTexBytes, gLastTexPtr, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail);
         }
 
         OSSleepTicks(OSMillisecondsToTicks(WDOG_TICK_INTERVAL_MS));
@@ -476,9 +494,10 @@ void Start() {
     // flood was ~290 UDP datagrams a second and is itself a suspect), so an SPDLOG_INFO here
     // would be swallowed -- and this is the one line MK_FREEZE_2026-09-09.md makes the
     // precondition for reading a capture at all.
-    Emit("watchdog: socket=%d channel-test-sendto=%d (if socket is -1 the watchdog cannot "
-         "report and its silence means nothing)\n",
-         sSocket, testRc);
+    Emit("watchdog: socket=%d channel-test-sendto=%d dest=%u.%u.%u.%u:4405 (if socket is -1 the "
+         "watchdog cannot report and its silence means nothing)\n",
+         sSocket, testRc, (unsigned int)((kLogHostAddr >> 24) & 0xFF), (unsigned int)((kLogHostAddr >> 16) & 0xFF),
+         (unsigned int)((kLogHostAddr >> 8) & 0xFF), (unsigned int)(kLogHostAddr & 0xFF));
 
     RegisterExceptionCallbacksOnAllCores();
 
