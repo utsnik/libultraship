@@ -143,7 +143,13 @@ int SDLAudioPlayer::Buffered() {
 }
 
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
+#ifdef LUS_PCM_DUMP
+    // Debug probe ONLY - blocking 512 KiB SD write from the audio path. Shipped
+    // unconditionally in 161289b4 and broke Mario Kart's music. Keep it off.
     CapturePcm(buf, len);
+#else
+    (void)&CapturePcm;
+#endif
 
     if (Buffered() < 6000) {
         // Don't fill the audio buffer too much in case this happens
