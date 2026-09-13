@@ -292,6 +292,14 @@ void TraceEvent(uint32_t phase, const char* event) {
     if (gTraceState != TRACE_ACTIVE && gEventStream == 0) {
         return;
     }
+    // Resource loading is the flood: two events per asset, hundreds of assets, and it is what
+    // pushed a capture to 397 lines/second - past anything this channel has been measured to
+    // survive. These phases still update the breadcrumb, so the 500 ms tick reports which asset
+    // the game is on; they just do not each get their own datagram. Everything that localises a
+    // hang - game-init steps, GX2, ImGui - keeps streaming.
+    if (gTraceState != TRACE_ACTIVE && (phase == PH_LOAD_RES || phase == PH_ARCHIVE)) {
+        return;
+    }
     if (gTraceState == TRACE_ACTIVE && phase == PH_TEX_UPLOAD && strcmp(event, "enter") == 0 &&
         gTraceStepState == TRACE_STEPS_WAITING && strstr(gDetail, "font_letter") != nullptr) {
         gTraceStepState = TRACE_STEPS_ACTIVE;
