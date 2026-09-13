@@ -83,18 +83,24 @@ static char* AppendExceptionRegister(char* destination, const char* name, uint32
     return destination;
 }
 
-static void EmitExceptionMessage() {
-    const char* line = sExceptionMessage;
-    while (*line != '\0') {
-        const char* end = line;
-        while (*end != '\0' && *end != '\n') {
-            ++end;
-        }
-        if (*end == '\n') {
-            ++end;
-        }
-        Watchdog::Emit("EXC: %.*s", (int)(end - line), line);
-        line = end;
+static void EmitExceptionMessage(const char* typeName, const OSContext* context) {
+    // One small Emit per register, deliberately. The previous version walked the
+    // OSFatal string emitting "%.*s" slices and produced truncated, repeated tails
+    // with SRR0 and DAR missing entirely - the only two values that matter.
+    // Emit is not safe to feed long or overlapping slices from here; short fixed
+    // formats are. Proven working from a real DSI by the CRASHTEST path.
+    Watchdog::Emit("EXC: type=%s core=%u\n", typeName, (unsigned int)OSGetCoreId());
+    if (context == nullptr) {
+        Watchdog::Emit("EXC: context unavailable\n");
+        return;
+    }
+    Watchdog::Emit("EXC: srr0=0x%08X\n", context->srr0);
+    Watchdog::Emit("EXC: dar=0x%08X\n", context->dar);
+    Watchdog::Emit("EXC: dsisr=0x%08X\n", context->dsisr);
+    Watchdog::Emit("EXC: srr1=0x%08X\n", context->srr1);
+    Watchdog::Emit("EXC: lr=0x%08X\n", context->lr);
+    for (int gpr = 0; gpr <= 12; ++gpr) {
+        Watchdog::Emit("EXC: r%d=0x%08X\n", gpr, context->gpr[gpr]);
     }
 }
 
@@ -131,7 +137,7 @@ static void FormatExceptionMessage(const char* typeName, const OSContext* contex
 
 static BOOL FatalException(const char* typeName, OSContext* context) {
     FormatExceptionMessage(typeName, context);
-    EmitExceptionMessage();
+    EmitExceptionMessage(typeName, context);
     OSFatal(sExceptionMessage);
     return FALSE;
 }
