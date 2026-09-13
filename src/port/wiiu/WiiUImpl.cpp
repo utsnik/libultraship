@@ -335,9 +335,9 @@ volatile uint32_t gTexBytes = 0;
 volatile uint32_t gTexCount = 0;
 volatile uint32_t gLastTexPtr = 0;
 volatile uint32_t gFlipCount = 0;
-// On by default in this diagnosis build: see the header for why the 500 ms tick is the
-// blind spot rather than the breadcrumbs.
-volatile uint32_t gEventStream = 1;
+// Keep the periodic watchdog and explicitly requested diagnostics, but do not stream every
+// watchdog Enter/Leave pair from the GX2 hot path.
+volatile uint32_t gEventStream = 0;
 volatile uint32_t gEmitOk = 0;
 volatile uint32_t gEmitFail = 0;
 
