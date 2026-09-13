@@ -50,6 +50,7 @@ enum Phase : uint32_t {
     PH_IMGUI_FONT_TEX,        // ImGui_ImplGX2_CreateFontsTexture()
     PH_IMGUI_DEVICE_OBJECTS,  // ImGui_ImplGX2_CreateDeviceObjects()
     PH_IMGUI_NEW_FRAME,       // ImGui_ImplGX2_NewFrame()
+    PH_GAME_INIT,             // game-side startup step (detail = the step name)
     PH_COUNT
 };
 

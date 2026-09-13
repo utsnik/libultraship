@@ -230,6 +230,8 @@ static const char* PhaseName(uint32_t phase) {
             return "imgui-device-objects";
         case PH_IMGUI_NEW_FRAME:
             return "imgui-new-frame";
+        case PH_GAME_INIT:
+            return "game-init";
         default:
             return "?";
     }
