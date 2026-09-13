@@ -243,8 +243,14 @@ void Emit(const char* fmt, ...) {
     // watchdog thread (tick lines) call this concurrently; a shared static buffer would
     // interleave them and the channel would lie - the third time instrumentation would have
     // lied in this hunt. 512 bytes fits the watchdog's 32 KB stack, and stack use keeps
-    // Emit allocation-free, which is the one rule this file exists to obey.
-    char line[512];
+    // Emit allocation-free, which is the one rule this file exists to obey. 384 rather than
+    // 512 because Emit is also called from the exception-registration threads and from the
+    // exception callbacks, whose stacks are 4 KB, and losing an EXC: line to a blown stack
+    // would cost the evidence most worth having. Not smaller than 384: the worst-case
+    // `alive` line is 281 bytes (a 127-byte detail plus every numeric field at full width),
+    // and truncating it would drop `flips=` off the end - the field the tick exists to
+    // report. vsnprintf truncates safely either way, but silently.
+    char line[384];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
