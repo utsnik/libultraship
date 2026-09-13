@@ -143,6 +143,9 @@ constexpr int16_t ShaderIdUnmask(int id) {
 struct GfxExecStack {
     // This is a dlist stack used to handle dlist calls.
     std::stack<F3DGfx*> cmd_stack = {};
+#ifdef __WIIU__
+    std::stack<F3DGfx*> dlist_start_stack = {};
+#endif
     // This is also a dlist stack but a std::vector is used to make it possible
     // to iterate on the elements.
     // The purpose of this is to identify an instruction at a poin in time
@@ -165,6 +168,9 @@ struct GfxExecStack {
     void branch(F3DGfx* caller);
     void call(F3DGfx* caller, F3DGfx* callee);
     F3DGfx* ret();
+#ifdef __WIIU__
+    F3DGfx* currentDlistStart() const;
+#endif
 };
 
 struct XYWidthHeight {

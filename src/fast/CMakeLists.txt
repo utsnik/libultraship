@@ -35,7 +35,7 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "PSVita")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "gfx_vita_shader\\.cpp$")
 endif()
 
-if (CMAKE_SYSTEM_NAME STREQUAL "PSVita")
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "gfx_wiiu\\.cpp$")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "imgui_impl_(gx2|wiiu)\\.cpp$")
 endif()

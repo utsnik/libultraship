@@ -8,6 +8,16 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
+#ifdef __WIIU__
+#include <stdarg.h>
+// Do not include <coreinit/time.h> here: it conflicts with libultra's OSTime
+// typedef already visible in this translation unit (same reason gfx_wiiu.cpp
+// forward-declares its CafeOS helpers instead of including the header).
+extern "C" uint64_t OSGetSystemTick(void);
+// OSTimerClockSpeed = busClockSpeed / 4 = 248.625 MHz / 4. Only throttles
+// diagnostics, so precision is irrelevant.
+static const uint64_t kTicksPerSecond = 62156250ULL;
+#endif
 #ifndef _WIN32
 #if !defined(__WIIU__) && !defined(__vita__)
 #include <dlfcn.h>
@@ -33,6 +43,7 @@
 #include "fast/interpreter.h"
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
+
 #include "fast/backends/gfx_rendering_api.h"
 
 #include "ship/window/gui/Gui.h"
@@ -75,6 +86,15 @@ std::stack<std::string> currentDir;
 #define TEXTURE_CACHE_MAX_SIZE 1024
 
 namespace Fast {
+
+#ifdef __WIIU__
+static bool EmitThrottledAt(uint64_t* lastEmit, const char* format, ...);
+#define EmitThrottled(...)                                                                                             \
+    do {                                                                                                               \
+        static uint64_t lastEmitTick_ = 0;                                                                             \
+        EmitThrottledAt(&lastEmitTick_, __VA_ARGS__);                                                                  \
+    } while (0)
+#endif
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
 
@@ -2409,14 +2429,31 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+#ifdef __WIIU__
+            uintptr_t old = mSegmentPointers[segNumber];
+#endif
             mSegmentPointers[segNumber] = data;
+#ifdef __WIIU__
+            if (old != data)
+                EmitThrottled("FAST3D: segment pointers changed [%p, %p, %p, %p]\n", (void*)mSegmentPointers[0],
+                              (void*)mSegmentPointers[1], (void*)mSegmentPointers[2], (void*)mSegmentPointers[3]);
+#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
-            if (segIndex == mInterpolationIndex)
+            if (segIndex == mInterpolationIndex) {
+#ifdef __WIIU__
+                uintptr_t old = mSegmentPointers[segNumber];
+#endif
                 mSegmentPointers[segNumber] = data;
+#ifdef __WIIU__
+                if (old != data)
+                    EmitThrottled("FAST3D: segment pointers changed [%p, %p, %p, %p]\n", (void*)mSegmentPointers[0],
+                                  (void*)mSegmentPointers[1], (void*)mSegmentPointers[2], (void*)mSegmentPointers[3]);
+#endif
+            }
         } break;
     }
 }
@@ -2435,14 +2472,31 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+#ifdef __WIIU__
+            uintptr_t old = mSegmentPointers[segNumber];
+#endif
             mSegmentPointers[segNumber] = data;
+#ifdef __WIIU__
+            if (old != data)
+                EmitThrottled("FAST3D: segment pointers changed [%p, %p, %p, %p]\n", (void*)mSegmentPointers[0],
+                              (void*)mSegmentPointers[1], (void*)mSegmentPointers[2], (void*)mSegmentPointers[3]);
+#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
-            if (segIndex == mInterpolationIndex)
+            if (segIndex == mInterpolationIndex) {
+#ifdef __WIIU__
+                uintptr_t old = mSegmentPointers[segNumber];
+#endif
                 mSegmentPointers[segNumber] = data;
+#ifdef __WIIU__
+                if (old != data)
+                    EmitThrottled("FAST3D: segment pointers changed [%p, %p, %p, %p]\n", (void*)mSegmentPointers[0],
+                                  (void*)mSegmentPointers[1], (void*)mSegmentPointers[2], (void*)mSegmentPointers[3]);
+#endif
+            }
         } break;
     }
 }
@@ -3254,6 +3308,11 @@ void GfxExecStack::start(F3DGfx* dlist) {
         cmd_stack.pop();
     gfx_path.clear();
     cmd_stack.push(dlist);
+#ifdef __WIIU__
+    while (!dlist_start_stack.empty())
+        dlist_start_stack.pop();
+    dlist_start_stack.push(dlist);
+#endif
     disp_stack.clear();
 }
 
@@ -3261,6 +3320,10 @@ void GfxExecStack::stop() {
     while (!cmd_stack.empty())
         cmd_stack.pop();
     gfx_path.clear();
+#ifdef __WIIU__
+    while (!dlist_start_stack.empty())
+        dlist_start_stack.pop();
+#endif
 }
 
 F3DGfx*& GfxExecStack::currCmd() {
@@ -3282,12 +3345,22 @@ void GfxExecStack::branch(F3DGfx* caller) {
     cmd_stack.pop();
     cmd_stack.push(nullptr);
     cmd_stack.push(old);
+#ifdef __WIIU__
+    // `old` is already the branch TARGET: the caller assigns *cmd0 (a reference into
+    // cmd_stack.top()) before calling branch(). Record that, not the caller's start.
+    dlist_start_stack.pop();
+    dlist_start_stack.push(nullptr);
+    dlist_start_stack.push(old);
+#endif
 
     gfx_path.push_back(caller);
 }
 
 void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
     cmd_stack.push(callee);
+#ifdef __WIIU__
+    dlist_start_stack.push(callee);
+#endif
     gfx_path.push_back(caller);
 }
 
@@ -3295,18 +3368,45 @@ F3DGfx* GfxExecStack::ret() {
     F3DGfx* cmd = cmd_stack.top();
 
     cmd_stack.pop();
+#ifdef __WIIU__
+    dlist_start_stack.pop();
+#endif
     if (!gfx_path.empty()) {
         gfx_path.pop_back();
     }
 
     while (cmd_stack.size() > 0 && cmd_stack.top() == nullptr) {
         cmd_stack.pop();
+#ifdef __WIIU__
+        dlist_start_stack.pop();
+#endif
         if (!gfx_path.empty()) {
             gfx_path.pop_back();
         }
     }
     return cmd;
 }
+
+#ifdef __WIIU__
+F3DGfx* GfxExecStack::currentDlistStart() const {
+    return dlist_start_stack.empty() ? nullptr : dlist_start_stack.top();
+}
+
+static bool EmitThrottledAt(uint64_t* lastEmit, const char* format, ...) {
+    const uint64_t now = OSGetSystemTick();
+    if (*lastEmit != 0 && now - *lastEmit < kTicksPerSecond)
+        return false;
+    *lastEmit = now;
+    va_list args;
+    va_start(args, format);
+    // Watchdog::Emit is variadic; preserve its existing formatting convention.
+    char message[512];
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    Ship::WiiU::Watchdog::Emit("%s", message);
+    return true;
+}
+#endif
 
 void gfx_set_framebuffer(int fb, float noise_scale);
 void gfx_reset_framebuffer();
@@ -3371,7 +3471,16 @@ bool gfx_mtx_handler_f3dex2(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     uintptr_t mtxAddr = cmd->words.w1;
 
+#ifdef __WIIU__
+    void* addr = gfx->SegAddr(mtxAddr);
+    if ((uintptr_t)addr < 0x01000000) {
+        EmitThrottled("FAST3D: skipped invalid F3DEX2 matrix address=%p\n", addr);
+        return false;
+    }
+    gfx->GfxSpMatrix(C0(0, 8) ^ F3DEX2_G_MTX_PUSH, (const int32_t*)addr);
+#else
     gfx->GfxSpMatrix(C0(0, 8) ^ F3DEX2_G_MTX_PUSH, (const int32_t*)gfx->SegAddr(mtxAddr));
+#endif
     return false;
 }
 // Seems to be the same for all other non F3DEX2 microcodes...
@@ -3380,7 +3489,16 @@ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     uintptr_t mtxAddr = cmd->words.w1;
 
+#ifdef __WIIU__
+    void* addr = gfx->SegAddr(cmd->words.w1);
+    if ((uintptr_t)addr < 0x01000000) {
+        EmitThrottled("FAST3D: skipped invalid F3D matrix address=%p\n", addr);
+        return false;
+    }
+    gfx->GfxSpMatrix(C0(16, 8), (const int32_t*)addr);
+#else
     gfx->GfxSpMatrix(C0(16, 8), (const int32_t*)gfx->SegAddr(cmd->words.w1));
+#endif
     return false;
 }
 
@@ -4972,10 +5090,19 @@ static void gfx_step() {
     }
 
     if (!has_handler) {
-#ifdef __WIIU__
-        Ship::WiiU::Watchdog::Emit("FAST3D: unhandled opcode=0x%02X w0=0x%08X w1=0x%08X cmd=%p depth=%u\n",
+#ifndef __WIIU__
+        fprintf(stderr, "FAST3D: unhandled opcode=0x%02X w0=0x%08X w1=0x%08X cmd=%p depth=%u\n",
+                (unsigned int)(uint8_t)opcode, (unsigned int)cmd->words.w0,
+                (unsigned int)cmd->words.w1, (const void*)cmd,
+                (unsigned int)g_exec_stack.cmd_stack.size());
+#else
+        EmitThrottled("FAST3D: unhandled opcode=0x%02X w0=0x%08X w1=0x%08X cmd=%p start=%p distance=%d depth=%u\n",
                                    (unsigned int)(uint8_t)opcode, (unsigned int)cmd->words.w0,
                                    (unsigned int)cmd->words.w1, (const void*)cmd,
+                                   (const void*)g_exec_stack.currentDlistStart(),
+                                   g_exec_stack.currentDlistStart() == nullptr
+                                       ? -1
+                                       : (int)((cmd - g_exec_stack.currentDlistStart()) * sizeof(F3DGfx)),
                                    (unsigned int)g_exec_stack.cmd_stack.size());
 #endif
         g_exec_stack.stop();
