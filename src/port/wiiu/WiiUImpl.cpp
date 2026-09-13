@@ -84,24 +84,19 @@ static char* AppendExceptionRegister(char* destination, const char* name, uint32
 }
 
 static void EmitExceptionMessage(const char* typeName, const OSContext* context) {
-    // One small Emit per register, deliberately. The previous version walked the
-    // OSFatal string emitting "%.*s" slices and produced truncated, repeated tails
-    // with SRR0 and DAR missing entirely - the only two values that matter.
-    // Emit is not safe to feed long or overlapping slices from here; short fixed
-    // formats are. Proven working from a real DSI by the CRASHTEST path.
-    Watchdog::Emit("EXC: type=%s core=%u\n", typeName, (unsigned int)OSGetCoreId());
+    // ONE Emit, not one per register. Measured 2026-09-13 on a real DSI: 19 sequential
+    // Emit calls from the exception context all arrived carrying the LAST call's text
+    // (every datagram read "r12=..."), because Emit formats into a shared static buffer
+    // and the send lands after it has been overwritten. srr0 and dar were lost exactly
+    // when they mattered. So: everything that matters in a single call, srr0 and dar
+    // first. The GPRs still reach the screen via OSFatal.
     if (context == nullptr) {
-        Watchdog::Emit("EXC: context unavailable\n");
+        Watchdog::Emit("EXC: type=%s context=NULL\n", typeName);
         return;
     }
-    Watchdog::Emit("EXC: srr0=0x%08X\n", context->srr0);
-    Watchdog::Emit("EXC: dar=0x%08X\n", context->dar);
-    Watchdog::Emit("EXC: dsisr=0x%08X\n", context->dsisr);
-    Watchdog::Emit("EXC: srr1=0x%08X\n", context->srr1);
-    Watchdog::Emit("EXC: lr=0x%08X\n", context->lr);
-    for (int gpr = 0; gpr <= 12; ++gpr) {
-        Watchdog::Emit("EXC: r%d=0x%08X\n", gpr, context->gpr[gpr]);
-    }
+    Watchdog::Emit("EXC: %s srr0=0x%08X dar=0x%08X dsisr=0x%08X srr1=0x%08X lr=0x%08X r1=0x%08X core=%u\n",
+                   typeName, context->srr0, context->dar, context->dsisr, context->srr1, context->lr,
+                   context->gpr[1], (unsigned int)OSGetCoreId());
 }
 
 static void FormatExceptionMessage(const char* typeName, const OSContext* context) {
