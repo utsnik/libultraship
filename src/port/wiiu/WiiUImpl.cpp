@@ -248,6 +248,15 @@ static const devoptab_t dotab_stdout = {
 #endif
 
 void Init(const std::string& shortName) {
+    // Called twice now: once at the very top of InitOTR (so logging and the chdir are
+    // up before ANY filesystem access) and once where upstream has always called it,
+    // at the tail of RunExtract. Second call is a no-op.
+    static bool sInitialised = false;
+    if (sInitialised) {
+        return;
+    }
+    sInitialised = true;
+
 #if 1 /* force UDP logging: no other way to diagnose on-device */
     WHBLogUdpInit();
     WHBLogPrint("Hello World!");
