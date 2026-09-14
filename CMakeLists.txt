@@ -34,6 +34,10 @@ endif()
 
 include(cmake/dependencies/common.cmake)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    include(cmake/dependencies/wiiu.cmake)
+endif()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Android")
 	include(cmake/dependencies/android.cmake)
 endif()

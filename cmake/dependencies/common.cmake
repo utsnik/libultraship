@@ -27,11 +27,18 @@ target_sources(ImGui
     ${imgui_SOURCE_DIR}/imgui.cpp
 )
 
-target_sources(ImGui
-    PRIVATE
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
-)
+# The Wii U has neither OpenGL nor the desktop SDL video backend, and
+# imgui_impl_opengl3_loader.h reaches for <dlfcn.h>, which wut's newlib does not
+# provide. libultraship supplies imgui_impl_gx2 / imgui_impl_wiiu instead.
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    target_sources(ImGui
+        PRIVATE
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+    )
+else()
+    target_compile_definitions(ImGui PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+endif()
 
 target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends PRIVATE ${SDL2_INCLUDE_DIRS})
 
@@ -100,6 +107,22 @@ FetchContent_Declare(
     GIT_TAG v4.1.0
 )
 FetchContent_MakeAvailable(ThreadPool)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    # elf2rpl cannot represent PowerPC TLS relocations. Preserve the
+    # single-process thread-pool state as ordinary storage on CafeOS; the Wii U
+    # runtime does not use the thread-pool's per-thread inspection API.
+    file(READ "${threadpool_SOURCE_DIR}/include/BS_thread_pool.hpp" BS_THREAD_POOL_HEADER)
+    string(REPLACE
+        "inline thread_local thread_info_index get_index;"
+        "inline thread_info_index get_index;"
+        BS_THREAD_POOL_HEADER "${BS_THREAD_POOL_HEADER}")
+    string(REPLACE
+        "inline thread_local thread_info_pool get_pool;"
+        "inline thread_info_pool get_pool;"
+        BS_THREAD_POOL_HEADER "${BS_THREAD_POOL_HEADER}")
+    file(WRITE "${threadpool_SOURCE_DIR}/include/BS_thread_pool.hpp" "${BS_THREAD_POOL_HEADER}")
+endif()
 
 list(APPEND ADDITIONAL_LIB_INCLUDES ${threadpool_SOURCE_DIR}/include)
 
