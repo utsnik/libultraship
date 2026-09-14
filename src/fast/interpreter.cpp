@@ -3741,7 +3741,17 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
+
+#ifdef __WIIU__
+    void* addr = gfx->SegAddr(cmd->words.w1);
+    if ((uintptr_t)addr < 0x01000000 || ((uintptr_t)addr & 7) != 0) {
+        EmitThrottled("FAST3D: skipped invalid F3DEX vertex address=%p\n", addr);
+        return false;
+    }
+    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)addr);
+#else
     gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+#endif
 
     return false;
 }

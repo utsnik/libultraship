@@ -628,4 +628,16 @@ void Start() {
 }; // namespace WiiU
 }; // namespace Ship
 
+extern "C" void modelRenderWatchdogReportInvalidDisplayList(uint32_t index, uint32_t size, const char* handler) {
+    static uint64_t lastEmitTick = 0;
+    const uint64_t now = OSGetSystemTick();
+    static const uint64_t kTicksPerSecond = 62156250ULL;
+    if (lastEmitTick != 0 && now - lastEmitTick < kTicksPerSecond) {
+        return;
+    }
+    lastEmitTick = now;
+    Ship::WiiU::Watchdog::Emit("MODEL: skipped invalid display-list index=%u size=%u handler=%s\n", index, size,
+                               handler);
+}
+
 #endif
