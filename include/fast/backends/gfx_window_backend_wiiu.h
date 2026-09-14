@@ -44,8 +44,8 @@ class GfxWindowBackendWiiU : public GfxWindowBackend {
     bool IsMouseCaptured() override;
 
     void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) override;
-    void SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) override;
-    Ship::WindowRect GetPrimaryMonitorRect() override;
+    // SetDimensions()/GetPrimaryMonitorRect() are newer-LUS virtuals absent from the
+    // 9.2.3 GfxWindowBackend; the Wii U has fixed scan-out so neither had any work to do.
 
     void HandleEvents() override;
     bool IsFrameReady() override;

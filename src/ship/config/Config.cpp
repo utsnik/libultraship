@@ -320,7 +320,11 @@ WindowBackend Config::GetWindowBackend() {
         return WindowBackend::FAST3D_SDL_METAL;
     }
 #endif
+#ifdef ENABLE_GX2
+    return WindowBackend::FAST3D_WIIU_GX2;
+#else
     return WindowBackend::FAST3D_SDL_OPENGL;
+#endif
 }
 
 void Config::SetWindowBackend(WindowBackend backend) {
@@ -335,6 +339,9 @@ void Config::SetWindowBackend(WindowBackend backend) {
             break;
         case WindowBackend::FAST3D_SDL_METAL:
             SetString("Window.Backend.Name", "Metal");
+            break;
+        case WindowBackend::FAST3D_WIIU_GX2:
+            SetString("Window.Backend.Name", "GX2");
             break;
         default:
             SetString("Window.Backend.Name", "");

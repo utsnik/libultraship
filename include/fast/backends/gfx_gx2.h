@@ -56,9 +56,11 @@ class GfxRenderingAPIGX2 : public GfxRenderingAPI {
 
     void UnloadShader(ShaderProgram* oldPrg) override;
     void LoadShader(ShaderProgram* newPrg) override;
-    void ClearShaderCache() override;
-    ShaderProgram* CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) override;
-    ShaderProgram* LookupShader(uint64_t shaderId0, uint64_t shaderId1) override;
+    // Not part of the 9.2.3 GfxRenderingAPI interface - kept as a plain member so the
+    // cache-teardown code survives; nothing in this LUS dispatches to it.
+    void ClearShaderCache();
+    ShaderProgram* CreateAndLoadNewShader(uint64_t shaderId0, uint32_t shaderId1) override;
+    ShaderProgram* LookupShader(uint64_t shaderId0, uint32_t shaderId1) override;
     void ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) override;
 
     uint32_t NewTexture() override;
@@ -98,7 +100,6 @@ class GfxRenderingAPIGX2 : public GfxRenderingAPI {
 
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
-    void SetCurrentPrimDepth(float depth) override;
 
   private:
     void ApplyDepthState();

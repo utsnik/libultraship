@@ -1410,13 +1410,11 @@ void GfxRenderingAPIGX2::UnloadShader(ShaderProgram* oldPrg) {
 void GfxRenderingAPIGX2::LoadShader(ShaderProgram* newPrg) {
     gfx_gx2_load_shader(newPrg);
 }
-ShaderProgram* GfxRenderingAPIGX2::CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) {
-    // shaderId1 widened from uint32_t to uint64_t upstream; the GX2 generator
-    // still keys on the low 32 bits, which is the range Fast3D actually emits.
-    return gfx_gx2_create_and_load_new_shader(shaderId0, static_cast<uint32_t>(shaderId1));
+ShaderProgram* GfxRenderingAPIGX2::CreateAndLoadNewShader(uint64_t shaderId0, uint32_t shaderId1) {
+    return gfx_gx2_create_and_load_new_shader(shaderId0, shaderId1);
 }
-ShaderProgram* GfxRenderingAPIGX2::LookupShader(uint64_t shaderId0, uint64_t shaderId1) {
-    return gfx_gx2_lookup_shader(shaderId0, static_cast<uint32_t>(shaderId1));
+ShaderProgram* GfxRenderingAPIGX2::LookupShader(uint64_t shaderId0, uint32_t shaderId1) {
+    return gfx_gx2_lookup_shader(shaderId0, shaderId1);
 }
 void GfxRenderingAPIGX2::ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) {
     gfx_gx2_shader_get_info(prg, numInputs, usedTextures);
@@ -1545,11 +1543,6 @@ void GfxRenderingAPIGX2::SetSrgbMode() {
 
 ImTextureID GfxRenderingAPIGX2::GetTextureById(int id) {
     return (ImTextureID)(uintptr_t)gfx_gx2_get_framebuffer_texture_id(id);
-}
-
-void GfxRenderingAPIGX2::SetCurrentPrimDepth(float depth) {
-    mCurrentPrimDepth = depth;
-    mPrimDepthDirty = true;
 }
 
 } // namespace Fast
