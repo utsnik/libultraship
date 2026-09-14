@@ -27,6 +27,15 @@ set(ADDITIONAL_LIB_INCLUDES "")
 option(INCLUDE_MPQ_SUPPORT "Enable StormLib and MPQ archive support" OFF)
 option(GBI_UCODE "Specify the GBI ucode version" F3DEX_GBI_2)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    # elf2rpl cannot represent PowerPC TLS relocations (R_PPC_TPREL16_LO/_HA, types
+    # 70/72), so nothing reaching the link may contain a thread_local. stb_image and
+    # spdlog both declare them unless told otherwise. These must be directory-wide AND
+    # set before the dependency includes below, or the targets those create - stb in
+    # common.cmake, spdlog via FetchContent in wiiu.cmake - never see them.
+    add_compile_definitions(STBI_NO_THREAD_LOCALS SPDLOG_NO_TLS SPDLOG_NO_THREAD_ID)
+endif()
+
 # =========== Dependencies =============
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     include(cmake/dependencies/windows-vcpkg.cmake)
