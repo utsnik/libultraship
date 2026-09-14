@@ -34,7 +34,20 @@ void __real___cxa_throw(void* exception, std::type_info* typeInfo, void (*destru
     __attribute__((noreturn));
 
 void __wrap___cxa_throw(void* exception, std::type_info* typeInfo, void (*destructor)(void*)) {
-    Ship::WiiU::Watchdog::Emit("CXX: throw type=%s\n", typeInfo->name());
+    // The type alone is not enough - std::out_of_range from an .at() could be almost
+    // anywhere in SoH. Log the throw site too.
+    //
+    // The load bias is computed here rather than hardcoded: a previous session's
+    // 0x0A000000 was measured against a different binary and does not transfer. Taking
+    // the runtime address of this very function and subtracting its link-time address
+    // gives the bias for THIS build, so `file` is directly usable with:
+    //     powerpc-eabi-addr2line -e soh.elf <file>
+    const uint32_t ra = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    const uint32_t here = (uint32_t)(uintptr_t)&__wrap___cxa_throw;
+    extern char __code_start[] __attribute__((weak));
+    const uint32_t bias = here - 0x049057c4u; // link-time address of __wrap___cxa_throw
+    Ship::WiiU::Watchdog::Emit("CXX: throw type=%s ra=0x%08X bias=0x%08X file=0x%08X\n",
+                               typeInfo->name(), ra, bias, ra - bias);
     __real___cxa_throw(exception, typeInfo, destructor);
 }
 }
