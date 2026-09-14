@@ -628,16 +628,30 @@ void Start() {
 }; // namespace WiiU
 }; // namespace Ship
 
-extern "C" void modelRenderWatchdogReportInvalidDisplayList(uint32_t index, uint32_t size, const char* handler) {
+extern "C" void modelRenderWatchdogReportInvalidDisplayList(uint32_t index, uint32_t size, const char* handler,
+                                                            const void* node) {
+    static uint32_t emitted = 0;
     static uint64_t lastEmitTick = 0;
-    const uint64_t now = OSGetSystemTick();
     static const uint64_t kTicksPerSecond = 62156250ULL;
-    if (lastEmitTick != 0 && now - lastEmitTick < kTicksPerSecond) {
+    const uint64_t now = OSGetSystemTick();
+    // The first 20 go out unthrottled: a 1/sec cap samples roughly one report per
+    // second out of hundreds per frame, which hid the real spread of bad indices.
+    if (emitted >= 20 && lastEmitTick != 0 && now - lastEmitTick < kTicksPerSecond) {
         return;
     }
+    ++emitted;
     lastEmitTick = now;
-    Ship::WiiU::Watchdog::Emit("MODEL: skipped invalid display-list index=%u size=%u handler=%s\n", index, size,
-                               handler);
+
+    // Dump the node as it actually sits in memory. If cmd0 reads 5 (big-endian,
+    // i.e. already converted) while the s16 array at +8 reads byte-reversed, then
+    // the header and the payload of one node disagree -- which the load-time swap
+    // cannot produce, and would mean the renderer is reading a different buffer.
+    const uint32_t* words = static_cast<const uint32_t*>(node);
+    const int16_t* arr = reinterpret_cast<const int16_t*>(static_cast<const uint8_t*>(node) + 8);
+    Ship::WiiU::Watchdog::Emit(
+        "MODEL: skipped invalid display-list index=%u size=%u handler=%s node=%p cmd0=0x%08X size4=0x%08X "
+        "arr=[%d,%d,%d]\n",
+        index, size, handler, node, words[0], words[1], (int)arr[0], (int)arr[1], (int)arr[2]);
 }
 
 #endif
