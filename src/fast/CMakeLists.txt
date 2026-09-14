@@ -25,6 +25,15 @@ target_sources(libultraship PRIVATE ${Source_Files__Resource} ${Source_Files__Re
 
 file(GLOB Source_Files__Graphic RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "backends/*.cpp")
 
+# The GX2/Wii U backends only build for CafeOS; everywhere else they pull in
+# wut headers (gx2/*.h, whb/*.h, vpad/*.h) that do not exist.
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_wiiu\\.cpp$")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_gx2\\.cpp$")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gx2_shader_gen\\.cpp$")
+    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/imgui_impl_(gx2|wiiu)\\.cpp$")
+endif()
+
 if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "graphic/Fast3D/backends/gfx_dxgi*")
     list(FILTER Source_Files__Graphic EXCLUDE REGEX "graphic/Fast3D/backends/gfx_direct3d*")
