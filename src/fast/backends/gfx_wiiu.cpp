@@ -38,8 +38,11 @@
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_gx2.h"
-#include "fast/Fast3dGui.h"
 #include "ship/Context.h"
+// LUS 9.2.3 has no Fast::Fast3dGui: the ImGui backend dispatch still lives in the
+// monolithic Ship::Gui, keyed off Window::GetWindowBackend(). Use Ship::Gui directly.
+#include "ship/window/Window.h"
+#include "ship/window/gui/Gui.h"
 
 // gfx_gx2.cpp lives in namespace Fast; its shutdown entry point is used below.
 namespace Fast {
@@ -475,14 +478,14 @@ static void gfx_wiiu_init(const char* game_name, const char* gfx_api_name, bool 
     GX2SetSwapInterval(frame_divisor);
     SPDLOG_INFO("gfx_wiiu_init: GX2SetSwapInterval ok");
 
-    SPDLOG_INFO("gfx_wiiu_init: Fast3dGui::Init ...");
-    Fast::GuiWindowInitData window_impl;
-    window_impl.Backend = Fast::WindowBackend::FAST3D_WIIU_GX2;
+    SPDLOG_INFO("gfx_wiiu_init: Gui::Init ...");
+    // Ship::GuiWindowInitData carries no Backend field in 9.2.3; Ship::Gui reads the
+    // active backend from Window::GetWindowBackend() instead.
+    Ship::GuiWindowInitData window_impl;
     window_impl.Gx2.Width = WIIU_DEFAULT_FB_WIDTH;
     window_impl.Gx2.Height = WIIU_DEFAULT_FB_HEIGHT;
-    std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui())
-        ->Init(window_impl);
-    SPDLOG_INFO("gfx_wiiu_init: Fast3dGui::Init ok");
+    Ship::Context::GetInstance()->GetWindow()->GetGui()->Init(window_impl);
+    SPDLOG_INFO("gfx_wiiu_init: Gui::Init ok");
 
     SPDLOG_INFO("gfx_wiiu_init: complete ok");
 }
@@ -798,22 +801,6 @@ void GfxWindowBackendWiiU::GetDimensions(uint32_t* width, uint32_t* height, int3
     if (posY != nullptr) {
         *posY = 0;
     }
-}
-
-void GfxWindowBackendWiiU::SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) {
-    // Fixed scan-out: resizing is not possible, so this is a no-op rather than a
-    // silent partial resize that would desync Fast3D's idea of the framebuffer.
-    (void)width;
-    (void)height;
-    (void)posX;
-    (void)posY;
-}
-
-Ship::WindowRect GfxWindowBackendWiiU::GetPrimaryMonitorRect() {
-    uint32_t width = 0;
-    uint32_t height = 0;
-    gfx_wiiu_get_dimensions(&width, &height);
-    return Ship::WindowRect{ 0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height) };
 }
 
 void GfxWindowBackendWiiU::HandleEvents() {
