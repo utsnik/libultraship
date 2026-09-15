@@ -78,6 +78,11 @@ bool has_foreground = false;
 static void* mem1_storage = nullptr;
 static void* command_buffer_pool = nullptr;
 static void* secondary_command_buffer = nullptr;
+static bool sGx2Down = false;
+
+bool gfx_wiiu_gx2_is_down(void) {
+    return sGx2Down;
+}
 static uint32_t display_list_overrun_count = 0;
 static volatile bool secondary_command_buffer_in_use = false;
 GX2ContextState* context_state = nullptr;
@@ -491,6 +496,13 @@ static void gfx_wiiu_init(const char* game_name, const char* gfx_api_name, bool 
 }
 
 static void gfx_wiiu_shutdown(void) {
+    static bool sShutdown = false;
+    if (sShutdown) {
+        Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_shutdown already done - ignoring\n");
+        return;
+    }
+    sShutdown = true;
+
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_shutdown enter\n");
 
     if (has_foreground) {
@@ -498,6 +510,8 @@ static void gfx_wiiu_shutdown(void) {
         gfx_wiiu_destroy_mem1();
     }
 
+    // This remains false during a live backend switch so GPU resources are still freed.
+    sGx2Down = true;
     GX2Shutdown();
 
     if (context_state) {
@@ -551,7 +565,24 @@ bool gfx_wiiu_is_running(void) {
 }
 
 void gfx_wiiu_teardown(void) {
+    static bool sTornDown = false;
+    if (sTornDown) {
+        Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_teardown already done - ignoring\n");
+        return;
+    }
+    sTornDown = true;
+
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_teardown enter\n");
+
+    // Unregister every callback FIRST. gfx_wiiu_init registers two GX2 event callbacks
+    // and two ProcUI callbacks, and nothing ever cleared them - so during teardown the
+    // system could still call into handlers whose state gfx_gx2_shutdown had just freed.
+    // That showed up as an unhandled ISI to address 0 (a call through a NULL pointer)
+    // right at the end of gfx_gx2_shutdown, which hard-hung the console on every exit.
+    GX2SetEventCallback(GX2_EVENT_TYPE_FLIP, nullptr, nullptr);
+    GX2SetEventCallback(GX2_EVENT_TYPE_DISPLAY_LIST_OVERRUN, nullptr, nullptr);
+    ProcUIClearCallbacks();
+    Ship::WiiU::Watchdog::Emit("SHUTDOWN: callbacks cleared\n");
 
     Ship::WiiU::Exit();
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: WiiU::Exit exit\n");

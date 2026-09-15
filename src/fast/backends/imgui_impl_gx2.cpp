@@ -15,6 +15,7 @@
 #include <gx2r/surface.h>
 
 #include "port/wiiu/WiiUWatchdog.h"
+#include "fast/backends/gfx_wiiu.h"
 
 // Include shader data
 #include "shaders/shader.h"
@@ -341,11 +342,16 @@ bool ImGui_ImplGX2_CreateFontsTexture()
 
 void ImGui_ImplGX2_DestroyFontsTexture()
 {
-    ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
+    if (!bd)
+        return;
+    ImGuiIO& io = ImGui::GetIO();
     if (bd->FontTexture)
     {
-        GX2RDestroySurfaceEx(&bd->FontTexture->Texture->surface, GX2R_RESOURCE_BIND_NONE);
+        if (gfx_wiiu_gx2_is_down())
+            WDOG_EMIT("IMGUIFONT: skipping GX2RDestroySurfaceEx after GX2 shutdown\n");
+        else
+            GX2RDestroySurfaceEx(&bd->FontTexture->Texture->surface, GX2R_RESOURCE_BIND_NONE);
         io.Fonts->SetTexID(0);
         IM_DELETE(bd->FontTexture->Texture);
         IM_DELETE(bd->FontTexture->Sampler);
@@ -397,6 +403,8 @@ bool    ImGui_ImplGX2_CreateDeviceObjects()
 void    ImGui_ImplGX2_DestroyDeviceObjects()
 {
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
+    if (!bd)
+        return;
 
     free(bd->VertexBuffer);
     bd->VertexBuffer = NULL;
@@ -404,7 +412,10 @@ void    ImGui_ImplGX2_DestroyDeviceObjects()
     free(bd->IndexBuffer);
     bd->IndexBuffer = NULL;
 
-    WHBGfxFreeShaderGroup(bd->ShaderGroup);
+    if (gfx_wiiu_gx2_is_down())
+        WDOG_EMIT("IMGUI: skipping WHBGfxFreeShaderGroup after GX2 shutdown\n");
+    else
+        WHBGfxFreeShaderGroup(bd->ShaderGroup);
     IM_DELETE(bd->ShaderGroup);
     bd->ShaderGroup = NULL;
 

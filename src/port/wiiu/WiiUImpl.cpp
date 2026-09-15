@@ -4,6 +4,7 @@
 #include <exception>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 #include <typeinfo>
 #include <unistd.h>
 #include <sys/iosupport.h>
@@ -28,26 +29,89 @@
 #include <coreinit/core.h>
 #include <sysapp/launch.h>
 #include <nsysnet/_socket.h>
+#include <cstdlib>
+
+static int wiiu_log_open(struct _reent*, void*, const char*, int, int) {
+    return -1;
+}
+
+static int wiiu_log_close(struct _reent*, void*) {
+    return 0;
+}
+
+static int wiiu_log_fstat(struct _reent*, void*, struct stat* st) {
+    memset(st, 0, sizeof(*st));
+    return 0;
+}
+
+static ssize_t wiiu_log_discard(struct _reent*, void*, const char*, size_t len) {
+    return len;
+}
+
+static const devoptab_t dotab_devnull = {
+    .name = "devnull_wiiu",
+    .open_r = wiiu_log_open,
+    .close_r = wiiu_log_close,
+    .write_r = wiiu_log_discard,
+    .fstat_r = wiiu_log_fstat,
+};
 
 extern "C" {
 void __real___cxa_throw(void* exception, std::type_info* typeInfo, void (*destructor)(void*))
     __attribute__((noreturn));
+extern void __init(void);
+
+static void RestoreStdioDevoptab() {
+    // In the linked ELF, devoptab_list[STD_IN/OUT/ERR] default to &dotab_stdnull.
+    // Its measured open_r, close_r, read_r, and fstat_r slots are all NULL, so
+    // restoring the original entries would hand those NULL slots back during teardown.
+    devoptab_list[STD_OUT] = &dotab_devnull;
+    devoptab_list[STD_ERR] = &dotab_devnull;
+}
+
+// Every SohGui::RegisterPopup OK handler calls exit(). On Cafe OS that unwinds atexit
+// handlers and static destructors while the GX2 context and ProcUI are still live, and
+// something in that teardown never returns - the console hangs and needs a power cycle.
+// Same class of problem as abort() in the terminate handler, and the same remedy: do the
+// small amount of teardown that is safe, then _Exit so the system reclaims the title
+// normally and the Aroma plugins survive.
+void __real_exit(int status) __attribute__((noreturn));
+void __wrap_exit(int status) {
+    Ship::WiiU::Watchdog::Emit("EXIT: exit(%d) - bypassing destructor teardown\n", status);
+    KPADShutdown();
+    RestoreStdioDevoptab();
+    WHBLogUdpDeinit();
+    _Exit(status);
+}
 
 void __wrap___cxa_throw(void* exception, std::type_info* typeInfo, void (*destructor)(void*)) {
-    // The type alone is not enough - std::out_of_range from an .at() could be almost
-    // anywhere in SoH. Log the throw site too.
+    // One frame is not enough: __cxa_throw is called BY std::__throw_out_of_range, so
+    // __builtin_return_address(0) only ever names that helper. Walk the PowerPC
+    // back-chain instead - r1 points at a frame whose first word is the caller's frame
+    // and whose second word is that frame's saved LR - to get the real call path.
     //
-    // The load bias is computed here rather than hardcoded: a previous session's
-    // 0x0A000000 was measured against a different binary and does not transfer. Taking
-    // the runtime address of this very function and subtracting its link-time address
-    // gives the bias for THIS build, so `file` is directly usable with:
-    //     powerpc-eabi-addr2line -e soh.elf <file>
-    const uint32_t ra = (uint32_t)(uintptr_t)__builtin_return_address(0);
-    const uint32_t here = (uint32_t)(uintptr_t)&__wrap___cxa_throw;
-    extern char __code_start[] __attribute__((weak));
-    const uint32_t bias = here - 0x049057c4u; // link-time address of __wrap___cxa_throw
-    Ship::WiiU::Watchdog::Emit("CXX: throw type=%s ra=0x%08X bias=0x%08X file=0x%08X\n",
-                               typeInfo->name(), ra, bias, ra - bias);
+    // A constant tied to this translation unit went stale on every rebuild:
+    // 0x049057c4 -> 0x0490581c -> 0x04904fc8. __init only moves if the crt layout in
+    // the linker script moves, so derive the bias from its fixed head-of-.text address.
+    const uint32_t bias = (uint32_t)(uintptr_t)&__init - 0x02000080u;
+
+    uint32_t* sp;
+    __asm__ volatile("mr %0, 1" : "=r"(sp));
+
+    char line[512];
+    int n = snprintf(line, sizeof(line), "CXX: throw type=%s bias=0x%08X frames:", typeInfo->name(), bias);
+    for (int depth = 0; depth < 8 && sp != nullptr && n < (int)sizeof(line) - 16; ++depth) {
+        uint32_t* next = (uint32_t*)sp[0];
+        if (next <= sp || (uintptr_t)next & 3u) {
+            break;
+        }
+        const uint32_t lr = next[1];
+        if (lr > bias) {
+            n += snprintf(line + n, sizeof(line) - n, " 0x%08X", lr - bias);
+        }
+        sp = next;
+    }
+    Ship::WiiU::Watchdog::Emit("%s\n", line);
     __real___cxa_throw(exception, typeInfo, destructor);
 }
 }
@@ -97,19 +161,40 @@ static char* AppendExceptionRegister(char* destination, const char* name, uint32
 }
 
 static void EmitExceptionMessage(const char* typeName, const OSContext* context) {
-    // ONE Emit, not one per register. Measured 2026-09-13 on a real DSI: 19 sequential
-    // Emit calls from the exception context all arrived carrying the LAST call's text
-    // (every datagram read "r12=..."), because Emit formats into a shared static buffer
-    // and the send lands after it has been overwritten. srr0 and dar were lost exactly
-    // when they mattered. So: everything that matters in a single call, srr0 and dar
-    // first. The GPRs still reach the screen via OSFatal.
+    // Emit formats into a 384-byte stack-local buffer, so sequential calls keep their own
+    // text. Emit the register evidence before OSGetSymbolName: symbol lookup may stall or
+    // fault in the exception context. The GPRs still reach the screen via OSFatal.
     if (context == nullptr) {
         Watchdog::Emit("EXC: type=%s context=NULL\n", typeName);
         return;
     }
+
+    uint32_t* sp = (uint32_t*)(uintptr_t)context->gpr[1];
+    uint32_t caller = 0;
+    do {
+        if (sp == nullptr || (uintptr_t)sp & 3u) {
+            break;
+        }
+        uint32_t* next = (uint32_t*)sp[0];
+        if (next <= sp || (uintptr_t)next & 3u) {
+            break;
+        }
+        caller = next[1];
+    } while (false);
+
     Watchdog::Emit("EXC: %s srr0=0x%08X dar=0x%08X dsisr=0x%08X srr1=0x%08X lr=0x%08X r1=0x%08X core=%u\n",
                    typeName, context->srr0, context->dar, context->dsisr, context->srr1, context->lr,
                    context->gpr[1], (unsigned int)OSGetCoreId());
+
+    char lrSymbol[64] = {};
+    char callerSymbol[64] = {};
+    OSGetSymbolName(context->lr, lrSymbol, sizeof(lrSymbol));
+    lrSymbol[sizeof(lrSymbol) - 1] = '\0';
+    if (caller != 0) {
+        OSGetSymbolName(caller, callerSymbol, sizeof(callerSymbol));
+        callerSymbol[sizeof(callerSymbol) - 1] = '\0';
+    }
+    Watchdog::Emit("EXC-SYM: lr=0x%08X %s caller=0x%08X %s\n", context->lr, lrSymbol, caller, callerSymbol);
 }
 
 static void FormatExceptionMessage(const char* typeName, const OSContext* context) {
@@ -255,7 +340,10 @@ static ssize_t wiiu_log_write(struct _reent* r, void* fd, const char* ptr, size_
 
 static const devoptab_t dotab_stdout = {
     .name = "stdout_whb",
+    .open_r = wiiu_log_open,
+    .close_r = wiiu_log_close,
     .write_r = wiiu_log_write,
+    .fstat_r = wiiu_log_fstat,
 };
 };
 #endif
@@ -297,6 +385,7 @@ void Init(const std::string& shortName) {
 void Exit() {
     KPADShutdown();
 
+    RestoreStdioDevoptab();
     WHBLogUdpDeinit();
 }
 
@@ -591,6 +680,15 @@ static int Main(int, const char**) {
 
 static void TerminateHandler() {
     Emit("CXX: terminate\n");
+    // Do NOT fall through to abort(). abort() hard-wedges the PowerPC side and takes
+    // ftpiiu and the wiiload server with it, so every uncaught exception has been
+    // costing a physical power cycle - the console still answers ping, but nothing
+    // that needs CPU does, and it cannot be recovered remotely.
+    //
+    // _Exit() instead: no destructors (we are already in a terminate handler, the heap
+    // and locks cannot be trusted), but the title ends the way the system expects and
+    // the Aroma plugins survive. A crash then costs a wiiload, not a reboot.
+    _Exit(1);
 }
 
 void Start() {

@@ -897,6 +897,17 @@ static void gfx_gx2_init(void) {
 }
 
 void gfx_gx2_shutdown(void) {
+    // Idempotent: the teardown path runs TWICE. Fast3dWindow::Close drives the window
+    // manager's teardown and the GfxRenderingAPIGX2 destructor calls this again, so the
+    // second pass used to walk freed GX2 state and fault with an ISI to address 0,
+    // hanging the console on every exit - AFTER a first pass that completed cleanly.
+    static bool sShutdown = false;
+    if (sShutdown) {
+        Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown already done - ignoring\n");
+        return;
+    }
+    sShutdown = true;
+
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown enter\n");
 
     if (has_foreground) {
@@ -1046,12 +1057,13 @@ static struct Framebuffer* gfx_gx2_lookup_framebuffer(int framebuffer_id) {
 static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                   bool opengl_invert_y, bool render_target, bool has_depth_buffer,
                                                   bool can_extract_depth) {
-    SPDLOG_INFO("gfx_gx2: UpdateFramebufferParameters fb={} size={}x{} msaa={} ...", fb, width, height, msaa_level);
+    // NO logging here: this runs per frame, and every spdlog emit on this port is a
+    // BLOCKING sendto over UDP. Two lines a frame was ~45 datagrams/sec of pure stall.
+    // (The Banjo port lost 60 fps -> 3.7 fps to exactly this pattern.)
     struct Framebuffer* buffer = (struct Framebuffer*)fb;
 
     // we don't support updating the main buffer (fb 0)
     if (!buffer) {
-        SPDLOG_INFO("gfx_gx2: UpdateFramebufferParameters fb=0 uses the initialized main framebuffer");
         return;
     }
 
