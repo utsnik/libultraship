@@ -21,6 +21,7 @@
 
 #include <coreinit/thread.h>
 #include <coreinit/alarm.h>
+#include <coreinit/dynload.h>
 #include <coreinit/time.h>
 #include <coreinit/exception.h>
 #include <sys/socket.h>
@@ -491,6 +492,9 @@ static ProfileBucket sPcProfile[2][kProfileTableSize];
 static ProfileBucket sLrProfile[2][kProfileTableSize];
 static volatile uint32_t sProfileActive = 0;
 static volatile uint32_t sProfileCount[2] = { 0, 0 };
+// "Game caller": for samples outside the game's .text, the first return address on the
+// stack that IS game code - attributes system/GX2/lock time to the game function behind it.
+static ProfileBucket sGcProfile[2][kProfileTableSize];
 static OSAlarm sProfileAlarm;
 static ProfileTop sTopPcs[kProfileTopPcCount];
 static ProfileTop sTopLrs[kProfileTopLrCount];
@@ -710,10 +714,13 @@ static void EmitProfileReport() {
     ProfileSelectTop(sLrProfile[done], sTopLrs, kProfileTopLrCount);
     EmitProfileTop("pc", sTopPcs, kProfileTopPcCount);
     EmitProfileTop("lr", sTopLrs, kProfileTopLrCount);
+    ProfileSelectTop(sGcProfile[done], sTopPcs, kProfileTopPcCount);
+    EmitProfileTop("gc", sTopPcs, kProfileTopPcCount);
     Emit("PROF: samples=%u\n", sProfileCount[done]);
 
     memset(sPcProfile[done], 0, sizeof(sPcProfile[done]));
     memset(sLrProfile[done], 0, sizeof(sLrProfile[done]));
+    memset(sGcProfile[done], 0, sizeof(sGcProfile[done]));
     sProfileCount[done] = 0;
 }
 
@@ -721,6 +728,12 @@ static void EmitProfileReport() {
 // handed the INTERRUPTED context, so srr0/lr are where the game really was. (OSSuspendThread
 // from another core only ever showed the scheduler: every sample landed on one coreinit PC.)
 // No locks, no allocation, no Emit in here.
+static uint32_t sGameTextStart = 0;
+static uint32_t sGameTextEnd = 0;
+static inline bool ProfileIsGameText(uint32_t address) {
+    return address >= sGameTextStart && address < sGameTextEnd;
+}
+
 static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     (void)alarm;
     if (context == nullptr) {
@@ -729,7 +742,69 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     const uint32_t set = sProfileActive;
     ProfileAdd(sPcProfile[set], context->srr0);
     ProfileAdd(sLrProfile[set], context->lr & ~0xFu);
+    const uint32_t pc = context->srr0;
+    if (!ProfileIsGameText(pc)) {
+        uint32_t caller = ProfileIsGameText(context->lr) ? context->lr : 0;
+        uint32_t sp = context->gpr[1];
+        for (int depth = 0; caller == 0 && depth < 12; ++depth) {
+            if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
+                break;
+            }
+            const uint32_t next = *(const volatile uint32_t*)sp;
+            if (next <= sp || next >= 0x50000000u) {
+                break;
+            }
+            const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
+            if (ProfileIsGameText(savedLr)) {
+                caller = savedLr;
+            }
+            sp = next;
+        }
+        ProfileAdd(sGcProfile[set], caller != 0 ? (caller & ~0xFu) : 0xFFFFFFF0u);
+    }
     ++sProfileCount[set];
+}
+
+// Real addresses of likely-hot system exports, so host-side symbolisation can name the
+// <system 0x010xxxxx> samples by the nearest preceding landmark.
+static void EmitSystemLandmarks() {
+    static const char* const kCoreinit[] = { "OSLockMutex", "OSUnlockMutex", "OSWaitCond", "OSSignalCond",
+        "OSWaitEvent", "OSSleepTicks", "OSYieldThread", "OSFastMutex_Lock", "OSUninterruptibleSpinLock_Acquire",
+        "DCFlushRange", "DCStoreRange", "DCInvalidateRange", "OSBlockMove", "OSBlockSet", "memcpy", "memset",
+        "OSGetTime", "OSGetSystemTime", "MEMAllocFromExpHeapEx", "MEMFreeToExpHeap", "OSCompareAndSwapAtomic",
+        "OSTestThreadCancel", "OSWaitAlarm", nullptr };
+    static const char* const kGx2[] = { "GX2DrawEx", "GX2DrawIndexedEx", "GX2SetAttribBuffer", "GX2SetFetchShader",
+        "GX2SetVertexShader", "GX2SetPixelShader", "GX2SetPixelTexture", "GX2SetPixelSampler",
+        "GX2SetVertexUniformReg", "GX2SetPixelUniformReg", "GX2SetBlendControl", "GX2SetColorControl",
+        "GX2SetDepthStencilControl", "GX2SetAlphaTest", "GX2SetScissor", "GX2SetViewport", "GX2Invalidate",
+        "GX2Flush", "GX2DrawDone", "GX2WaitTimeStamp", "GX2WaitForVsync", "GX2CopySurfaceEx",
+        "GX2SetPolygonOffset", "GX2SetPolygonControl", "GX2SetCullOnlyControl", nullptr };
+    struct Lib { const char* rpl; const char* const* names; };
+    const Lib libs[] = { { "coreinit.rpl", kCoreinit }, { "gx2.rpl", kGx2 } };
+    for (const Lib& lib : libs) {
+        OSDynLoad_Module module = nullptr;
+        if (OSDynLoad_Acquire(lib.rpl, &module) != OS_DYNLOAD_OK) {
+            Emit("PROFMAP: acquire %s failed\n", lib.rpl);
+            continue;
+        }
+        for (const char* const* name = lib.names; *name != nullptr; ++name) {
+            void* address = nullptr;
+            if (OSDynLoad_FindExport(module, OS_DYNLOAD_EXPORT_FUNC, *name, &address) == OS_DYNLOAD_OK) {
+                Emit("PROFMAP: sym %s:%s=0x%08X\n", lib.rpl, *name, (uint32_t)address);
+            }
+        }
+        OSDynLoad_Release(module);
+    }
+    OSDynLoad_NotifyData infos[48];
+    const int32_t rplCount = OSDynLoad_GetNumberOfRPLs();
+    if (rplCount > 0 && OSDynLoad_GetRPLInfo(0, rplCount > 48 ? 48 : (uint32_t)rplCount, infos)) {
+        for (int32_t i = 0; i < rplCount && i < 48; ++i) {
+            Emit("PROFMAP: rpl %s text=0x%08X+0x%X\n", infos[i].name ? infos[i].name : "?", infos[i].textAddr,
+                 infos[i].textSize);
+        }
+    } else {
+        Emit("PROFMAP: rpl list unavailable (count=%d)\n", (int)rplCount);
+    }
 }
 
 // Must run before the title tears down: a periodic alarm left armed would fire into a
@@ -909,6 +984,15 @@ void Start() {
     }
     sStarted = true;
     sSampleThread = OSGetCurrentThread();
+    // Game .text range for caller attribution: ELF .text starts at 0x02000000 and is ~46 MB;
+    // the load bias comes from __init's fixed head-of-.text address, as in the throw logger.
+    {
+        const uint32_t bias = (uint32_t)(uintptr_t)&__init - 0x02000080u;
+        sGameTextStart = bias + 0x02000000u;
+        sGameTextEnd = bias + 0x05000000u;
+    }
+    Emit("PROFMAP: gameText=0x%08X-0x%08X\n", sGameTextStart, sGameTextEnd);
+    EmitSystemLandmarks();
     // Set from the game thread so the alarm fires on (and samples) the game thread's core.
     OSCreateAlarm(&sProfileAlarm);
     OSSetPeriodicAlarm(&sProfileAlarm, OSGetTime() + OSMillisecondsToTicks(2000),
