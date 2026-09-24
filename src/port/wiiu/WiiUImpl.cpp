@@ -980,15 +980,19 @@ static int Main(int, const char**) {
             // newlib heap (what malloc/new actually use): arena = bytes obtained via sbrk,
             // used = bytes in allocated chunks. Growth of "used" is the leak/pressure signal.
             const struct mallinfo heapInfo = mallinfo();
+            // Two lines: with the live cache counters one line exceeded Emit's 512-byte buffer
+            // and would have truncated heapUsed, the field that matters most.
             Emit("WDOG: mem texCount=%u texBytes=%u texLiveCount=%u texLiveBytes=%u lastTexPtr=0x%08X "
-                 "texCache=%u freeTexIds=%u otrCache=%u rawPath=%u rawHash=%u resourceCache=%u shaderPool=%u "
                  "audioSeq=%u audioPhase=%u flips=%u emitOk=%u emitFail=%u otrHit=%u otrMiss=%u rmLookup=%u "
                  "drawHwm=%u frames=%u gpuUs=%u cpuUs=%u waitUs=%u slotWaits=%u heapArena=%u heapUsed=%u\n",
-                 gTexCount, gTexBytes, gTexLiveCount, gTexLiveBytes, gLastTexPtr, gTextureCacheSize,
-                 gFreeTextureIdsSize, gOtrTextureCacheSize, gRawPointerByPathSize, gRawPointerByHashSize,
-                 gResourceCacheSize, gShaderProgramPoolSize, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail,
-                 gOtrCacheHits, gOtrCacheMisses, gOtrResourceManagerLookups, gDrawBufferHighWaterBytes, timingFrames,
-                 gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits, (uint32_t)heapInfo.arena,
+                 gTexCount, gTexBytes, gTexLiveCount, gTexLiveBytes, gLastTexPtr, gAudioSeq, gAudioPhase,
+                 gFlipCount, gEmitOk, gEmitFail, gOtrCacheHits, gOtrCacheMisses, gOtrResourceManagerLookups,
+                 gDrawBufferHighWaterBytes, timingFrames, gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits,
+                 (uint32_t)heapInfo.arena, (uint32_t)heapInfo.uordblks);
+            Emit("WDOG: caches texCache=%u freeTexIds=%u otrCache=%u rawPath=%u rawHash=%u resourceCache=%u "
+                 "shaderPool=%u texLiveBytes=%u heapUsed=%u\n",
+                 gTextureCacheSize, gFreeTextureIdsSize, gOtrTextureCacheSize, gRawPointerByPathSize,
+                 gRawPointerByHashSize, gResourceCacheSize, gShaderProgramPoolSize, gTexLiveBytes,
                  (uint32_t)heapInfo.uordblks);
         }
 
