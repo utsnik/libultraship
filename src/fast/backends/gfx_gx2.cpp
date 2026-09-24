@@ -15,7 +15,10 @@
 #include <malloc.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <map>
+#include <unordered_map>
+#include <vector>
 
 #ifndef _LANGUAGE_C
 #define _LANGUAGE_C
@@ -108,7 +111,6 @@ struct Framebuffer {
 
 static struct Framebuffer main_framebuffer;
 static std::map<int, struct Framebuffer*> framebuffer_registry = {{0, &main_framebuffer}};
-static GX2DepthBuffer depthReadBuffer;
 static struct Framebuffer* current_framebuffer;
 
 static std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgram> shader_program_pool;
@@ -117,13 +119,22 @@ static struct ShaderProgram* current_shader_program;
 static struct GX2TextureEntry* current_texture;
 static int current_tile;
 
-// 96 Mb (should be more than enough to draw everything without waiting for the GPU)
-#define DRAW_BUFFER_SIZE 0x6000000
+// 8 MiB per frame arena. Exhaustion keeps the serialized fallback below.
+#define DRAW_BUFFER_SIZE 0x800000
+
+struct DepthReadbackRequest {
+    struct Framebuffer* framebuffer;
+    std::pair<float, float> coordinate;
+};
+
 struct DrawBufferSlot {
     uint8_t* buffer = nullptr;
     OSTime submitted_timestamp = 0;
     uint32_t cpu_microseconds = 0;
     bool gpu_timing_pending = false;
+    GX2DepthBuffer depth_read_buffer = {};
+    std::vector<DepthReadbackRequest> depth_read_requests;
+    bool depth_readback_pending = false;
 };
 
 static DrawBufferSlot draw_buffer_slots[2];
@@ -139,6 +150,8 @@ static uint8_t* draw_buffer = nullptr;
 static uint8_t* draw_ptr = nullptr;
 static uint32_t draw_buffer_frame_high_water = 0;
 static OSTime frame_start_time = 0;
+
+static std::map<std::pair<struct Framebuffer*, std::pair<float, float>>, uint16_t> depth_readback_cache;
 
 static uint32_t frame_count;
 static bool gfx_gx2_trace_first_frame = true;
@@ -169,6 +182,87 @@ static uint32_t gfx_gx2_elapsed_microseconds(OSTime start, OSTime end) {
     }
     const uint64_t microseconds = OSTicksToMicroseconds(end - start);
     return microseconds > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(microseconds);
+}
+
+static bool gfx_gx2_resize_depth_readback(DrawBufferSlot& slot, uint32_t capacity) {
+    if (slot.depth_read_buffer.surface.image && slot.depth_read_buffer.surface.width >= capacity) {
+        return true;
+    }
+
+    GX2DepthBuffer replacement;
+    memcpy(&replacement, &main_framebuffer.depth_buffer, sizeof(replacement));
+    replacement.surface.image = nullptr;
+    replacement.surface.mipmaps = nullptr;
+    replacement.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    replacement.surface.width = capacity;
+    replacement.surface.height = 1;
+    GX2CalcSurfaceSizeAndAlignment(&replacement.surface);
+
+    replacement.surface.image =
+        gfx_wiiu_alloc_mem1(replacement.surface.imageSize, replacement.surface.alignment);
+    if (!replacement.surface.image) {
+        SPDLOG_ERROR("gfx_gx2: failed to allocate depth readback buffer for {} coordinates", capacity);
+        return false;
+    }
+
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_DEPTH_BUFFER, replacement.surface.image,
+                  replacement.surface.imageSize);
+    if (slot.depth_read_buffer.surface.image) {
+        gfx_wiiu_free_mem1(slot.depth_read_buffer.surface.image);
+    }
+    slot.depth_read_buffer = replacement;
+    return true;
+}
+
+static void gfx_gx2_collect_depth_readback(DrawBufferSlot& slot) {
+    if (!slot.depth_readback_pending || slot.submitted_timestamp == 0 ||
+        slot.submitted_timestamp > GX2GetRetiredTimeStamp()) {
+        return;
+    }
+
+    // The frame timestamp is also the fence for these GPU writes. Invalidate
+    // the CPU cache only after that fence has retired and before reading them.
+    DCInvalidateRange(slot.depth_read_buffer.surface.image, slot.depth_read_buffer.surface.imageSize);
+    const uint32_t* depth_values = static_cast<const uint32_t*>(slot.depth_read_buffer.surface.image);
+    for (size_t i = 0; i < slot.depth_read_requests.size(); ++i) {
+        const uint32_t bits = __builtin_bswap32(depth_values[i]);
+        float depth;
+        memcpy(&depth, &bits, sizeof(depth));
+        const DepthReadbackRequest& request = slot.depth_read_requests[i];
+        depth_readback_cache[{ request.framebuffer, request.coordinate }] =
+            static_cast<uint16_t>(depth * 65532.0f);
+    }
+
+    slot.depth_readback_pending = false;
+    slot.depth_read_requests.clear();
+}
+
+static void gfx_gx2_collect_retired_depth_readbacks() {
+    const OSTime retired_timestamp = GX2GetRetiredTimeStamp();
+    DrawBufferSlot* first = nullptr;
+    DrawBufferSlot* second = nullptr;
+
+    for (DrawBufferSlot& slot : draw_buffer_slots) {
+        if (!slot.depth_readback_pending || slot.submitted_timestamp == 0 ||
+            slot.submitted_timestamp > retired_timestamp) {
+            continue;
+        }
+        if (!first || slot.submitted_timestamp < first->submitted_timestamp) {
+            second = first;
+            first = &slot;
+        } else {
+            second = &slot;
+        }
+    }
+
+    // Apply completed slots in submission order so duplicate coordinates keep
+    // the newest retired value.
+    if (first) {
+        gfx_gx2_collect_depth_readback(*first);
+    }
+    if (second) {
+        gfx_gx2_collect_depth_readback(*second);
+    }
 }
 
 static void gfx_gx2_draw_done(const char* detail) {
@@ -220,6 +314,8 @@ static void gfx_gx2_prepare_draw_buffer_slot() {
     DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
     if (draw_buffer_double_buffered) {
         gfx_gx2_wait_for_draw_buffer_slot(slot);
+        gfx_gx2_collect_retired_depth_readbacks();
+        slot.submitted_timestamp = 0;
     }
     draw_buffer = slot.buffer;
     draw_ptr = draw_buffer;
@@ -865,7 +961,7 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
     size_t vbo_len = sizeof(float) * buf_vbo_len;
 
     if (draw_ptr + vbo_len >= draw_buffer + DRAW_BUFFER_SIZE) {
-        printf("Waiting on GPU!!!\n");
+        SPDLOG_WARN("gfx_gx2: draw-buffer arena exhausted; serializing GPU for fallback");
         gfx_gx2_draw_done("draw-buffer arena exhaustion");
         draw_ptr = draw_buffer;
     }
@@ -946,30 +1042,13 @@ static void gfx_gx2_init(void) {
     main_framebuffer.imtex.Texture = &main_framebuffer.texture;
     main_framebuffer.imtex.Sampler = &main_framebuffer.sampler;
 
-    // create a linear aligned copy of the depth buffer to read pixels to
-    memcpy(&depthReadBuffer, &main_framebuffer.depth_buffer, sizeof(GX2DepthBuffer));
-
-    depthReadBuffer.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
-    depthReadBuffer.surface.width = 32;
-    depthReadBuffer.surface.height = 1;
-
-    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(depth readback) ...");
-    GX2CalcSurfaceSizeAndAlignment(&depthReadBuffer.surface);
-    SPDLOG_INFO("gfx_gx2_init: GX2CalcSurfaceSizeAndAlignment(depth readback) complete size=0x{:X} alignment=0x{:X}",
-                depthReadBuffer.surface.imageSize, depthReadBuffer.surface.alignment);
-
-    SPDLOG_INFO("gfx_gx2_init: depth readback allocation ... size=0x{:X}", depthReadBuffer.surface.imageSize);
-    depthReadBuffer.surface.image =
-        gfx_wiiu_alloc_mem1(depthReadBuffer.surface.imageSize, depthReadBuffer.surface.alignment);
-    SPDLOG_INFO("gfx_gx2_init: depth readback allocation returned ptr={}", depthReadBuffer.surface.image);
-    if (!depthReadBuffer.surface.image) {
-        SPDLOG_ERROR("gfx_gx2: failed to allocate depth readback buffer");
-        return;
+    // Each frame slot owns its GPU destination so a copy can stay in flight
+    // while the CPU records the following frame.
+    for (DrawBufferSlot& slot : draw_buffer_slots) {
+        if (!gfx_gx2_resize_depth_readback(slot, 32)) {
+            return;
+        }
     }
-    SPDLOG_INFO("gfx_gx2_init: depth readback GX2Invalidate ...");
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_DEPTH_BUFFER, depthReadBuffer.surface.image,
-                  depthReadBuffer.surface.imageSize);
-    SPDLOG_INFO("gfx_gx2_init: depth readback GX2Invalidate complete");
 
     SPDLOG_INFO("gfx_gx2_init: GX2SetColorBuffer ...");
     GX2SetColorBuffer(&main_framebuffer.color_buffer, GX2_RENDER_TARGET_0);
@@ -1031,9 +1110,11 @@ void gfx_gx2_shutdown(void) {
     if (has_foreground) {
         gfx_gx2_draw_done("shutdown");
 
-        if (depthReadBuffer.surface.image) {
-            gfx_wiiu_free_mem1(depthReadBuffer.surface.image);
-            depthReadBuffer.surface.image = nullptr;
+        for (DrawBufferSlot& slot : draw_buffer_slots) {
+            if (slot.depth_read_buffer.surface.image) {
+                gfx_wiiu_free_mem1(slot.depth_read_buffer.surface.image);
+                slot.depth_read_buffer.surface.image = nullptr;
+            }
         }
 
         if (main_framebuffer.color_buffer.surface.image) {
@@ -1054,7 +1135,10 @@ void gfx_gx2_shutdown(void) {
         }
         slot.submitted_timestamp = 0;
         slot.gpu_timing_pending = false;
+        slot.depth_read_requests.clear();
+        slot.depth_readback_pending = false;
     }
+    depth_readback_cache.clear();
     draw_buffer_double_buffered = false;
     draw_buffer_slot_index = 0;
     draw_buffer = nullptr;
@@ -1129,10 +1213,77 @@ static void gfx_gx2_start_frame(void) {
     }
 }
 
+static void gfx_gx2_enqueue_depth_readback(DrawBufferSlot& slot) {
+    if (slot.depth_read_requests.empty()) {
+        return;
+    }
+
+    if (slot.depth_read_requests.size() > UINT32_MAX) {
+        SPDLOG_ERROR("gfx_gx2: depth readback request count exceeds GX2 surface capacity");
+        slot.depth_read_requests.clear();
+        return;
+    }
+
+    const uint32_t request_count = static_cast<uint32_t>(slot.depth_read_requests.size());
+    if (!gfx_gx2_resize_depth_readback(slot, request_count)) {
+        slot.depth_read_requests.clear();
+        return;
+    }
+
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_DEPTH_BUFFER,
+                  slot.depth_read_buffer.surface.image, slot.depth_read_buffer.surface.imageSize);
+
+    // GX2CopySurfaceEx accepts at most 25 source rectangles per call. Multiple
+    // calls target disjoint pixels in this slot's linear destination.
+    for (uint32_t first = 0; first < request_count; first += 25) {
+        const uint32_t count = std::min<uint32_t>(25, request_count - first);
+        GX2Rect source_rects[25];
+        GX2Point destination_points[25];
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const DepthReadbackRequest& request = slot.depth_read_requests[first + i];
+            const GX2Surface& depth_surface = request.framebuffer->depth_buffer.surface;
+            const int32_t x = static_cast<int32_t>(
+                std::clamp(request.coordinate.first, 0.0f, static_cast<float>(depth_surface.width - 1)));
+            const int32_t y = static_cast<int32_t>(
+                std::clamp(request.coordinate.second, 0.0f, static_cast<float>(depth_surface.height - 1)));
+            source_rects[i] = GX2Rect{ x, static_cast<int32_t>(depth_surface.height) - y, x + 1,
+                                       static_cast<int32_t>(depth_surface.height) - y + 1 };
+            destination_points[i] = GX2Point{ static_cast<int32_t>(first + i), 0 };
+        }
+
+        // A batch can contain requests for different framebuffers, while one
+        // GX2CopySurfaceEx call has only one source. Keep contiguous requests
+        // grouped by source by issuing individual copies where necessary.
+        uint32_t group_start = 0;
+        while (group_start < count) {
+            struct Framebuffer* source = slot.depth_read_requests[first + group_start].framebuffer;
+            uint32_t group_count = 1;
+            while (group_start + group_count < count &&
+                   slot.depth_read_requests[first + group_start + group_count].framebuffer == source) {
+                ++group_count;
+            }
+            GX2CopySurfaceEx(&source->depth_buffer.surface, 0, 0, &slot.depth_read_buffer.surface, 0, 0,
+                             group_count, &source_rects[group_start], &destination_points[group_start]);
+            group_start += group_count;
+        }
+    }
+
+    // CopySurfaceEx changes the GX2 context state. Restore the render state
+    // without waiting; the queued copies remain part of this frame.
+    gfx_wiiu_set_context_state();
+
+    slot.depth_readback_pending = true;
+}
+
 static void gfx_gx2_end_frame(void) {
     const bool trace = gfx_gx2_trace_first_frame;
     DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
     Ship::WiiU::Watchdog::gDrawBufferHighWaterBytes = draw_buffer_frame_high_water;
+
+    // Queue depth copies into this frame's slot before the flush. They retire
+    // under the same timestamp as the draw arena and timing samples.
+    gfx_gx2_enqueue_depth_readback(slot);
 
     // Close the GPU-side timing interval and submit the command buffer. The
     // submitted timestamp is the fence for both the draw arena and its timing
@@ -1152,6 +1303,7 @@ static void gfx_gx2_end_frame(void) {
         // the single arena is serialized once per frame.
         gfx_gx2_draw_done("GX2DrawDone");
         gfx_gx2_collect_gpu_timing(slot);
+        gfx_gx2_collect_depth_readback(slot);
         slot.submitted_timestamp = 0;
         draw_ptr = draw_buffer;
     }
@@ -1462,50 +1614,28 @@ gfx_gx2_get_pixel_depth(int fb_id, const std::set<std::pair<float, float>>& coor
         buffer = &main_framebuffer;
     }
 
+    // Poll only: never wait in the depth path. Retired slots update the cache;
+    // an in-flight result remains eligible on a later frame.
+    gfx_gx2_collect_retired_depth_readbacks();
+
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
-    GX2Rect srcRects[25];
-    GX2Point dstPoints[25];
-    size_t num_coordinates = coordinates.size();
-    while (num_coordinates > 0) {
-        size_t numRects = 25;
-        if (num_coordinates < numRects) {
-            numRects = num_coordinates;
+    DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
+    for (const auto& coordinate : coordinates) {
+        const auto cached = depth_readback_cache.find({ buffer, coordinate });
+        res.emplace(coordinate, cached == depth_readback_cache.end() ? 65532 : cached->second);
+
+        const auto already_queued = std::find_if(
+            slot.depth_read_requests.begin(), slot.depth_read_requests.end(),
+            [buffer, &coordinate](const DepthReadbackRequest& request) {
+                return request.framebuffer == buffer && request.coordinate == coordinate;
+            });
+        if (already_queued == slot.depth_read_requests.end()) {
+            slot.depth_read_requests.push_back({ buffer, coordinate });
         }
-        num_coordinates -= numRects;
+    }
 
-        // initialize rects and points
-        for (size_t i = 0; i < numRects; ++i) {
-            const auto& c = *std::next(coordinates.begin(), num_coordinates + i);
-            const int32_t x = (int32_t)std::clamp(c.first, 0.0f, (float)(buffer->depth_buffer.surface.width - 1));
-            const int32_t y = (int32_t)std::clamp(c.second, 0.0f, (float)(buffer->depth_buffer.surface.height - 1));
-
-            srcRects[i] = GX2Rect{ x, (int32_t)buffer->depth_buffer.surface.height - y, x + 1,
-                                   (int32_t)(buffer->depth_buffer.surface.height - y) + 1 };
-
-            // dst points will be spread over the x-axis of the buffer
-            dstPoints[i] = GX2Point{ i, 0 };
-        }
-
-        // Invalidate the buffer first
-        GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_DEPTH_BUFFER, depthReadBuffer.surface.image,
-                      depthReadBuffer.surface.imageSize);
-
-        // Perform the copy
-        GX2CopySurfaceEx(&buffer->depth_buffer.surface, 0, 0, &depthReadBuffer.surface, 0, 0, numRects, srcRects,
-                         dstPoints);
-
-        // Wait for draws to be done and restore context, in case GPU was used
-        gfx_gx2_draw_done("depth readback");
-        gfx_wiiu_set_context_state();
-
-        // read the pixels from the depthReadBuffer
-        for (size_t i = 0; i < numRects; ++i) {
-            uint32_t tmp = __builtin_bswap32(*((uint32_t*)depthReadBuffer.surface.image + i));
-            float val = *(float*)&tmp;
-
-            const auto& c = *std::next(coordinates.begin(), num_coordinates + i);
-            res.emplace(c, val * 65532.0f);
-        }
+    if (slot.depth_read_requests.size() <= UINT32_MAX) {
+        gfx_gx2_resize_depth_readback(slot, static_cast<uint32_t>(slot.depth_read_requests.size()));
     }
 
     return res;
