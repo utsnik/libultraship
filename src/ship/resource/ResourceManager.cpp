@@ -8,6 +8,7 @@
 #include "ship/utils/Utils.h"
 #include "ship/config/ConsoleVariable.h"
 #include "ship/Context.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 namespace Ship {
 
@@ -144,6 +145,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
         {
             const std::lock_guard<std::mutex> lock(mMutex);
             mResourceCache[identifier] = ResourceLoadError::NotFound;
+            WDOG_RESOURCE_CACHE_SIZE(mResourceCache.size());
         }
         return nullptr;
     }
@@ -170,6 +172,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
         } else {
             mResourceCache[identifier] = ResourceLoadError::NotFound;
         }
+        WDOG_RESOURCE_CACHE_SIZE(mResourceCache.size());
     }
 
     if (resource != nullptr) {
@@ -337,7 +340,10 @@ std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadRe
 }
 
 std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadResources(const ResourceFilter& filter) {
-    return LoadResourcesAsync(filter, BS::pr::highest).get();
+    WDOG_HEAPMARK("before ResourceManager::LoadResources");
+    auto resources = LoadResourcesAsync(filter, BS::pr::highest).get();
+    WDOG_HEAPMARK("after ResourceManager::LoadResources");
+    return resources;
 }
 
 void ResourceManager::DirtyResources(const ResourceFilter& filter) {
@@ -403,6 +409,7 @@ size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
         const std::lock_guard<std::mutex> lock(mMutex);
         if (mResourceCache.erase(identifier) != 0) {
             mCacheGeneration.fetch_add(1, std::memory_order_relaxed);
+            WDOG_RESOURCE_CACHE_SIZE(mResourceCache.size());
         }
     }
 

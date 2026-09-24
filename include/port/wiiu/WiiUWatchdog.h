@@ -120,7 +120,16 @@ extern volatile uint32_t gAudioPhase;  // 0 = waiting for work, 1 = mixing
 
 extern volatile uint32_t gTexBytes;   // cumulative allocation bytes passed to memalign
 extern volatile uint32_t gTexCount;
+extern volatile uint32_t gTexLiveBytes;
+extern volatile uint32_t gTexLiveCount;
 extern volatile uint32_t gLastTexPtr;
+extern volatile uint32_t gTextureCacheSize;
+extern volatile uint32_t gFreeTextureIdsSize;
+extern volatile uint32_t gOtrTextureCacheSize;
+extern volatile uint32_t gRawPointerByPathSize;
+extern volatile uint32_t gRawPointerByHashSize;
+extern volatile uint32_t gResourceCacheSize;
+extern volatile uint32_t gShaderProgramPoolSize;
 extern volatile uint32_t gFlipCount;
 extern volatile uint32_t gOtrCacheHits;
 extern volatile uint32_t gOtrCacheMisses;
@@ -140,6 +149,7 @@ void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds);
 
 // Raw UDP diagnostic output shared with GX2 callbacks. This must remain allocation-free.
 void Emit(const char* fmt, ...);
+void HeapMark(const char* label);
 void TraceEvent(uint32_t phase, const char* event);
 void TraceStep(uint32_t opcode, const void* cmd, uint32_t steps);
 void ArmTraceAfterTrackLoad();
@@ -148,6 +158,37 @@ inline void TexAlloc(const void* ptr, uint32_t size) {
     gLastTexPtr = (uint32_t)(uintptr_t)ptr;
     gTexBytes += size;
     ++gTexCount;
+    if (ptr != nullptr) {
+        gTexLiveBytes += size;
+        ++gTexLiveCount;
+    }
+}
+
+inline void TexFree(uint32_t size) {
+    gTexLiveBytes -= size;
+    --gTexLiveCount;
+}
+
+inline void SetTextureCacheSizes(size_t mapSize, size_t freeTextureIdsSize) {
+    gTextureCacheSize = (uint32_t)mapSize;
+    gFreeTextureIdsSize = (uint32_t)freeTextureIdsSize;
+}
+
+inline void SetOtrTextureCacheSize(size_t size) {
+    gOtrTextureCacheSize = (uint32_t)size;
+}
+
+inline void SetRawPointerCacheSizes(size_t byPathSize, size_t byHashSize) {
+    gRawPointerByPathSize = (uint32_t)byPathSize;
+    gRawPointerByHashSize = (uint32_t)byHashSize;
+}
+
+inline void SetResourceCacheSize(size_t size) {
+    gResourceCacheSize = (uint32_t)size;
+}
+
+inline void SetShaderProgramPoolSize(size_t size) {
+    gShaderProgramPoolSize = (uint32_t)size;
 }
 
 inline void OtrCacheHit() {
@@ -294,6 +335,7 @@ void StopProfiler();
 #define WDOG_ENTER(phase, detail) ::Ship::WiiU::Watchdog::Enter(phase, detail)
 #define WDOG_ENTER_FMT(phase, fmt, ...) ::Ship::WiiU::Watchdog::EnterFmt(phase, fmt, __VA_ARGS__)
 #define WDOG_EMIT(...) ::Ship::WiiU::Watchdog::Emit(__VA_ARGS__)
+#define WDOG_HEAPMARK(label) ::Ship::WiiU::Watchdog::HeapMark(label)
 #define WDOG_LEAVE(phase) ::Ship::WiiU::Watchdog::Leave(phase)
 #define WDOG_STEP(op, cmd, steps) ::Ship::WiiU::Watchdog::Step(op, cmd, steps)
 #define WDOG_FRAME(n) ::Ship::WiiU::Watchdog::Frame(n)
@@ -303,6 +345,14 @@ void StopProfiler();
 #define WDOG_SCOPE_FMT(phase, fmt, ...) \
     ::Ship::WiiU::Watchdog::ScopeFmt WDOG_CAT(wdogScopeFmt_, __LINE__)(phase, fmt, __VA_ARGS__)
 #define WDOG_TEXALLOC(ptr, size) ::Ship::WiiU::Watchdog::TexAlloc(ptr, size)
+#define WDOG_TEXFREE(size) ::Ship::WiiU::Watchdog::TexFree(size)
+#define WDOG_TEXTURE_CACHE_SIZES(mapSize, freeSize) \
+    ::Ship::WiiU::Watchdog::SetTextureCacheSizes(mapSize, freeSize)
+#define WDOG_OTR_TEXTURE_CACHE_SIZE(size) ::Ship::WiiU::Watchdog::SetOtrTextureCacheSize(size)
+#define WDOG_RAW_POINTER_CACHE_SIZES(byPathSize, byHashSize) \
+    ::Ship::WiiU::Watchdog::SetRawPointerCacheSizes(byPathSize, byHashSize)
+#define WDOG_RESOURCE_CACHE_SIZE(size) ::Ship::WiiU::Watchdog::SetResourceCacheSize(size)
+#define WDOG_SHADER_PROGRAM_POOL_SIZE(size) ::Ship::WiiU::Watchdog::SetShaderProgramPoolSize(size)
 #define WDOG_OTR_CACHE_HIT() ::Ship::WiiU::Watchdog::OtrCacheHit()
 #define WDOG_OTR_CACHE_MISS() ::Ship::WiiU::Watchdog::OtrCacheMiss()
 #define WDOG_OTR_RM_LOOKUP() ::Ship::WiiU::Watchdog::OtrResourceManagerLookup()
@@ -312,6 +362,7 @@ void StopProfiler();
 #define WDOG_ENTER(phase, detail) ((void)0)
 #define WDOG_ENTER_FMT(phase, fmt, ...) ((void)0)
 #define WDOG_EMIT(...) ((void)0)
+#define WDOG_HEAPMARK(label) ((void)0)
 #define WDOG_LEAVE(phase) ((void)0)
 #define WDOG_STEP(op, cmd, steps) ((void)0)
 #define WDOG_FRAME(n) ((void)0)
@@ -320,6 +371,12 @@ void StopProfiler();
 #define WDOG_SCOPE(phase, detail) ((void)0)
 #define WDOG_SCOPE_FMT(phase, fmt, ...) ((void)0)
 #define WDOG_TEXALLOC(ptr, size) ((void)0)
+#define WDOG_TEXFREE(size) ((void)0)
+#define WDOG_TEXTURE_CACHE_SIZES(mapSize, freeSize) ((void)0)
+#define WDOG_OTR_TEXTURE_CACHE_SIZE(size) ((void)0)
+#define WDOG_RAW_POINTER_CACHE_SIZES(byPathSize, byHashSize) ((void)0)
+#define WDOG_RESOURCE_CACHE_SIZE(size) ((void)0)
+#define WDOG_SHADER_PROGRAM_POOL_SIZE(size) ((void)0)
 #define WDOG_OTR_CACHE_HIT() ((void)0)
 #define WDOG_OTR_CACHE_MISS() ((void)0)
 #define WDOG_OTR_RM_LOOKUP() ((void)0)

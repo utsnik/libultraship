@@ -420,6 +420,7 @@ class Interpreter {
     void ImportTextureImg(int tile, bool importReplacement);
     void ImportTexture(int i, int tile, bool importReplacement);
     void ImportTextureMask(int i, int tile);
+    bool EnsureTexUploadBuffer(size_t requiredBytes);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
@@ -494,6 +495,7 @@ class Interpreter {
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
     uint8_t* mTexUploadBuffer = nullptr;
+    size_t mTexUploadBufferSize = 0;
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;
     int32_t mCurWindowPosX{};

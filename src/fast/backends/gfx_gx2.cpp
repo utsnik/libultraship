@@ -463,6 +463,7 @@ static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
     struct ShaderProgram* prg = &shader_program_pool[std::make_pair(shader_id0, shader_id1)];
+    WDOG_SHADER_PROGRAM_POOL_SIZE(shader_program_pool.size());
     prg->shader_id0 = shader_id0;
     prg->shader_id1 = shader_id1;
 
@@ -545,6 +546,7 @@ static void gfx_gx2_delete_texture(uint32_t texture_id) {
 
     if (tex->texture.surface.image) {
         gfx_gx2_draw_done("texture free");
+        WDOG_TEXFREE(tex->texture.surface.imageSize);
         free(tex->texture.surface.image);
     }
 
@@ -627,6 +629,7 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
             // hard-freezes the console with no CPU-side error at all. The
             // framebuffer path already guards its frees this way.
             gfx_gx2_draw_done("texture reallocation");
+            WDOG_TEXFREE(tex->texture.surface.imageSize);
             free(tex->texture.surface.image);
             tex->texture.surface.image = nullptr;
         }
@@ -997,6 +1000,7 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
 }
 
 static void gfx_gx2_init(void) {
+    WDOG_HEAPMARK("before gfx_gx2_init");
     SPDLOG_INFO("gfx_gx2_init: framebuffer setup begin {}x{}", WIIU_DEFAULT_FB_WIDTH, WIIU_DEFAULT_FB_HEIGHT);
     // Init the default framebuffer
     gfx_gx2_init_framebuffer(&main_framebuffer, WIIU_DEFAULT_FB_WIDTH, WIIU_DEFAULT_FB_HEIGHT);
@@ -1091,6 +1095,7 @@ static void gfx_gx2_init(void) {
                        GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ZERO, GX2_BLEND_MODE_ZERO,
                        GX2_BLEND_COMBINE_MODE_ADD);
     SPDLOG_INFO("gfx_gx2_init: GX2SetBlendControl complete; framebuffer setup complete");
+    WDOG_HEAPMARK("after gfx_gx2_init");
 }
 
 void gfx_gx2_shutdown(void) {
@@ -1717,6 +1722,7 @@ void GfxRenderingAPIGX2::ClearShaderCache() {
         gx2FreeShaderGroup(&entry.second.group);
     }
     shader_program_pool.clear();
+    WDOG_SHADER_PROGRAM_POOL_SIZE(shader_program_pool.size());
     current_shader_program = nullptr;
 }
 

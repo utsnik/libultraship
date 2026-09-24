@@ -448,7 +448,16 @@ volatile uint32_t gAudioSeq = 0;
 volatile uint32_t gAudioPhase = 0;
 volatile uint32_t gTexBytes = 0;
 volatile uint32_t gTexCount = 0;
+volatile uint32_t gTexLiveBytes = 0;
+volatile uint32_t gTexLiveCount = 0;
 volatile uint32_t gLastTexPtr = 0;
+volatile uint32_t gTextureCacheSize = 0;
+volatile uint32_t gFreeTextureIdsSize = 0;
+volatile uint32_t gOtrTextureCacheSize = 0;
+volatile uint32_t gRawPointerByPathSize = 0;
+volatile uint32_t gRawPointerByHashSize = 0;
+volatile uint32_t gResourceCacheSize = 0;
+volatile uint32_t gShaderProgramPoolSize = 0;
 volatile uint32_t gFlipCount = 0;
 volatile uint32_t gOtrCacheHits = 0;
 volatile uint32_t gOtrCacheMisses = 0;
@@ -607,7 +616,7 @@ void Emit(const char* fmt, ...) {
     // `alive` line is 281 bytes (a 127-byte detail plus every numeric field at full width),
     // and truncating it would drop `flips=` off the end - the field the tick exists to
     // report. vsnprintf truncates safely either way, but silently.
-    char line[384];
+    char line[512];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
@@ -631,6 +640,11 @@ void Emit(const char* fmt, ...) {
     } else {
         ++gEmitOk;
     }
+}
+
+void HeapMark(const char* label) {
+    const struct mallinfo heapInfo = mallinfo();
+    Emit("HEAPMARK: %s used=%u\n", label != nullptr ? label : "?", (uint32_t)heapInfo.uordblks);
 }
 
 static uint32_t ProfileHash(uint32_t address) {
@@ -775,7 +789,7 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
         const uint32_t caller = ProfileFirstGameReturn(context->lr, context->gpr[1]);
         ProfileAdd(sGcProfile[set], caller != 0 ? (caller & ~0xFu) : 0xFFFFFFF0u);
     }
-    if (sSampleThread != nullptr && OSGetCurrentThread() != sSampleThread) {
+    if (sSampleThread != nullptr && context != &sSampleThread->context) {
         const uint32_t blocked =
             ProfileFirstGameReturn(sSampleThread->context.lr, sSampleThread->context.gpr[1]);
         ProfileAdd(sBkProfile[set], blocked != 0 ? (blocked & ~0xFu) : 0xFFFFFFF0u);
@@ -966,10 +980,13 @@ static int Main(int, const char**) {
             // newlib heap (what malloc/new actually use): arena = bytes obtained via sbrk,
             // used = bytes in allocated chunks. Growth of "used" is the leak/pressure signal.
             const struct mallinfo heapInfo = mallinfo();
-            Emit("WDOG: mem texCount=%u texBytes=%u lastTexPtr=0x%08X audioSeq=%u audioPhase=%u flips=%u "
-                 "emitOk=%u emitFail=%u otrHit=%u otrMiss=%u rmLookup=%u drawHwm=%u frames=%u gpuUs=%u cpuUs=%u "
-                 "waitUs=%u slotWaits=%u heapArena=%u heapUsed=%u\n",
-                 gTexCount, gTexBytes, gLastTexPtr, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail,
+            Emit("WDOG: mem texCount=%u texBytes=%u texLiveCount=%u texLiveBytes=%u lastTexPtr=0x%08X "
+                 "texCache=%u freeTexIds=%u otrCache=%u rawPath=%u rawHash=%u resourceCache=%u shaderPool=%u "
+                 "audioSeq=%u audioPhase=%u flips=%u emitOk=%u emitFail=%u otrHit=%u otrMiss=%u rmLookup=%u "
+                 "drawHwm=%u frames=%u gpuUs=%u cpuUs=%u waitUs=%u slotWaits=%u heapArena=%u heapUsed=%u\n",
+                 gTexCount, gTexBytes, gTexLiveCount, gTexLiveBytes, gLastTexPtr, gTextureCacheSize,
+                 gFreeTextureIdsSize, gOtrTextureCacheSize, gRawPointerByPathSize, gRawPointerByHashSize,
+                 gResourceCacheSize, gShaderProgramPoolSize, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail,
                  gOtrCacheHits, gOtrCacheMisses, gOtrResourceManagerLookups, gDrawBufferHighWaterBytes, timingFrames,
                  gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits, (uint32_t)heapInfo.arena,
                  (uint32_t)heapInfo.uordblks);

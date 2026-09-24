@@ -329,6 +329,7 @@ static uint32_t gfx_wiiu_proc_callback_released(void* context) {
 
 static void gfx_wiiu_init(const char* game_name, const char* gfx_api_name, bool start_in_fullscreen, uint32_t width,
                           uint32_t height) {
+    WDOG_HEAPMARK("before gfx_wiiu_init");
     SPDLOG_INFO("gfx_wiiu_init: WHBProcInit ...");
     WHBProcInit();
     SPDLOG_INFO("gfx_wiiu_init: WHBProcInit ok");
@@ -493,6 +494,7 @@ static void gfx_wiiu_init(const char* game_name, const char* gfx_api_name, bool 
     SPDLOG_INFO("gfx_wiiu_init: Gui::Init ok");
 
     SPDLOG_INFO("gfx_wiiu_init: complete ok");
+    WDOG_HEAPMARK("after gfx_wiiu_init");
 }
 
 static void gfx_wiiu_shutdown(void) {

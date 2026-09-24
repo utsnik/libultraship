@@ -408,11 +408,13 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
 
 void Interpreter::TextureCacheClear() {
     mOtrTextureCache.clear();
+    WDOG_OTR_TEXTURE_CACHE_SIZE(mOtrTextureCache.size());
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
     }
     mTextureCache.map.clear();
     mTextureCache.lru.clear();
+    WDOG_TEXTURE_CACHE_SIZES(mTextureCache.map.size(), mTextureCache.free_texture_ids.size());
 }
 
 const char* Interpreter::ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::Texture>& texture) {
@@ -422,6 +424,7 @@ const char* Interpreter::ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::
     if (mOtrTextureCacheResourceManager != resourceManager.get() ||
         mOtrTextureCacheGeneration != currentResourceCacheGeneration) {
         mOtrTextureCache.clear();
+        WDOG_OTR_TEXTURE_CACHE_SIZE(mOtrTextureCache.size());
         mOtrTextureCacheResourceManager = resourceManager.get();
         mOtrTextureCacheGeneration = currentResourceCacheGeneration;
     }
@@ -451,6 +454,7 @@ const char* Interpreter::ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::
         cacheEntry->second.fileName = fileName;
         cacheEntry->second.texture = texture;
     }
+    WDOG_OTR_TEXTURE_CACHE_SIZE(mOtrTextureCache.size());
     return cacheEntry->second.fileName.c_str();
 }
 
@@ -490,6 +494,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     mRapi->SelectTexture(i, texture_id);
     mRapi->SetSamplerParameters(i, false, 0, 0);
     *n = node;
+    WDOG_TEXTURE_CACHE_SIZES(mTextureCache.map.size(), mTextureCache.free_texture_ids.size());
     return false;
 }
 
@@ -519,6 +524,35 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
             break;
         }
     }
+    WDOG_TEXTURE_CACHE_SIZES(mTextureCache.map.size(), mTextureCache.free_texture_ids.size());
+}
+
+bool Interpreter::EnsureTexUploadBuffer(size_t requiredBytes) {
+    constexpr size_t kInitialSize = 4 * 1024 * 1024;
+    if (mTexUploadBuffer != nullptr && requiredBytes <= mTexUploadBufferSize) {
+        return true;
+    }
+
+    size_t newSize = mTexUploadBufferSize == 0 ? kInitialSize : mTexUploadBufferSize;
+    while (newSize < requiredBytes) {
+        if (newSize > SIZE_MAX / 2) {
+            newSize = requiredBytes;
+            break;
+        }
+        newSize *= 2;
+    }
+
+    free(mTexUploadBuffer);
+    mTexUploadBuffer = nullptr;
+    mTexUploadBufferSize = 0;
+    mTexUploadBuffer = static_cast<uint8_t*>(malloc(newSize));
+    if (mTexUploadBuffer == nullptr) {
+        SPDLOG_ERROR("Interpreter: failed to allocate texture upload buffer ({} bytes)", newSize);
+        return false;
+    }
+
+    mTexUploadBufferSize = newSize;
+    return true;
 }
 
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
@@ -544,6 +578,10 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width * 2;
+    }
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
     }
 
     uint32_t i = 0;
@@ -610,6 +648,10 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     uint32_t lineSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
     SUPPORT_CHECK(fullImageLineSizeBytes == lineSizeBytes);
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(sizeBytes) * 2 * 4)) {
+        return;
+    }
+
     for (uint32_t i = 0; i < sizeBytes * 2; i++) {
         uint8_t byte = addr[i / 2];
         uint8_t part = (byte >> (4 - (i % 2) * 4)) & 0xf;
@@ -647,6 +689,10 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t lineSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
     SUPPORT_CHECK(fullImageLineSizeBytes == lineSizeBytes);
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(sizeBytes) * 4)) {
+        return;
+    }
 
     for (uint32_t i = 0; i < sizeBytes; i++) {
         uint8_t intensity = addr[i] >> 4;
@@ -689,6 +735,10 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (full_image_line_size_bytes == size_bytes) {
         full_image_line_size_bytes = width * 2;
+    }
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
     }
 
     uint32_t i = 0;
@@ -739,6 +789,10 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
         fullImageLineSizeBytes = width / 2;
     }
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
+    }
+
     uint32_t i = 0;
 
     for (uint32_t y = 0; y < height; y++) {
@@ -781,6 +835,10 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t line_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(sizeBytes) * 4)) {
+        return;
+    }
+
     for (uint32_t i = 0; i < sizeBytes; i++) {
         uint8_t intensity = addr[i];
         mTexUploadBuffer[4 * i + 0] = intensity;
@@ -821,6 +879,10 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
         palette = mRdp->palettes[palIdx / 8] + (palIdx % 8) * 16 * 2;
 
     SUPPORT_CHECK(fullImageLineSizeBytes == lineSizeBytes);
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(sizeBytes) * 2 * 4)) {
+        return;
+    }
 
     for (uint32_t i = 0; i < sizeBytes * 2; i++) {
         uint8_t byte = addr[i / 2];
@@ -863,6 +925,10 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     uint32_t fullImageLineSizeBytes =
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t lineSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
+
+    if (!EnsureTexUploadBuffer((static_cast<size_t>(sizeBytes) + lineSizeBytes) * 4)) {
+        return;
+    }
 
     for (uint32_t i = 0, j = 0; i < sizeBytes; j += fullImageLineSizeBytes - lineSizeBytes) {
         for (uint32_t k = 0; k < lineSizeBytes; i++, k++, j++) {
@@ -959,6 +1025,12 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     uint32_t fullImageLineSizeBytes =
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t line_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
+
+    const size_t requiredBytes = std::max(static_cast<size_t>(numLoadedBytes) + line_size_bytes,
+                                          static_cast<size_t>(resultNewLineSize) * resultNewHeight);
+    if (!EnsureTexUploadBuffer(requiredBytes)) {
+        return;
+    }
 
     // Get the resource's true image size
     uint32_t resourceImageSizeBytes = resource->ImageDataSize;
@@ -1121,6 +1193,10 @@ void Interpreter::ImportTextureMask(int i, int tile) {
         case G_IM_SIZ_32b:
             width /= 4;
             break;
+    }
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
     }
 
     for (uint32_t texIndex = 0; texIndex < width * height; texIndex++) {
@@ -2895,6 +2971,7 @@ static void RawPointerCacheValidate(Ship::ResourceManager* resourceManager,
         byPath.clear();
         byHash.clear();
         generation = current;
+        WDOG_RAW_POINTER_CACHE_SIZES(byPath.size(), byHash.size());
     }
 }
 
@@ -2910,6 +2987,7 @@ static void* CachedRawPointer(const char* path) {
     }
     void* pointer = resourceManager->GetResourceRawPointer(path);
     sRawPointerByPath.emplace(path, pointer);
+    WDOG_RAW_POINTER_CACHE_SIZES(sRawPointerByPath.size(), sRawPointerByHash.size());
     return pointer;
 }
 
@@ -2922,6 +3000,7 @@ static void* CachedRawPointer(uint64_t hash) {
     }
     void* pointer = resourceManager->GetResourceRawPointer(hash);
     sRawPointerByHash.emplace(hash, pointer);
+    WDOG_RAW_POINTER_CACHE_SIZES(sRawPointerByPath.size(), sRawPointerByHash.size());
     return pointer;
 }
 
@@ -4339,6 +4418,7 @@ void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX
 
 void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi, const char* game_name,
                        bool start_in_fullscreen, uint32_t width, uint32_t height, uint32_t posX, uint32_t posY) {
+    WDOG_HEAPMARK("before Interpreter::Init");
     mWapi = wapi;
     mRapi = rapi;
     mWapi->Init(game_name, rapi->GetName(), start_in_fullscreen, width, height, posX, posY);
@@ -4361,18 +4441,15 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
         mSegmentPointers[i] = 0;
     }
 
-    if (mTexUploadBuffer == nullptr) {
-        // We cap texture max to 8k, because why would you need more?
-        int max_tex_size = std::min(8192, mRapi->GetMaxTextureSize());
-        mTexUploadBuffer = (uint8_t*)malloc(max_tex_size * max_tex_size * 4);
-    }
-
     ucode_handler_index = UcodeHandlers::ucode_f3dex2;
+    WDOG_HEAPMARK("after Interpreter::Init");
 }
 
 void Interpreter::Destroy() {
     // TODO: should also destroy rapi, and any other resources acquired in fast3d
     free(mTexUploadBuffer);
+    mTexUploadBuffer = nullptr;
+    mTexUploadBufferSize = 0;
     mWapi->Destroy();
 
     // Texture cache and loaded textures store references to Resources which need to be unreferenced.

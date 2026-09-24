@@ -303,6 +303,7 @@ void    ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
 bool ImGui_ImplGX2_CreateFontsTexture()
 {
     WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_IMGUI_FONT_TEX, "enter");
+    WDOG_HEAPMARK("before ImGui font texture creation");
     ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
 
@@ -397,6 +398,10 @@ bool ImGui_ImplGX2_CreateFontsTexture()
 
     // Store our identifier
     io.Fonts->SetTexID((ImTextureID) bd->FontTexture);
+    if (io.Fonts->TexPixelsRGBA32 != nullptr || io.Fonts->TexPixelsAlpha8 != nullptr) {
+        io.Fonts->ClearTexData();
+    }
+    WDOG_HEAPMARK("after ImGui font texture creation");
 
     return true;
 }

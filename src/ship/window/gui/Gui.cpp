@@ -15,6 +15,7 @@
 #include <stb_image.h>
 #include "ship/window/gui/Fonts.h"
 #include "ship/window/gui/resource/GuiTextureFactory.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 #include "libultraship/window/gui/GfxDebuggerWindow.h"
 #include "fast/Fast3dWindow.h"
@@ -98,6 +99,7 @@ Gui::~Gui() {
 
 void Gui::Init(GuiWindowInitData windowImpl) {
     mImpl = windowImpl;
+    WDOG_HEAPMARK("before ImGui init");
     ImGuiContext* ctx = ImGui::CreateContext();
     ImGui::SetCurrentContext(ctx);
     mImGuiIo = &ImGui::GetIO();
@@ -155,6 +157,7 @@ void Gui::Init(GuiWindowInitData windowImpl) {
     ImGuiBackendInit();
 
     mInterpreter = dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow())->GetInterpreterWeak();
+    WDOG_HEAPMARK("after ImGui init");
 }
 
 void Gui::ImGuiWMInit() {
@@ -229,7 +232,9 @@ void Gui::ImGuiBackendInit() {
 #ifdef ENABLE_GX2
         case WindowBackend::FAST3D_WIIU_GX2:
             SPDLOG_INFO("Gui::ImGuiBackendInit: ImGui_ImplGX2_Init ...");
+            WDOG_HEAPMARK("before ImGui_ImplGX2_Init");
             ImGui_ImplGX2_Init();
+            WDOG_HEAPMARK("after ImGui_ImplGX2_Init");
             SPDLOG_INFO("Gui::ImGuiBackendInit: ImGui_ImplGX2_Init ok");
             break;
 #endif
@@ -640,10 +645,18 @@ void Gui::HandleMouseCapture() {
 }
 
 void Gui::StartFrame() {
+    static bool firstFrame = true;
+    if (firstFrame) {
+        WDOG_HEAPMARK("before first frame");
+    }
     HandleMouseCapture();
     ImGuiBackendNewFrame();
     ImGuiWMNewFrame();
     ImGui::NewFrame();
+    if (firstFrame) {
+        WDOG_HEAPMARK("after first frame");
+        firstFrame = false;
+    }
 }
 
 void Gui::EndFrame() {
