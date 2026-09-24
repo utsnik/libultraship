@@ -34,6 +34,7 @@
 #include <nsysnet/_socket.h>
 #include <cstdlib>
 #include <errno.h>
+#include <new>
 #include <stdint.h>
 
 namespace Ship {
@@ -42,6 +43,19 @@ namespace Watchdog {
 void Emit(const char* fmt, ...);
 }
 }
+}
+
+extern "C" {
+void* __real_malloc(size_t);
+void __real_free(void*);
+void* __real_calloc(size_t, size_t);
+void* __real_realloc(void*, size_t);
+void* __real_memalign(size_t, size_t);
+void* __real_aligned_alloc(size_t, size_t);
+void* __real__Znwm(size_t) __attribute__((weak));
+void* __real__Znam(size_t) __attribute__((weak));
+void* __real__Znwj(size_t) __attribute__((weak));
+void* __real__Znaj(size_t) __attribute__((weak));
 }
 
 // This tracker is intentionally independent of the watchdog's C++/socket path.  The wrapped
@@ -58,6 +72,8 @@ static const uint32_t kLeakTableSize = 262144;
 static const uint32_t kLeakMaxProbe = 64;
 static const uint32_t kLeakSiteTableSize = 16384;
 static const uint32_t kLeakTopCount = 12;
+static const uint32_t kLeakChurnTopCount = 10;
+static const uint64_t kLeakBigThreshold = 64u * 1024u;
 static const uint32_t kLeakEmpty = 0;
 static const uint32_t kLeakUsed = 1;
 static const uint32_t kLeakDeleted = 2;
@@ -74,7 +90,13 @@ struct LeakSite {
     uint32_t key[3];
     uint64_t liveBytes;
     uint32_t liveCount;
+    uint64_t bigLiveBytes;
+    uint32_t bigLiveCount;
     uint64_t previousBytes;
+    uint64_t churnBytes;
+    uint32_t churnCount;
+    uint64_t churnMin;
+    uint64_t churnMax;
     uint32_t used;
 };
 
@@ -83,6 +105,14 @@ struct LeakTop {
     uint64_t bytes;
     uint32_t count;
     uint64_t growth;
+};
+
+struct LeakChurnTop {
+    uint32_t key[3];
+    uint64_t bytes;
+    uint32_t count;
+    uint64_t min;
+    uint64_t max;
 };
 
 static LeakEntry sLeakTable[kLeakTableSize];
@@ -244,7 +274,13 @@ static int32_t LeakFindSiteLocked(const uint32_t key[3], bool create) {
             site.key[2] = key[2];
             site.liveBytes = 0;
             site.liveCount = 0;
+            site.bigLiveBytes = 0;
+            site.bigLiveCount = 0;
             site.previousBytes = 0;
+            site.churnBytes = 0;
+            site.churnCount = 0;
+            site.churnMin = 0;
+            site.churnMax = 0;
             site.used = 1;
             return (int32_t)((start + probe) & (kLeakSiteTableSize - 1));
         }
@@ -294,6 +330,23 @@ static void LeakSiteAddLocked(int32_t siteIndex, uint64_t bytes) {
     LeakSite& site = sLeakSites[siteIndex];
     site.liveBytes += bytes;
     ++site.liveCount;
+    if (bytes >= kLeakBigThreshold) {
+        site.bigLiveBytes += bytes;
+        ++site.bigLiveCount;
+        site.churnBytes += bytes;
+        ++site.churnCount;
+        if (site.churnCount == 1) {
+            site.churnMin = bytes;
+            site.churnMax = bytes;
+        } else {
+            if (bytes < site.churnMin) {
+                site.churnMin = bytes;
+            }
+            if (bytes > site.churnMax) {
+                site.churnMax = bytes;
+            }
+        }
+    }
 }
 
 static void LeakSiteRemoveLocked(int32_t siteIndex, uint64_t bytes) {
@@ -304,6 +357,12 @@ static void LeakSiteRemoveLocked(int32_t siteIndex, uint64_t bytes) {
     site.liveBytes = site.liveBytes >= bytes ? site.liveBytes - bytes : 0;
     if (site.liveCount != 0) {
         --site.liveCount;
+    }
+    if (bytes >= kLeakBigThreshold) {
+        site.bigLiveBytes = site.bigLiveBytes >= bytes ? site.bigLiveBytes - bytes : 0;
+        if (site.bigLiveCount != 0) {
+            --site.bigLiveCount;
+        }
     }
 }
 
@@ -383,9 +442,13 @@ static void LeakReplace(uintptr_t oldAddress, uintptr_t newAddress, uint64_t byt
 
 static void LeakEmitReport() {
     LeakTop top[kLeakTopCount] = {};
+    LeakChurnTop churnTop[kLeakChurnTopCount] = {};
     uint32_t topCount = 0;
+    uint32_t churnTopCount = 0;
     uint32_t tracked = 0;
     uint32_t dropped = 0;
+    uint64_t bigLiveBytes = 0;
+    uint32_t bigLiveCount = 0;
 
     if (!LeakTryLock()) {
         return;
@@ -420,7 +483,39 @@ static void LeakEmitReport() {
             }
         }
         if (site.used) {
+            bigLiveBytes += site.bigLiveBytes;
+            bigLiveCount += site.bigLiveCount;
+
+            if (site.churnBytes != 0) {
+                uint32_t insertAt = churnTopCount;
+                for (uint32_t topIndex = 0; topIndex < churnTopCount; ++topIndex) {
+                    if (site.churnBytes > churnTop[topIndex].bytes) {
+                        insertAt = topIndex;
+                        break;
+                    }
+                }
+                if (insertAt < kLeakChurnTopCount) {
+                    if (churnTopCount < kLeakChurnTopCount) {
+                        ++churnTopCount;
+                    }
+                    for (uint32_t topIndex = churnTopCount - 1; topIndex > insertAt; --topIndex) {
+                        churnTop[topIndex] = churnTop[topIndex - 1];
+                    }
+                    churnTop[insertAt].key[0] = site.key[0];
+                    churnTop[insertAt].key[1] = site.key[1];
+                    churnTop[insertAt].key[2] = site.key[2];
+                    churnTop[insertAt].bytes = site.churnBytes;
+                    churnTop[insertAt].count = site.churnCount;
+                    churnTop[insertAt].min = site.churnMin;
+                    churnTop[insertAt].max = site.churnMax;
+                }
+            }
+
             site.previousBytes = site.liveBytes;
+            site.churnBytes = 0;
+            site.churnCount = 0;
+            site.churnMin = 0;
+            site.churnMax = 0;
         }
     }
     LeakUnlock();
@@ -431,32 +526,76 @@ static void LeakEmitReport() {
             top[index].key[1], top[index].key[2], (unsigned long long)top[index].bytes, top[index].count,
             (unsigned long long)top[index].growth);
     }
+    Ship::WiiU::Watchdog::Emit("LEAKBIG: live=%llu count=%u\n", (unsigned long long)bigLiveBytes, bigLiveCount);
+    for (uint32_t index = 0; index < churnTopCount; ++index) {
+        Ship::WiiU::Watchdog::Emit(
+            "CHURN: key=0x%08X,0x%08X,0x%08X bytes=%llu count=%u min=%llu max=%llu\n", churnTop[index].key[0],
+            churnTop[index].key[1], churnTop[index].key[2], (unsigned long long)churnTop[index].bytes,
+            churnTop[index].count, (unsigned long long)churnTop[index].min, (unsigned long long)churnTop[index].max);
+    }
     Ship::WiiU::Watchdog::Emit("LEAK: tracked=%u dropped=%u\n", tracked, dropped);
+}
+
+static uint64_t LeakProbeLargest() {
+    static const size_t kProbeMax = 64u * 1024u * 1024u;
+    static const size_t kProbeMin = 4u * 1024u;
+    uint64_t largest = 0;
+
+    for (size_t probe = kProbeMax;; probe >>= 1) {
+        void* result = __real_malloc(probe);
+        if (result != nullptr) {
+            if (largest == 0) {
+                largest = probe;
+            }
+            __real_free(result);
+        }
+        if (probe == kProbeMin) {
+            break;
+        }
+    }
+    return largest;
+}
+
+static void LeakEmitAllocFailure(const char* function, uint64_t bytes, uint64_t alignment,
+                                 const uint32_t key[3]) {
+    const struct mallinfo heapInfo = mallinfo();
+    const uint64_t largest = LeakProbeLargest();
+    Ship::WiiU::Watchdog::Emit(
+        "ALLOCFAIL: fn=%s size=%llu align=%llu key=0x%08X,0x%08X,0x%08X arena=%u used=%u largest=%llu\n", function,
+        (unsigned long long)bytes, (unsigned long long)alignment, key[0], key[1], key[2], (uint32_t)heapInfo.arena,
+        (uint32_t)heapInfo.uordblks, (unsigned long long)largest);
+}
+
+static void LeakEmitAllocFailureIfUnreentrant(LeakThreadState* state, const char* function, uint64_t bytes,
+                                              uint64_t alignment, const uint32_t key[3]) {
+    const bool acquired = __sync_lock_test_and_set(&state->reentrant, 1) == 0;
+    LeakEmitAllocFailure(function, bytes, alignment, key);
+    if (acquired) {
+        __sync_lock_release(&state->reentrant);
+    }
 }
 
 } // namespace
 
 extern "C" {
-void* __real_malloc(size_t);
-void __real_free(void*);
-void* __real_calloc(size_t, size_t);
-void* __real_realloc(void*, size_t);
-void* __real_memalign(size_t, size_t);
-void* __real_aligned_alloc(size_t, size_t);
-void* __real__Znwm(size_t) __attribute__((weak));
-void* __real__Znam(size_t) __attribute__((weak));
-void* __real__Znwj(size_t) __attribute__((weak));
-void* __real__Znaj(size_t) __attribute__((weak));
-
 void* __wrap_malloc(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        return __real_malloc(size);
+        void* result = __real_malloc(size);
+        if (result == nullptr) {
+            const uint32_t key[3] = { 0, 0, 0 };
+            LeakEmitAllocFailure("malloc", size, 0, key);
+        }
+        return result;
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
     void* result = __real_malloc(size);
-    LeakRecord((uintptr_t)result, size, key);
+    if (result == nullptr) {
+        LeakEmitAllocFailure("malloc", size, 0, key);
+    } else {
+        LeakRecord((uintptr_t)result, size, key);
+    }
     __sync_lock_release(&state->reentrant);
     return result;
 }
@@ -475,12 +614,22 @@ void __wrap_free(void* pointer) {
 void* __wrap_calloc(size_t count, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        return __real_calloc(count, size);
+        void* result = __real_calloc(count, size);
+        if (result == nullptr) {
+            const uint32_t key[3] = { 0, 0, 0 };
+            LeakEmitAllocFailure("calloc", (uint64_t)count * (uint64_t)size, 0, key);
+        }
+        return result;
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
     void* result = __real_calloc(count, size);
-    LeakRecord((uintptr_t)result, (uint64_t)count * (uint64_t)size, key);
+    const uint64_t bytes = (uint64_t)count * (uint64_t)size;
+    if (result == nullptr) {
+        LeakEmitAllocFailure("calloc", bytes, 0, key);
+    } else {
+        LeakRecord((uintptr_t)result, bytes, key);
+    }
     __sync_lock_release(&state->reentrant);
     return result;
 }
@@ -488,13 +637,20 @@ void* __wrap_calloc(size_t count, size_t size) {
 void* __wrap_realloc(void* pointer, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        return __real_realloc(pointer, size);
+        void* result = __real_realloc(pointer, size);
+        if (result == nullptr && size != 0) {
+            const uint32_t key[3] = { 0, 0, 0 };
+            LeakEmitAllocFailure("realloc", size, 0, key);
+        }
+        return result;
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
     void* result = __real_realloc(pointer, size);
     if (result != nullptr || size == 0) {
         LeakReplace((uintptr_t)pointer, (uintptr_t)result, size, key, true);
+    } else {
+        LeakEmitAllocFailure("realloc", size, 0, key);
     }
     __sync_lock_release(&state->reentrant);
     return result;
@@ -503,12 +659,21 @@ void* __wrap_realloc(void* pointer, size_t size) {
 void* __wrap_memalign(size_t alignment, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        return __real_memalign(alignment, size);
+        void* result = __real_memalign(alignment, size);
+        if (result == nullptr) {
+            const uint32_t key[3] = { 0, 0, 0 };
+            LeakEmitAllocFailure("memalign", size, alignment, key);
+        }
+        return result;
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
     void* result = __real_memalign(alignment, size);
-    LeakRecord((uintptr_t)result, size, key);
+    if (result == nullptr) {
+        LeakEmitAllocFailure("memalign", size, alignment, key);
+    } else {
+        LeakRecord((uintptr_t)result, size, key);
+    }
     __sync_lock_release(&state->reentrant);
     return result;
 }
@@ -531,13 +696,20 @@ static int LeakPosixMemalign(void** pointer, size_t alignment, size_t size) {
 int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        return LeakPosixMemalign(pointer, alignment, size);
+        const int result = LeakPosixMemalign(pointer, alignment, size);
+        if (result != 0) {
+            const uint32_t key[3] = { 0, 0, 0 };
+            LeakEmitAllocFailure("posix_memalign", size, alignment, key);
+        }
+        return result;
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
     const int result = LeakPosixMemalign(pointer, alignment, size);
     if (result == 0 && pointer != nullptr) {
         LeakRecord((uintptr_t)*pointer, size, key);
+    } else if (result != 0) {
+        LeakEmitAllocFailure("posix_memalign", size, alignment, key);
     }
     __sync_lock_release(&state->reentrant);
     return result;
@@ -546,57 +718,122 @@ int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
 void* __wrap_aligned_alloc(size_t alignment, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        return __real_aligned_alloc(alignment, size);
+        void* result = __real_aligned_alloc(alignment, size);
+        if (result == nullptr) {
+            const uint32_t key[3] = { 0, 0, 0 };
+            LeakEmitAllocFailure("aligned_alloc", size, alignment, key);
+        }
+        return result;
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
     void* result = __real_aligned_alloc(alignment, size);
-    LeakRecord((uintptr_t)result, size, key);
+    if (result == nullptr) {
+        LeakEmitAllocFailure("aligned_alloc", size, alignment, key);
+    } else {
+        LeakRecord((uintptr_t)result, size, key);
+    }
     __sync_lock_release(&state->reentrant);
     return result;
 }
 
 void* __wrap__Znwm(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
+    uint32_t key[3];
+    LeakCaptureKey(key, false);
     if (__real__Znwm == nullptr) {
-        return nullptr;
+        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
+        throw std::bad_alloc();
     }
     ++state->newDepth;
-    void* result = __real__Znwm(size);
+    void* result;
+    try {
+        result = __real__Znwm(size);
+    } catch (const std::bad_alloc&) {
+        --state->newDepth;
+        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
+        throw;
+    }
     --state->newDepth;
+    if (result == nullptr) {
+        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
+        throw std::bad_alloc();
+    }
     return result;
 }
 
 void* __wrap__Znam(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
+    uint32_t key[3];
+    LeakCaptureKey(key, false);
     if (__real__Znam == nullptr) {
-        return nullptr;
+        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
+        throw std::bad_alloc();
     }
     ++state->newDepth;
-    void* result = __real__Znam(size);
+    void* result;
+    try {
+        result = __real__Znam(size);
+    } catch (const std::bad_alloc&) {
+        --state->newDepth;
+        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
+        throw;
+    }
     --state->newDepth;
+    if (result == nullptr) {
+        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
+        throw std::bad_alloc();
+    }
     return result;
 }
 
 void* __wrap__Znwj(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
+    uint32_t key[3];
+    LeakCaptureKey(key, false);
     if (__real__Znwj == nullptr) {
-        return nullptr;
+        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
+        throw std::bad_alloc();
     }
     ++state->newDepth;
-    void* result = __real__Znwj(size);
+    void* result;
+    try {
+        result = __real__Znwj(size);
+    } catch (const std::bad_alloc&) {
+        --state->newDepth;
+        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
+        throw;
+    }
     --state->newDepth;
+    if (result == nullptr) {
+        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
+        throw std::bad_alloc();
+    }
     return result;
 }
 
 void* __wrap__Znaj(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
+    uint32_t key[3];
+    LeakCaptureKey(key, false);
     if (__real__Znaj == nullptr) {
-        return nullptr;
+        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
+        throw std::bad_alloc();
     }
     ++state->newDepth;
-    void* result = __real__Znaj(size);
+    void* result;
+    try {
+        result = __real__Znaj(size);
+    } catch (const std::bad_alloc&) {
+        --state->newDepth;
+        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
+        throw;
+    }
     --state->newDepth;
+    if (result == nullptr) {
+        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
+        throw std::bad_alloc();
+    }
     return result;
 }
 }
