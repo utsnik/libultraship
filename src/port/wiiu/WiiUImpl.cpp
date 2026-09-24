@@ -72,6 +72,11 @@ static const uint32_t kLeakTableSize = 262144;
 // entry that was inserted is always found.
 static const uint32_t kLeakMaxProbe = 64;
 static const uint32_t kLeakSiteTableSize = 16384;
+// The allocator wrappers always stay (they route large blocks to their own heap); this switches
+// only the per-call-site tracking. On, boot takes ~40 s and HOME can hang the console.
+#ifndef WIIU_LEAK_TRACKER
+#define WIIU_LEAK_TRACKER 0
+#endif
 static const uint32_t kLeakTopCount = 12;
 static const uint32_t kLeakChurnTopCount = 10;
 static const uint64_t kLeakBigThreshold = 64u * 1024u;
@@ -203,6 +208,9 @@ static void LeakCaptureKey(uint32_t key[3], bool skipOperatorNew) {
     key[0] = 0;
     key[1] = 0;
     key[2] = 0;
+    if (!WIIU_LEAK_TRACKER) {
+        return;
+    }
 
     uint32_t* frame;
     __asm__ volatile("mr %0, 1" : "=r"(frame));
@@ -412,6 +420,9 @@ static void LeakRemoveLocked(uintptr_t address) {
 // Called with the caller's reentrancy flag held, so the real allocator is not tracked. Allocates
 // before LeakLock is taken, so the tracker lock is never held across newlib's malloc lock.
 static bool LeakTablesReady() {
+    if (!WIIU_LEAK_TRACKER) {
+        return false;
+    }
     if (sLeakTablesState == 2) {
         return true;
     }
@@ -474,6 +485,9 @@ static void LeakReplace(uintptr_t oldAddress, uintptr_t newAddress, uint64_t byt
 }
 
 static void LeakEmitReport() {
+    if (!WIIU_LEAK_TRACKER) {
+        return;
+    }
     if (sLeakTablesState != 2) {
         ::Ship::WiiU::Watchdog::Emit("LEAK: tables not ready state=%u\n", sLeakTablesState);
         return;
