@@ -221,7 +221,22 @@ ResourceManager::LoadResourceAsync(const std::string& filePath, bool loadExact, 
 
 std::shared_ptr<IResource> ResourceManager::LoadResource(const ResourceIdentifier& identifier, bool loadExact,
                                                          std::shared_ptr<ResourceInitData> initData) {
+#ifdef __WIIU__
+    // Synchronous path without a promise or the thread pool. Going through LoadResourceAsync made
+    // a std::promise per call - hundreds per second, mostly cache hits - and on wut every
+    // std::mutex that is locked lazily allocates an OS mutex that ~mutex never frees: that was the
+    // whole ~3.5 MB/min leak (soh923m5 tracker). It also cost a thread handoff and condvar wait per
+    // load, which the profiler showed as ~10% of the game thread.
+    if (OtrSignatureCheck(identifier.Path.c_str())) {
+        return LoadResource({ identifier.Path.substr(7), identifier.Owner, identifier.Parent }, loadExact, initData);
+    }
+    auto resource = GetCachedResource(identifier, loadExact);
+    if (resource == nullptr) {
+        resource = LoadResourceProcess(identifier, loadExact, initData);
+    }
+#else
     auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
+#endif
     if (resource == nullptr) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
     }

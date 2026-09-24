@@ -593,14 +593,19 @@ static uint64_t LeakProbeLargest() {
     return largest;
 }
 
+static uint32_t BigHeapFreeBytes();
+static uint32_t BigHeapLargestFree();
+
 static void LeakEmitAllocFailure(const char* function, uint64_t bytes, uint64_t alignment,
                                  const uint32_t key[3]) {
     const struct mallinfo heapInfo = mallinfo();
     const uint64_t largest = LeakProbeLargest();
     Ship::WiiU::Watchdog::Emit(
-        "ALLOCFAIL: fn=%s size=%llu align=%llu key=0x%08X,0x%08X,0x%08X arena=%u used=%u largest=%llu\n", function,
-        (unsigned long long)bytes, (unsigned long long)alignment, key[0], key[1], key[2], (uint32_t)heapInfo.arena,
-        (uint32_t)heapInfo.uordblks, (unsigned long long)largest);
+        "ALLOCFAIL: fn=%s size=%llu align=%llu key=0x%08X,0x%08X,0x%08X arena=%u used=%u largest=%llu bigFree=%u "
+        "bigLargest=%u\n",
+        function, (unsigned long long)bytes, (unsigned long long)alignment, key[0], key[1], key[2],
+        (uint32_t)heapInfo.arena, (uint32_t)heapInfo.uordblks, (unsigned long long)largest, BigHeapFreeBytes(),
+        BigHeapLargestFree());
 }
 
 static void LeakEmitAllocFailureIfUnreentrant(LeakThreadState* state, const char* function, uint64_t bytes,
@@ -612,13 +617,131 @@ static void LeakEmitAllocFailureIfUnreentrant(LeakThreadState* state, const char
     }
 }
 
+// ---- Large-block heap -------------------------------------------------------------------
+// With the texture pack, newlib's arena hit its 943 MB ceiling while only ~555 MB was in use
+// (soh923l): every pack texture passes through four 64 KB-1 MB blocks (O2R read buffer, init-data
+// copy, decoded image, GX2 surface), transient and long-lived interleaved with small long-lived
+// objects, and the holes left behind never fit the next texture. Blocks of 64 KB and more now live
+// in their own Cafe OS expanded heap, carved from the arena on the first allocation while it is
+// still empty, so small objects can never split the space between large ones. Either side falls
+// back to the other when it runs out; frees are routed by address.
+static const uint32_t kBigBlockMin = 64u * 1024u;
+static const uint32_t kBigHeapSize = 560u * 1024u * 1024u;
+static MEMHeapHandle sBigHeap = nullptr;
+static uintptr_t sBigHeapBase = 0;
+static uintptr_t sBigHeapEnd = 0;
+static volatile uint32_t sBigHeapState = 0; // 0 = not tried, 1 = initialising, 2 = ready, 3 = failed
+
+static void BigHeapInit() {
+    if (sBigHeapState >= 2 || !__sync_bool_compare_and_swap(&sBigHeapState, 0, 1)) {
+        return;
+    }
+    void* base = __real_memalign(64, kBigHeapSize);
+    if (base != nullptr) {
+        MEMHeapHandle heap = MEMCreateExpHeapEx(base, kBigHeapSize, MEM_HEAP_FLAG_USE_LOCK);
+        if (heap != nullptr) {
+            sBigHeap = heap;
+            sBigHeapBase = (uintptr_t)base;
+            sBigHeapEnd = (uintptr_t)base + kBigHeapSize;
+            __sync_synchronize();
+            sBigHeapState = 2;
+            return;
+        }
+        __real_free(base);
+    }
+    sBigHeapState = 3;
+}
+
+static inline bool BigHeapOwns(const void* pointer) {
+    const uintptr_t address = (uintptr_t)pointer;
+    return address >= sBigHeapBase && address < sBigHeapEnd;
+}
+
+static void* BigHeapAlloc(size_t size, size_t alignment) {
+    if (sBigHeapState != 2 || size == 0 || size > 0x7FFFFFFFu) {
+        return nullptr;
+    }
+    if (alignment < 16) {
+        alignment = 16;
+    }
+    return MEMAllocFromExpHeapEx(sBigHeap, (uint32_t)size, (int)alignment);
+}
+
+static void* BigRouteAlloc(size_t size, size_t alignment) {
+    BigHeapInit();
+    void* result = nullptr;
+    if (size >= kBigBlockMin) {
+        result = BigHeapAlloc(size, alignment);
+    }
+    if (result == nullptr) {
+        result = alignment <= 8 ? __real_malloc(size) : __real_memalign(alignment, size);
+    }
+    if (result == nullptr && size < kBigBlockMin) {
+        result = BigHeapAlloc(size, alignment);
+    }
+    return result;
+}
+
+static void BigRouteFree(void* pointer) {
+    if (pointer == nullptr) {
+        return;
+    }
+    if (BigHeapOwns(pointer)) {
+        MEMFreeToExpHeap(sBigHeap, pointer);
+    } else {
+        __real_free(pointer);
+    }
+}
+
+static void* BigRouteCalloc(size_t count, size_t size) {
+    if (size != 0 && count > (size_t)-1 / size) {
+        return nullptr;
+    }
+    const size_t bytes = count * size;
+    void* result = BigRouteAlloc(bytes, 0);
+    if (result != nullptr) {
+        memset(result, 0, bytes);
+    }
+    return result;
+}
+
+static void* BigRouteRealloc(void* pointer, size_t size) {
+    if (pointer == nullptr) {
+        return BigRouteAlloc(size, 0);
+    }
+    if (size == 0) {
+        BigRouteFree(pointer);
+        return nullptr;
+    }
+    const bool fromBig = BigHeapOwns(pointer);
+    if (!fromBig && size < kBigBlockMin) {
+        return __real_realloc(pointer, size);
+    }
+    const size_t oldSize = fromBig ? MEMGetSizeForMBlockExpHeap(pointer) : malloc_usable_size(pointer);
+    void* result = BigRouteAlloc(size, 0);
+    if (result == nullptr) {
+        return nullptr; // the old block stays valid, as realloc requires
+    }
+    memcpy(result, pointer, oldSize < size ? oldSize : size);
+    BigRouteFree(pointer);
+    return result;
+}
+
+static uint32_t BigHeapFreeBytes() {
+    return sBigHeapState == 2 ? MEMGetTotalFreeSizeForExpHeap(sBigHeap) : 0;
+}
+
+static uint32_t BigHeapLargestFree() {
+    return sBigHeapState == 2 ? MEMGetAllocatableSizeForExpHeapEx(sBigHeap, 16) : 0;
+}
+
 } // namespace
 
 extern "C" {
 void* __wrap_malloc(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        void* result = __real_malloc(size);
+        void* result = BigRouteAlloc(size, 0);
         if (result == nullptr) {
             const uint32_t key[3] = { 0, 0, 0 };
             LeakEmitAllocFailure("malloc", size, 0, key);
@@ -627,7 +750,7 @@ void* __wrap_malloc(size_t size) {
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
-    void* result = __real_malloc(size);
+    void* result = BigRouteAlloc(size, 0);
     if (result == nullptr) {
         LeakEmitAllocFailure("malloc", size, 0, key);
     } else {
@@ -640,20 +763,20 @@ void* __wrap_malloc(size_t size) {
 void __wrap_free(void* pointer) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        __real_free(pointer);
+        BigRouteFree(pointer);
         return;
     }
     // Forget first: once freed, another thread can be handed this address and record it,
     // and a late forget would then delete the new record.
     LeakForget((uintptr_t)pointer);
-    __real_free(pointer);
+    BigRouteFree(pointer);
     __sync_lock_release(&state->reentrant);
 }
 
 void* __wrap_calloc(size_t count, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        void* result = __real_calloc(count, size);
+        void* result = BigRouteCalloc(count, size);
         if (result == nullptr) {
             const uint32_t key[3] = { 0, 0, 0 };
             LeakEmitAllocFailure("calloc", (uint64_t)count * (uint64_t)size, 0, key);
@@ -662,7 +785,7 @@ void* __wrap_calloc(size_t count, size_t size) {
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
-    void* result = __real_calloc(count, size);
+    void* result = BigRouteCalloc(count, size);
     const uint64_t bytes = (uint64_t)count * (uint64_t)size;
     if (result == nullptr) {
         LeakEmitAllocFailure("calloc", bytes, 0, key);
@@ -676,7 +799,7 @@ void* __wrap_calloc(size_t count, size_t size) {
 void* __wrap_realloc(void* pointer, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        void* result = __real_realloc(pointer, size);
+        void* result = BigRouteRealloc(pointer, size);
         if (result == nullptr && size != 0) {
             const uint32_t key[3] = { 0, 0, 0 };
             LeakEmitAllocFailure("realloc", size, 0, key);
@@ -685,7 +808,7 @@ void* __wrap_realloc(void* pointer, size_t size) {
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
-    void* result = __real_realloc(pointer, size);
+    void* result = BigRouteRealloc(pointer, size);
     if (result != nullptr || size == 0) {
         LeakReplace((uintptr_t)pointer, (uintptr_t)result, size, key, true);
     } else {
@@ -698,7 +821,7 @@ void* __wrap_realloc(void* pointer, size_t size) {
 void* __wrap_memalign(size_t alignment, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        void* result = __real_memalign(alignment, size);
+        void* result = BigRouteAlloc(size, alignment);
         if (result == nullptr) {
             const uint32_t key[3] = { 0, 0, 0 };
             LeakEmitAllocFailure("memalign", size, alignment, key);
@@ -707,7 +830,7 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
-    void* result = __real_memalign(alignment, size);
+    void* result = BigRouteAlloc(size, alignment);
     if (result == nullptr) {
         LeakEmitAllocFailure("memalign", size, alignment, key);
     } else {
@@ -724,7 +847,7 @@ static int LeakPosixMemalign(void** pointer, size_t alignment, size_t size) {
     if (alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) {
         return EINVAL;
     }
-    void* result = __real_memalign(alignment, size);
+    void* result = BigRouteAlloc(size, alignment);
     if (result == nullptr) {
         return ENOMEM;
     }
@@ -757,7 +880,7 @@ int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
 void* __wrap_aligned_alloc(size_t alignment, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        void* result = __real_aligned_alloc(alignment, size);
+        void* result = BigRouteAlloc(size, alignment);
         if (result == nullptr) {
             const uint32_t key[3] = { 0, 0, 0 };
             LeakEmitAllocFailure("aligned_alloc", size, alignment, key);
@@ -766,7 +889,7 @@ void* __wrap_aligned_alloc(size_t alignment, size_t size) {
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
-    void* result = __real_aligned_alloc(alignment, size);
+    void* result = BigRouteAlloc(size, alignment);
     if (result == nullptr) {
         LeakEmitAllocFailure("aligned_alloc", size, alignment, key);
     } else {
@@ -1781,10 +1904,10 @@ static int Main(int, const char**) {
                  gDrawBufferHighWaterBytes, timingFrames, gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits,
                  (uint32_t)heapInfo.arena, (uint32_t)heapInfo.uordblks);
             Emit("WDOG: caches texCache=%u freeTexIds=%u otrCache=%u rawPath=%u rawHash=%u resourceCache=%u "
-                 "shaderPool=%u texLiveBytes=%u heapUsed=%u\n",
+                 "shaderPool=%u texLiveBytes=%u heapUsed=%u bigFree=%u bigLargest=%u\n",
                  gTextureCacheSize, gFreeTextureIdsSize, gOtrTextureCacheSize, gRawPointerByPathSize,
                  gRawPointerByHashSize, gResourceCacheSize, gShaderProgramPoolSize, gTexLiveBytes,
-                 (uint32_t)heapInfo.uordblks);
+                 (uint32_t)heapInfo.uordblks, BigHeapFreeBytes(), BigHeapLargestFree());
         }
 
         // The allocation table is sampled independently of the heap-pressure line.  At 500 ms
