@@ -141,7 +141,10 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     auto file = LoadFileProcess(identifier.Path);
     if (file == nullptr) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
-        mResourceCache[identifier] = ResourceLoadError::NotFound;
+        {
+            const std::lock_guard<std::mutex> lock(mMutex);
+            mResourceCache[identifier] = ResourceLoadError::NotFound;
+        }
         return nullptr;
     }
 
@@ -398,7 +401,9 @@ size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
     // We can only erase the resource if we have any resources for that owner.
     if (mResourceCache.contains(identifier)) {
         const std::lock_guard<std::mutex> lock(mMutex);
-        mResourceCache.erase(identifier);
+        if (mResourceCache.erase(identifier) != 0) {
+            mCacheGeneration.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     return ret;
@@ -441,7 +446,14 @@ bool ResourceManager::IsAltAssetsEnabled() {
 }
 
 void ResourceManager::SetAltAssetsEnabled(bool isEnabled) {
+    if (mAltAssetsEnabled != isEnabled) {
+        mCacheGeneration.fetch_add(1, std::memory_order_relaxed);
+    }
     mAltAssetsEnabled = isEnabled;
+}
+
+uint32_t ResourceManager::GetCacheGeneration() const {
+    return mCacheGeneration.load(std::memory_order_relaxed);
 }
 
 size_t ResourceManager::GetResourceSize(std::shared_ptr<IResource> resource) {

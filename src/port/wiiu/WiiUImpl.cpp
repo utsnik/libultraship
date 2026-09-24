@@ -446,6 +446,10 @@ volatile uint32_t gTexBytes = 0;
 volatile uint32_t gTexCount = 0;
 volatile uint32_t gLastTexPtr = 0;
 volatile uint32_t gFlipCount = 0;
+volatile uint32_t gOtrCacheHits = 0;
+volatile uint32_t gOtrCacheMisses = 0;
+volatile uint32_t gOtrResourceManagerLookups = 0;
+volatile uint32_t gDrawBufferHighWaterBytes = 0;
 // Keep the periodic watchdog and explicitly requested diagnostics, but do not stream every
 // watchdog Enter/Leave pair from the GX2 hot path.
 volatile uint32_t gEventStream = 0;
@@ -669,8 +673,9 @@ static int Main(int, const char**) {
             // texCount/texBytes/lastTexPtr are our own counters and are kept.
             (void)mem2;
             Emit("WDOG: mem texCount=%u texBytes=%u lastTexPtr=0x%08X audioSeq=%u audioPhase=%u flips=%u "
-                 "emitOk=%u emitFail=%u\n",
-                 gTexCount, gTexBytes, gLastTexPtr, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail);
+                 "emitOk=%u emitFail=%u otrHit=%u otrMiss=%u rmLookup=%u drawHwm=%u\n",
+                 gTexCount, gTexBytes, gLastTexPtr, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail,
+                 gOtrCacheHits, gOtrCacheMisses, gOtrResourceManagerLookups, gDrawBufferHighWaterBytes);
         }
 
         OSSleepTicks(OSMillisecondsToTicks(WDOG_TICK_INTERVAL_MS));

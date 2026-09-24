@@ -34,6 +34,7 @@
 #include "ship/utils/Utils.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 #include "libultraship/libultra/os.h"
 
@@ -406,11 +407,51 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
 }
 
 void Interpreter::TextureCacheClear() {
+    mOtrTextureCache.clear();
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
     }
     mTextureCache.map.clear();
     mTextureCache.lru.clear();
+}
+
+const char* Interpreter::ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::Texture>& texture) {
+    auto resourceManager = Ship::Context::GetInstance()->GetResourceManager();
+    const uint32_t currentResourceCacheGeneration = resourceManager->GetCacheGeneration();
+
+    if (mOtrTextureCacheResourceManager != resourceManager.get() ||
+        mOtrTextureCacheGeneration != currentResourceCacheGeneration) {
+        mOtrTextureCache.clear();
+        mOtrTextureCacheResourceManager = resourceManager.get();
+        mOtrTextureCacheGeneration = currentResourceCacheGeneration;
+    }
+
+    auto cachedTexture = mOtrTextureCache.find(hash);
+    if (cachedTexture != mOtrTextureCache.end()) {
+        if (cachedTexture->second.texture != nullptr && cachedTexture->second.texture->IsDirty()) {
+            mOtrTextureCache.erase(cachedTexture);
+        } else {
+            WDOG_OTR_CACHE_HIT();
+            texture = cachedTexture->second.texture;
+            return cachedTexture->second.fileName.empty() ? nullptr : cachedTexture->second.fileName.c_str();
+        }
+    }
+
+    WDOG_OTR_CACHE_MISS();
+    const char* fileName = resourceManager->GetArchiveManager()->HashToCString(hash);
+    if (fileName == nullptr) {
+        texture = nullptr;
+        return nullptr;
+    }
+
+    WDOG_OTR_RM_LOOKUP();
+    texture = std::static_pointer_cast<Fast::Texture>(resourceManager->LoadResourceProcess(fileName));
+    auto [cacheEntry, inserted] = mOtrTextureCache.emplace(hash, OtrTextureCacheEntry{ fileName, texture });
+    if (!inserted) {
+        cacheEntry->second.fileName = fileName;
+        cacheEntry->second.texture = texture;
+    }
+    return cacheEntry->second.fileName.c_str();
 }
 
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
@@ -3436,22 +3477,21 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
     uintptr_t addr = (*cmd0)->words.w1;
     (*cmd0)++;
     uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (uint64_t)(*cmd0)->words.w1;
 
-    const char* fileName = Ship::Context::GetInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash);
+    std::shared_ptr<Fast::Texture> texture;
+    const char* fileName = gfx->ResolveOtrTexture(hash, texture);
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
-    if (fileName == nullptr) {
+    if (fileName == nullptr && texture == nullptr) {
         (*cmd0)++;
         return false;
     }
 
-    std::shared_ptr<Fast::Texture> texture =
-        std::static_pointer_cast<Fast::Texture>(Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(
-            Ship::Context::GetInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash)));
     if (texture != nullptr) {
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
@@ -3460,10 +3500,6 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.v_pixel_scale = texture->VPixelScale;
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
-
-        // OTRTODO: We have disabled caching for now to fix a texture corruption issue with HD texture
-        // support. In doing so, there is a potential performance hit since we are not caching lookups. We
-        // need to do proper profiling to see whether or not it is worth it to keep the caching system.
 
         char* tex = reinterpret_cast<char*>(texture->ImageData);
 

@@ -18,6 +18,10 @@
 #include "fast/resource/type/Texture.h"
 #include "ship/resource/Resource.h"
 
+namespace Ship {
+class ResourceManager;
+}
+
 // TODO figure out why changing these to 640x480 makes the game only render in a quarter of the window
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
@@ -323,6 +327,13 @@ struct GfxTextureCache {
     std::vector<uint32_t> free_texture_ids;
 };
 
+struct OtrTextureCacheEntry {
+    std::string fileName;
+    std::shared_ptr<Fast::Texture> texture;
+};
+
+using OtrTextureCacheMap = std::unordered_map<uint64_t, OtrTextureCacheEntry>;
+
 struct ColorCombiner {
     uint64_t shader_id0;
     uint32_t shader_id1;
@@ -393,6 +404,7 @@ class Interpreter {
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
     void TextureCacheClear();
+    const char* ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::Texture>& texture);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void ImportTextureRgba16(int tile, bool importReplacement);
@@ -476,6 +488,9 @@ class Interpreter {
     RenderingState mRenderingState{};
 
     GfxTextureCache mTextureCache{};
+    OtrTextureCacheMap mOtrTextureCache{};
+    uint64_t mOtrTextureCacheGeneration = 0;
+    const Ship::ResourceManager* mOtrTextureCacheResourceManager = nullptr;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
     uint8_t* mTexUploadBuffer = nullptr;

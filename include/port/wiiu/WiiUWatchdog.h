@@ -121,6 +121,10 @@ extern volatile uint32_t gTexBytes;   // cumulative allocation bytes passed to m
 extern volatile uint32_t gTexCount;
 extern volatile uint32_t gLastTexPtr;
 extern volatile uint32_t gFlipCount;
+extern volatile uint32_t gOtrCacheHits;
+extern volatile uint32_t gOtrCacheMisses;
+extern volatile uint32_t gOtrResourceManagerLookups;
+extern volatile uint32_t gDrawBufferHighWaterBytes;
 
 // Raw UDP diagnostic output shared with GX2 callbacks. This must remain allocation-free.
 void Emit(const char* fmt, ...);
@@ -132,6 +136,18 @@ inline void TexAlloc(const void* ptr, uint32_t size) {
     gLastTexPtr = (uint32_t)(uintptr_t)ptr;
     gTexBytes += size;
     ++gTexCount;
+}
+
+inline void OtrCacheHit() {
+    ++gOtrCacheHits;
+}
+
+inline void OtrCacheMiss() {
+    ++gOtrCacheMisses;
+}
+
+inline void OtrResourceManagerLookup() {
+    ++gOtrResourceManagerLookups;
 }
 
 inline void SetDetail(const char* s) {
@@ -274,6 +290,9 @@ void Start();
 #define WDOG_SCOPE_FMT(phase, fmt, ...) \
     ::Ship::WiiU::Watchdog::ScopeFmt WDOG_CAT(wdogScopeFmt_, __LINE__)(phase, fmt, __VA_ARGS__)
 #define WDOG_TEXALLOC(ptr, size) ::Ship::WiiU::Watchdog::TexAlloc(ptr, size)
+#define WDOG_OTR_CACHE_HIT() ::Ship::WiiU::Watchdog::OtrCacheHit()
+#define WDOG_OTR_CACHE_MISS() ::Ship::WiiU::Watchdog::OtrCacheMiss()
+#define WDOG_OTR_RM_LOOKUP() ::Ship::WiiU::Watchdog::OtrResourceManagerLookup()
 
 #else
 
@@ -288,5 +307,8 @@ void Start();
 #define WDOG_SCOPE(phase, detail) ((void)0)
 #define WDOG_SCOPE_FMT(phase, fmt, ...) ((void)0)
 #define WDOG_TEXALLOC(ptr, size) ((void)0)
+#define WDOG_OTR_CACHE_HIT() ((void)0)
+#define WDOG_OTR_CACHE_MISS() ((void)0)
+#define WDOG_OTR_RM_LOOKUP() ((void)0)
 
 #endif // __WIIU__

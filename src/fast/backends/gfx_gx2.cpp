@@ -111,6 +111,7 @@ static int current_tile;
 #define DRAW_BUFFER_SIZE 0x6000000
 static uint8_t* draw_buffer = nullptr;
 static uint8_t* draw_ptr = nullptr;
+static uint32_t draw_buffer_frame_high_water = 0;
 
 static uint32_t frame_count;
 static bool gfx_gx2_trace_first_frame = true;
@@ -773,6 +774,10 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
 
     float* new_vbo = (float*)draw_ptr;
     draw_ptr += ALIGN(vbo_len, GX2_VERTEX_BUFFER_ALIGNMENT);
+    const uint32_t draw_buffer_used = static_cast<uint32_t>(draw_ptr - draw_buffer);
+    if (draw_buffer_used > draw_buffer_frame_high_water) {
+        draw_buffer_frame_high_water = draw_buffer_used;
+    }
 
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: OSBlockMove ...");
@@ -943,6 +948,7 @@ static void gfx_gx2_on_resize(void) {
 
 static void gfx_gx2_start_frame(void) {
     const bool trace = gfx_gx2_trace_first_frame;
+    draw_buffer_frame_high_water = 0;
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame state setup begin");
     }
@@ -1003,6 +1009,7 @@ static void gfx_gx2_start_frame(void) {
 
 static void gfx_gx2_end_frame(void) {
     const bool trace = gfx_gx2_trace_first_frame;
+    Ship::WiiU::Watchdog::gDrawBufferHighWaterBytes = draw_buffer_frame_high_water;
     draw_ptr = draw_buffer;
 
     {

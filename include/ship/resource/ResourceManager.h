@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -105,6 +106,7 @@ class ResourceManager {
     bool OtrSignatureCheck(const char* fileName);
     bool IsAltAssetsEnabled();
     void SetAltAssetsEnabled(bool isEnabled);
+    uint32_t GetCacheGeneration() const;
     std::shared_ptr<File> LoadFileProcess(const ResourceIdentifier& identifier);
     std::shared_ptr<File> LoadFileProcess(const std::string& filePath);
 
@@ -138,6 +140,7 @@ class ResourceManager {
     std::shared_ptr<ArchiveManager> mArchiveManager;
     std::shared_ptr<BS::thread_pool> mThreadPool;
     std::mutex mMutex;
+    std::atomic<uint32_t> mCacheGeneration = 0;
     bool mAltAssetsEnabled = false;
     // Private information for which owner and archive are default.
     uintptr_t mDefaultCacheOwner = 0;
