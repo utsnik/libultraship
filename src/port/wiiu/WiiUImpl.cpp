@@ -33,6 +33,560 @@
 #include <sysapp/launch.h>
 #include <nsysnet/_socket.h>
 #include <cstdlib>
+#include <errno.h>
+#include <stdint.h>
+
+namespace Ship {
+namespace WiiU {
+namespace Watchdog {
+void Emit(const char* fmt, ...);
+}
+}
+}
+
+// This tracker is intentionally independent of the watchdog's C++/socket path.  The wrapped
+// allocators may run before Watchdog::Start(), while another thread is stopped in the allocator,
+// so every data structure here is static and every operation is bounded and allocation-free.
+namespace {
+
+static const uint32_t kLeakTableSize = 16384;
+static const uint32_t kLeakSiteTableSize = 4096;
+static const uint32_t kLeakTopCount = 12;
+static const uint32_t kLeakEmpty = 0;
+static const uint32_t kLeakUsed = 1;
+static const uint32_t kLeakDeleted = 2;
+
+struct LeakEntry {
+    uintptr_t address;
+    uint64_t bytes;
+    uint32_t key[3];
+    int32_t site;
+    uint32_t state;
+};
+
+struct LeakSite {
+    uint32_t key[3];
+    uint64_t liveBytes;
+    uint32_t liveCount;
+    uint64_t previousBytes;
+    uint32_t used;
+};
+
+struct LeakTop {
+    uint32_t key[3];
+    uint64_t bytes;
+    uint32_t count;
+    uint64_t growth;
+};
+
+static LeakEntry sLeakTable[kLeakTableSize];
+static LeakSite sLeakSites[kLeakSiteTableSize];
+static volatile uint32_t sLeakLock = 0;
+static volatile uint32_t sLeakTracked = 0;
+static volatile uint32_t sLeakDropped = 0;
+// CafeOS RPLs reject the TLS relocations emitted for __thread.  This is the same semantic
+// guard, backed by a fixed slot table keyed by the current OSThread, so it remains per-thread
+// without using TLS or allocating to discover a thread's state.
+struct LeakThreadState {
+    OSThread* thread;
+    volatile uint32_t reentrant;
+    volatile uint32_t newDepth;
+};
+static LeakThreadState sLeakThreadStates[128];
+static LeakThreadState sLeakFallbackState = { nullptr, 0, 0 };
+
+static LeakThreadState* LeakCurrentThreadState() {
+    OSThread* current = OSGetCurrentThread();
+    if (current == nullptr) {
+        return &sLeakFallbackState;
+    }
+    for (uint32_t index = 0; index < sizeof(sLeakThreadStates) / sizeof(sLeakThreadStates[0]); ++index) {
+        LeakThreadState& state = sLeakThreadStates[index];
+        if (state.thread == current) {
+            return &state;
+        }
+        if (state.thread == nullptr &&
+            __sync_bool_compare_and_swap(&state.thread, (OSThread*)nullptr, current)) {
+            return &state;
+        }
+    }
+    return &sLeakFallbackState;
+}
+
+extern "C" {
+void* __wrap_malloc(size_t);
+void __wrap_free(void*);
+void* __wrap_calloc(size_t, size_t);
+void* __wrap_realloc(void*, size_t);
+void* __wrap_memalign(size_t, size_t);
+int __wrap_posix_memalign(void**, size_t, size_t);
+void* __wrap_aligned_alloc(size_t, size_t);
+void* __wrap__Znwm(size_t);
+void* __wrap__Znam(size_t);
+void* __wrap__Znwj(size_t);
+void* __wrap__Znaj(size_t);
+}
+
+static inline uint32_t LeakHashWord(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15;
+    value *= 0x846CA68Bu;
+    return value ^ (value >> 16);
+}
+
+static uint32_t LeakKeyHash(const uint32_t key[3]) {
+    uint32_t hash = 2166136261u;
+    hash = (hash ^ LeakHashWord(key[0])) * 16777619u;
+    hash = (hash ^ LeakHashWord(key[1])) * 16777619u;
+    hash = (hash ^ LeakHashWord(key[2])) * 16777619u;
+    return hash;
+}
+
+static uint32_t LeakAddressHash(uintptr_t address) {
+    return LeakHashWord((uint32_t)address ^ ((uint32_t)address >> 16));
+}
+
+static bool LeakIsWrapperFrame(uint32_t address) {
+    // The normal back-chain walk starts below the wrapper frame, but retain this filter for
+    // toolchain variants which expose the wrapper's saved LR as one of the walk results.
+    return address == (uint32_t)(uintptr_t)&__wrap_malloc ||
+           address == (uint32_t)(uintptr_t)&__wrap_free ||
+           address == (uint32_t)(uintptr_t)&__wrap_calloc ||
+           address == (uint32_t)(uintptr_t)&__wrap_realloc ||
+           address == (uint32_t)(uintptr_t)&__wrap_memalign ||
+           address == (uint32_t)(uintptr_t)&__wrap_posix_memalign ||
+           address == (uint32_t)(uintptr_t)&__wrap_aligned_alloc ||
+           address == (uint32_t)(uintptr_t)&__wrap__Znwm ||
+           address == (uint32_t)(uintptr_t)&__wrap__Znam ||
+           address == (uint32_t)(uintptr_t)&__wrap__Znwj ||
+           address == (uint32_t)(uintptr_t)&__wrap__Znaj;
+}
+
+static void LeakCaptureKey(uint32_t key[3], bool skipOperatorNew) __attribute__((noinline));
+static void LeakCaptureKey(uint32_t key[3], bool skipOperatorNew) {
+    key[0] = 0;
+    key[1] = 0;
+    key[2] = 0;
+
+    uint32_t* frame;
+    __asm__ volatile("mr %0, 1" : "=r"(frame));
+    bool skippedNew = !skipOperatorNew;
+    uint32_t count = 0;
+    for (uint32_t depth = 0; depth < 32 && frame != nullptr; ++depth) {
+        const uintptr_t frameAddress = (uintptr_t)frame;
+        if ((frameAddress & 3u) != 0 || frameAddress < 0x10000000u || frameAddress >= 0x50000000u) {
+            break;
+        }
+        uint32_t* next = (uint32_t*)frame[0];
+        const uintptr_t nextAddress = (uintptr_t)next;
+        if (next == nullptr || next <= frame || (nextAddress & 3u) != 0 ||
+            nextAddress < 0x10000000u || nextAddress > 0x4FFFFFFCu) {
+            break;
+        }
+
+        const uint32_t returnAddress = next[1];
+        frame = next;
+        if (returnAddress == 0 || LeakIsWrapperFrame(returnAddress)) {
+            continue;
+        }
+        if (!skippedNew) {
+            skippedNew = true;
+            continue;
+        }
+        if (count < 3) {
+            key[count++] = returnAddress;
+        }
+        if (count == 3) {
+            break;
+        }
+    }
+}
+
+static void LeakLock() {
+    while (!__sync_bool_compare_and_swap(&sLeakLock, 0, 1)) {
+        OSYieldThread();
+    }
+}
+
+static bool LeakTryLock() {
+    return __sync_bool_compare_and_swap(&sLeakLock, 0, 1);
+}
+
+static void LeakUnlock() {
+    __sync_synchronize();
+    sLeakLock = 0;
+}
+
+static int32_t LeakFindSiteLocked(const uint32_t key[3], bool create) {
+    const uint32_t start = LeakKeyHash(key) & (kLeakSiteTableSize - 1);
+    for (uint32_t probe = 0; probe < kLeakSiteTableSize; ++probe) {
+        LeakSite& site = sLeakSites[(start + probe) & (kLeakSiteTableSize - 1)];
+        if (!site.used) {
+            if (!create) {
+                return -1;
+            }
+            site.key[0] = key[0];
+            site.key[1] = key[1];
+            site.key[2] = key[2];
+            site.liveBytes = 0;
+            site.liveCount = 0;
+            site.previousBytes = 0;
+            site.used = 1;
+            return (int32_t)((start + probe) & (kLeakSiteTableSize - 1));
+        }
+        if (site.key[0] == key[0] && site.key[1] == key[1] && site.key[2] == key[2]) {
+            return (int32_t)((start + probe) & (kLeakSiteTableSize - 1));
+        }
+    }
+    return -1;
+}
+
+static int32_t LeakFindEntryLocked(uintptr_t address) {
+    const uint32_t start = LeakAddressHash(address) & (kLeakTableSize - 1);
+    for (uint32_t probe = 0; probe < kLeakTableSize; ++probe) {
+        LeakEntry& entry = sLeakTable[(start + probe) & (kLeakTableSize - 1)];
+        if (entry.state == kLeakEmpty) {
+            return -1;
+        }
+        if (entry.state == kLeakUsed && entry.address == address) {
+            return (int32_t)((start + probe) & (kLeakTableSize - 1));
+        }
+    }
+    return -1;
+}
+
+static int32_t LeakFindInsertEntryLocked(uintptr_t address) {
+    const uint32_t start = LeakAddressHash(address) & (kLeakTableSize - 1);
+    int32_t deleted = -1;
+    for (uint32_t probe = 0; probe < kLeakTableSize; ++probe) {
+        const uint32_t index = (start + probe) & (kLeakTableSize - 1);
+        LeakEntry& entry = sLeakTable[index];
+        if (entry.state == kLeakEmpty) {
+            return deleted >= 0 ? deleted : (int32_t)index;
+        }
+        if (entry.state == kLeakDeleted && deleted < 0) {
+            deleted = (int32_t)index;
+        } else if (entry.state == kLeakUsed && entry.address == address) {
+            return (int32_t)index;
+        }
+    }
+    return deleted;
+}
+
+static void LeakSiteAddLocked(int32_t siteIndex, uint64_t bytes) {
+    if (siteIndex < 0) {
+        return;
+    }
+    LeakSite& site = sLeakSites[siteIndex];
+    site.liveBytes += bytes;
+    ++site.liveCount;
+}
+
+static void LeakSiteRemoveLocked(int32_t siteIndex, uint64_t bytes) {
+    if (siteIndex < 0) {
+        return;
+    }
+    LeakSite& site = sLeakSites[siteIndex];
+    site.liveBytes = site.liveBytes >= bytes ? site.liveBytes - bytes : 0;
+    if (site.liveCount != 0) {
+        --site.liveCount;
+    }
+}
+
+static bool LeakAddLocked(uintptr_t address, uint64_t bytes, const uint32_t key[3]) {
+    const int32_t entryIndex = LeakFindInsertEntryLocked(address);
+    if (entryIndex < 0) {
+        ++sLeakDropped;
+        return false;
+    }
+    const int32_t siteIndex = LeakFindSiteLocked(key, true);
+    if (siteIndex < 0) {
+        ++sLeakDropped;
+        return false;
+    }
+
+    LeakEntry& entry = sLeakTable[entryIndex];
+    entry.address = address;
+    entry.bytes = bytes;
+    entry.key[0] = key[0];
+    entry.key[1] = key[1];
+    entry.key[2] = key[2];
+    entry.site = siteIndex;
+    entry.state = kLeakUsed;
+    LeakSiteAddLocked(siteIndex, bytes);
+    ++sLeakTracked;
+    return true;
+}
+
+static void LeakRemoveLocked(uintptr_t address) {
+    if (address == 0) {
+        return;
+    }
+    const int32_t entryIndex = LeakFindEntryLocked(address);
+    if (entryIndex < 0) {
+        return;
+    }
+    LeakEntry& entry = sLeakTable[entryIndex];
+    LeakSiteRemoveLocked(entry.site, entry.bytes);
+    entry.address = 0;
+    entry.bytes = 0;
+    entry.site = -1;
+    entry.state = kLeakDeleted;
+    if (sLeakTracked != 0) {
+        --sLeakTracked;
+    }
+}
+
+static void LeakRecord(uintptr_t address, uint64_t bytes, const uint32_t key[3]) {
+    if (address == 0) {
+        return;
+    }
+    LeakLock();
+    LeakAddLocked(address, bytes, key);
+    LeakUnlock();
+}
+
+static void LeakForget(uintptr_t address) {
+    if (address == 0) {
+        return;
+    }
+    LeakLock();
+    LeakRemoveLocked(address);
+    LeakUnlock();
+}
+
+static void LeakReplace(uintptr_t oldAddress, uintptr_t newAddress, uint64_t bytes, const uint32_t key[3],
+                        bool removeOld) {
+    LeakLock();
+    if (removeOld) {
+        LeakRemoveLocked(oldAddress);
+    }
+    if (newAddress != 0) {
+        LeakAddLocked(newAddress, bytes, key);
+    }
+    LeakUnlock();
+}
+
+static void LeakEmitReport() {
+    LeakTop top[kLeakTopCount] = {};
+    uint32_t topCount = 0;
+    uint32_t tracked = 0;
+    uint32_t dropped = 0;
+
+    if (!LeakTryLock()) {
+        return;
+    }
+
+    tracked = sLeakTracked;
+    dropped = sLeakDropped;
+    for (uint32_t index = 0; index < kLeakSiteTableSize; ++index) {
+        LeakSite& site = sLeakSites[index];
+        const uint64_t growth = site.liveBytes > site.previousBytes ? site.liveBytes - site.previousBytes : 0;
+        if (site.used && site.liveCount != 0 && growth != 0) {
+            uint32_t insertAt = topCount;
+            for (uint32_t topIndex = 0; topIndex < topCount; ++topIndex) {
+                if (growth > top[topIndex].growth) {
+                    insertAt = topIndex;
+                    break;
+                }
+            }
+            if (insertAt < kLeakTopCount) {
+                if (topCount < kLeakTopCount) {
+                    ++topCount;
+                }
+                for (uint32_t topIndex = topCount - 1; topIndex > insertAt; --topIndex) {
+                    top[topIndex] = top[topIndex - 1];
+                }
+                top[insertAt].key[0] = site.key[0];
+                top[insertAt].key[1] = site.key[1];
+                top[insertAt].key[2] = site.key[2];
+                top[insertAt].bytes = site.liveBytes;
+                top[insertAt].count = site.liveCount;
+                top[insertAt].growth = growth;
+            }
+        }
+        if (site.used) {
+            site.previousBytes = site.liveBytes;
+        }
+    }
+    LeakUnlock();
+
+    for (uint32_t index = 0; index < topCount; ++index) {
+        Ship::WiiU::Watchdog::Emit(
+            "LEAK: key=0x%08X,0x%08X,0x%08X bytes=%llu count=%u growth=%llu\n", top[index].key[0],
+            top[index].key[1], top[index].key[2], (unsigned long long)top[index].bytes, top[index].count,
+            (unsigned long long)top[index].growth);
+    }
+    Ship::WiiU::Watchdog::Emit("LEAK: tracked=%u dropped=%u\n", tracked, dropped);
+}
+
+} // namespace
+
+extern "C" {
+void* __real_malloc(size_t);
+void __real_free(void*);
+void* __real_calloc(size_t, size_t);
+void* __real_realloc(void*, size_t);
+void* __real_memalign(size_t, size_t);
+void* __real_aligned_alloc(size_t, size_t);
+void* __real__Znwm(size_t) __attribute__((weak));
+void* __real__Znam(size_t) __attribute__((weak));
+void* __real__Znwj(size_t) __attribute__((weak));
+void* __real__Znaj(size_t) __attribute__((weak));
+
+void* __wrap_malloc(size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
+        return __real_malloc(size);
+    }
+    uint32_t key[3];
+    LeakCaptureKey(key, state->newDepth != 0);
+    void* result = __real_malloc(size);
+    LeakRecord((uintptr_t)result, size, key);
+    __sync_lock_release(&state->reentrant);
+    return result;
+}
+
+void __wrap_free(void* pointer) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
+        __real_free(pointer);
+        return;
+    }
+    __real_free(pointer);
+    LeakForget((uintptr_t)pointer);
+    __sync_lock_release(&state->reentrant);
+}
+
+void* __wrap_calloc(size_t count, size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
+        return __real_calloc(count, size);
+    }
+    uint32_t key[3];
+    LeakCaptureKey(key, state->newDepth != 0);
+    void* result = __real_calloc(count, size);
+    LeakRecord((uintptr_t)result, (uint64_t)count * (uint64_t)size, key);
+    __sync_lock_release(&state->reentrant);
+    return result;
+}
+
+void* __wrap_realloc(void* pointer, size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
+        return __real_realloc(pointer, size);
+    }
+    uint32_t key[3];
+    LeakCaptureKey(key, state->newDepth != 0);
+    void* result = __real_realloc(pointer, size);
+    if (result != nullptr || size == 0) {
+        LeakReplace((uintptr_t)pointer, (uintptr_t)result, size, key, true);
+    }
+    __sync_lock_release(&state->reentrant);
+    return result;
+}
+
+void* __wrap_memalign(size_t alignment, size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
+        return __real_memalign(alignment, size);
+    }
+    uint32_t key[3];
+    LeakCaptureKey(key, state->newDepth != 0);
+    void* result = __real_memalign(alignment, size);
+    LeakRecord((uintptr_t)result, size, key);
+    __sync_lock_release(&state->reentrant);
+    return result;
+}
+
+static int LeakPosixMemalign(void** pointer, size_t alignment, size_t size) {
+    if (pointer == nullptr) {
+        return EINVAL;
+    }
+    if (alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) {
+        return EINVAL;
+    }
+    void* result = __real_memalign(alignment, size);
+    if (result == nullptr) {
+        return ENOMEM;
+    }
+    *pointer = result;
+    return 0;
+}
+
+int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
+        return LeakPosixMemalign(pointer, alignment, size);
+    }
+    uint32_t key[3];
+    LeakCaptureKey(key, state->newDepth != 0);
+    const int result = LeakPosixMemalign(pointer, alignment, size);
+    if (result == 0 && pointer != nullptr) {
+        LeakRecord((uintptr_t)*pointer, size, key);
+    }
+    __sync_lock_release(&state->reentrant);
+    return result;
+}
+
+void* __wrap_aligned_alloc(size_t alignment, size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
+        return __real_aligned_alloc(alignment, size);
+    }
+    uint32_t key[3];
+    LeakCaptureKey(key, state->newDepth != 0);
+    void* result = __real_aligned_alloc(alignment, size);
+    LeakRecord((uintptr_t)result, size, key);
+    __sync_lock_release(&state->reentrant);
+    return result;
+}
+
+void* __wrap__Znwm(size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__real__Znwm == nullptr) {
+        return nullptr;
+    }
+    ++state->newDepth;
+    void* result = __real__Znwm(size);
+    --state->newDepth;
+    return result;
+}
+
+void* __wrap__Znam(size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__real__Znam == nullptr) {
+        return nullptr;
+    }
+    ++state->newDepth;
+    void* result = __real__Znam(size);
+    --state->newDepth;
+    return result;
+}
+
+void* __wrap__Znwj(size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__real__Znwj == nullptr) {
+        return nullptr;
+    }
+    ++state->newDepth;
+    void* result = __real__Znwj(size);
+    --state->newDepth;
+    return result;
+}
+
+void* __wrap__Znaj(size_t size) {
+    LeakThreadState* state = LeakCurrentThreadState();
+    if (__real__Znaj == nullptr) {
+        return nullptr;
+    }
+    ++state->newDepth;
+    void* result = __real__Znaj(size);
+    --state->newDepth;
+    return result;
+}
+}
 
 static int wiiu_log_open(struct _reent*, void*, const char*, int, int) {
     return -1;
@@ -957,10 +1511,12 @@ static int Main(int, const char**) {
                  cmd, gDetail, gFlipCount);
         }
 
-        // MEM2 pressure, every 200th tick (~100 s) and on its own line. Deliberately NOT folded
+        ++tick;
+
+        // MEM2 pressure, every 20th tick (~10 s) and on its own line. Deliberately NOT folded
         // into the alive/STALLED lines: Emit's buffer is 512 bytes and a long detail= path
         // would push these fields off the end of exactly the line we most need intact.
-        if ((tick++ % 20u) == 0u) {
+        if ((tick % 20u) == 0u) {
             const MEMHeapHandle mem2 = MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM2);
             // Cross-check: heapFree is a base-heap query whose heap type is assumed, so it is
             // unverified on first use. texBytes/texCount/lastPtr are our own counters and
@@ -994,6 +1550,12 @@ static int Main(int, const char**) {
                  gTextureCacheSize, gFreeTextureIdsSize, gOtrTextureCacheSize, gRawPointerByPathSize,
                  gRawPointerByHashSize, gResourceCacheSize, gShaderProgramPoolSize, gTexLiveBytes,
                  (uint32_t)heapInfo.uordblks);
+        }
+
+        // The allocation table is sampled independently of the heap-pressure line.  At 500 ms
+        // per watchdog tick this is one report about every 60 seconds.
+        if ((tick % 120u) == 0u) {
+            LeakEmitReport();
         }
 
         OSSleepTicks(OSMillisecondsToTicks(kProfileSampleIntervalMs));

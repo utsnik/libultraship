@@ -180,6 +180,22 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
         SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
         $<$<BOOL:${GFX_DEBUG_DISASSEMBLER}>:GFX_DEBUG_DISASSEMBLER>
     )
+    # Keep these on the library target so every final executable which consumes
+    # libultraship gets the wrappers.  PRIVATE link options on this STATIC target
+    # would never reach the Soh link step.
+    target_link_options(libultraship PUBLIC
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=memalign"
+        "-Wl,--wrap=posix_memalign"
+        "-Wl,--wrap=aligned_alloc"
+        "-Wl,--wrap=_Znwm"
+        "-Wl,--wrap=_Znam"
+        "-Wl,--wrap=_Znwj"
+        "-Wl,--wrap=_Znaj"
+    )
 else()
     target_compile_definitions(libultraship PRIVATE
         ENABLE_OPENGL
@@ -237,4 +253,3 @@ if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU|Clang")
     )
     endif()
 endif()
-
