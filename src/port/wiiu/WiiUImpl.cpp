@@ -991,8 +991,6 @@ void Start() {
         sGameTextStart = bias + 0x02000000u;
         sGameTextEnd = bias + 0x05000000u;
     }
-    Emit("PROFMAP: gameText=0x%08X-0x%08X\n", sGameTextStart, sGameTextEnd);
-    EmitSystemLandmarks();
     // Set from the game thread so the alarm fires on (and samples) the game thread's core.
     OSCreateAlarm(&sProfileAlarm);
     OSSetPeriodicAlarm(&sProfileAlarm, OSGetTime() + OSMillisecondsToTicks(2000),
@@ -1031,6 +1029,9 @@ void Start() {
          "watchdog cannot report and its silence means nothing)\n",
          sSocket, testRc, (unsigned int)((kLogHostAddr >> 24) & 0xFF), (unsigned int)((kLogHostAddr >> 16) & 0xFF),
          (unsigned int)((kLogHostAddr >> 8) & 0xFF), (unsigned int)(kLogHostAddr & 0xFF));
+    // After the channel test: the watchdog socket must exist before these can be sent.
+    Emit("PROFMAP: gameText=0x%08X-0x%08X\n", sGameTextStart, sGameTextEnd);
+    EmitSystemLandmarks();
 
     // Core 2. The game loop runs on core 1, so a stalled main thread cannot hold this off.
     // Priority 5 is above the main thread's 16 (lower number wins on Cafe OS).
