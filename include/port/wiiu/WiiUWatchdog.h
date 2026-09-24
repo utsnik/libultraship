@@ -284,6 +284,7 @@ struct ScopeFmt {
 // Transmits one "online" line immediately, so that later silence is evidence about the
 // game and not about the socket.
 void Start();
+void StopProfiler();
 
 } // namespace Ship::WiiU::Watchdog
 

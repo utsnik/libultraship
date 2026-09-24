@@ -591,6 +591,7 @@ void gfx_wiiu_teardown(void) {
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown returned\n");
     gfx_wiiu_shutdown();
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_shutdown returned\n");
+    Ship::WiiU::Watchdog::StopProfiler();
     WHBProcShutdown();
 
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_teardown exit\n");
@@ -610,6 +611,7 @@ static void gfx_wiiu_main_loop(void (*run_one_game_iter)(void)) {
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown returned\n");
     gfx_wiiu_shutdown();
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_shutdown returned\n");
+    Ship::WiiU::Watchdog::StopProfiler();
     WHBProcShutdown();
 
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_main_loop exit\n");

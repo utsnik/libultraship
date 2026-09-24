@@ -20,6 +20,7 @@
 #include "port/wiiu/WiiUWatchdog.h"
 
 #include <coreinit/thread.h>
+#include <coreinit/alarm.h>
 #include <coreinit/time.h>
 #include <coreinit/exception.h>
 #include <sys/socket.h>
@@ -78,6 +79,7 @@ static void RestoreStdioDevoptab() {
 // normally and the Aroma plugins survive.
 void __real_exit(int status) __attribute__((noreturn));
 void __wrap_exit(int status) {
+    Ship::WiiU::Watchdog::StopProfiler();
     Ship::WiiU::Watchdog::Emit("EXIT: exit(%d) - bypassing destructor teardown\n", status);
     KPADShutdown();
     RestoreStdioDevoptab();
@@ -483,8 +485,13 @@ struct ProfileTop {
     uint32_t count;
 };
 
-static ProfileBucket sPcProfile[kProfileTableSize];
-static ProfileBucket sLrProfile[kProfileTableSize];
+// Double-buffered: the alarm callback (interrupt context, game core) fills [sProfileActive];
+// the watchdog flips the index every report and reads/clears the other set.
+static ProfileBucket sPcProfile[2][kProfileTableSize];
+static ProfileBucket sLrProfile[2][kProfileTableSize];
+static volatile uint32_t sProfileActive = 0;
+static volatile uint32_t sProfileCount[2] = { 0, 0 };
+static OSAlarm sProfileAlarm;
 static ProfileTop sTopPcs[kProfileTopPcCount];
 static ProfileTop sTopLrs[kProfileTopLrCount];
 static uint32_t sProfileSampleCount = 0;
@@ -695,31 +702,47 @@ static void EmitProfileTop(const char* kind, const ProfileTop* top, uint32_t top
 }
 
 static void EmitProfileReport() {
-    ProfileSelectTop(sPcProfile, sTopPcs, kProfileTopPcCount);
-    ProfileSelectTop(sLrProfile, sTopLrs, kProfileTopLrCount);
+    const uint32_t done = sProfileActive;
+    sProfileActive = done ^ 1u;
+    __sync_synchronize();
+    OSSleepTicks(OSMillisecondsToTicks(20)); // let an in-flight callback on the old set finish
+    ProfileSelectTop(sPcProfile[done], sTopPcs, kProfileTopPcCount);
+    ProfileSelectTop(sLrProfile[done], sTopLrs, kProfileTopLrCount);
     EmitProfileTop("pc", sTopPcs, kProfileTopPcCount);
     EmitProfileTop("lr", sTopLrs, kProfileTopLrCount);
-    Emit("PROF: samples=%u\n", sProfileSampleCount);
+    Emit("PROF: samples=%u\n", sProfileCount[done]);
 
-    memset(sPcProfile, 0, sizeof(sPcProfile));
-    memset(sLrProfile, 0, sizeof(sLrProfile));
-    sProfileSampleCount = 0;
+    memset(sPcProfile[done], 0, sizeof(sPcProfile[done]));
+    memset(sLrProfile[done], 0, sizeof(sLrProfile[done]));
+    sProfileCount[done] = 0;
 }
 
-static void ProfileSample() {
-    if (sSampleThread == nullptr) {
+// Periodic alarm on the game thread's core. Alarm callbacks run in interrupt context and are
+// handed the INTERRUPTED context, so srr0/lr are where the game really was. (OSSuspendThread
+// from another core only ever showed the scheduler: every sample landed on one coreinit PC.)
+// No locks, no allocation, no Emit in here.
+static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
+    (void)alarm;
+    if (context == nullptr) {
         return;
     }
+    const uint32_t set = sProfileActive;
+    ProfileAdd(sPcProfile[set], context->srr0);
+    ProfileAdd(sLrProfile[set], context->lr & ~0xFu);
+    ++sProfileCount[set];
+}
 
-    OSSuspendThread(sSampleThread);
-    const uint32_t pc = sSampleThread->context.srr0;
-    const uint32_t lr = sSampleThread->context.lr;
-    OSResumeThread(sSampleThread);
+// Must run before the title tears down: a periodic alarm left armed would fire into a
+// process that is being unmapped.
+void StopProfiler() {
+    OSCancelAlarm(&sProfileAlarm);
+}
 
-    ProfileAdd(sPcProfile, pc);
-    ProfileAdd(sLrProfile, lr & ~0xFu);
-    ++sProfileSampleCount;
-    if (sProfileSampleCount >= kProfileSamplesPerReport) {
+// Called from the watchdog loop every kProfileSampleIntervalMs; reports every ~10 s.
+static void ProfileSample() {
+    static uint32_t iterations = 0;
+    if (++iterations >= kProfileSamplesPerReport) {
+        iterations = 0;
         EmitProfileReport();
     }
 }
@@ -865,6 +888,7 @@ static int Main(int, const char**) {
 }
 
 static void TerminateHandler() {
+    StopProfiler();
     Emit("CXX: terminate\n");
     // Do NOT fall through to abort(). abort() hard-wedges the PowerPC side and takes
     // ftpiiu and the wiiload server with it, so every uncaught exception has been
@@ -885,6 +909,10 @@ void Start() {
     }
     sStarted = true;
     sSampleThread = OSGetCurrentThread();
+    // Set from the game thread so the alarm fires on (and samples) the game thread's core.
+    OSCreateAlarm(&sProfileAlarm);
+    OSSetPeriodicAlarm(&sProfileAlarm, OSGetTime() + OSMillisecondsToTicks(2000),
+                       OSMillisecondsToTicks(kProfileSampleIntervalMs), ProfileAlarmCallback);
 
     // wut wants the socket library brought up before any BSD call. WHBLogUdpInit() has
     // already run by this point and does this for its own socket, but whether that init is
