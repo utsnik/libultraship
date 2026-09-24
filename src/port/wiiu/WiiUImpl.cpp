@@ -49,8 +49,14 @@ void Emit(const char* fmt, ...);
 // so every data structure here is static and every operation is bounded and allocation-free.
 namespace {
 
-static const uint32_t kLeakTableSize = 16384;
-static const uint32_t kLeakSiteTableSize = 4096;
+// 262144 x 32 bytes = 8 MB. The first 16384-entry table would fill with long-lived allocations
+// and then drop exactly the new ones a leak is made of.
+static const uint32_t kLeakTableSize = 262144;
+// Deleted slots never become empty again, so an uncapped linear probe degrades to a whole-table
+// scan under the lock once churn has touched every slot. Insert and lookup share this cap, so an
+// entry that was inserted is always found.
+static const uint32_t kLeakMaxProbe = 64;
+static const uint32_t kLeakSiteTableSize = 16384;
 static const uint32_t kLeakTopCount = 12;
 static const uint32_t kLeakEmpty = 0;
 static const uint32_t kLeakUsed = 1;
@@ -204,8 +210,15 @@ static void LeakCaptureKey(uint32_t key[3], bool skipOperatorNew) {
 }
 
 static void LeakLock() {
+    // OSYieldThread never runs a LOWER-priority thread, so a high-priority thread spinning here
+    // on the holder's core would wait forever. Sleep instead after a short spin.
+    uint32_t spins = 0;
     while (!__sync_bool_compare_and_swap(&sLeakLock, 0, 1)) {
-        OSYieldThread();
+        if (++spins < 64) {
+            OSYieldThread();
+        } else {
+            OSSleepTicks(OSMicrosecondsToTicks(50));
+        }
     }
 }
 
@@ -244,7 +257,7 @@ static int32_t LeakFindSiteLocked(const uint32_t key[3], bool create) {
 
 static int32_t LeakFindEntryLocked(uintptr_t address) {
     const uint32_t start = LeakAddressHash(address) & (kLeakTableSize - 1);
-    for (uint32_t probe = 0; probe < kLeakTableSize; ++probe) {
+    for (uint32_t probe = 0; probe < kLeakMaxProbe; ++probe) {
         LeakEntry& entry = sLeakTable[(start + probe) & (kLeakTableSize - 1)];
         if (entry.state == kLeakEmpty) {
             return -1;
@@ -259,7 +272,7 @@ static int32_t LeakFindEntryLocked(uintptr_t address) {
 static int32_t LeakFindInsertEntryLocked(uintptr_t address) {
     const uint32_t start = LeakAddressHash(address) & (kLeakTableSize - 1);
     int32_t deleted = -1;
-    for (uint32_t probe = 0; probe < kLeakTableSize; ++probe) {
+    for (uint32_t probe = 0; probe < kLeakMaxProbe; ++probe) {
         const uint32_t index = (start + probe) & (kLeakTableSize - 1);
         LeakEntry& entry = sLeakTable[index];
         if (entry.state == kLeakEmpty) {
