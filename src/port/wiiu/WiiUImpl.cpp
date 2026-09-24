@@ -495,6 +495,10 @@ static volatile uint32_t sProfileCount[2] = { 0, 0 };
 // "Game caller": for samples outside the game's .text, the first return address on the
 // stack that IS game code - attributes system/GX2/lock time to the game function behind it.
 static ProfileBucket sGcProfile[2][kProfileTableSize];
+// "Blocked in": when the game thread is NOT the one running on its core (the core is idle or
+// running something else), the game thread is waiting. Its saved context is valid then, so
+// walking its own stack names the game function it is blocked under.
+static ProfileBucket sBkProfile[2][kProfileTableSize];
 static OSAlarm sProfileAlarm;
 static ProfileTop sTopPcs[kProfileTopPcCount];
 static ProfileTop sTopLrs[kProfileTopLrCount];
@@ -716,11 +720,14 @@ static void EmitProfileReport() {
     EmitProfileTop("lr", sTopLrs, kProfileTopLrCount);
     ProfileSelectTop(sGcProfile[done], sTopPcs, kProfileTopPcCount);
     EmitProfileTop("gc", sTopPcs, kProfileTopPcCount);
+    ProfileSelectTop(sBkProfile[done], sTopPcs, kProfileTopPcCount);
+    EmitProfileTop("bk", sTopPcs, kProfileTopPcCount);
     Emit("PROF: samples=%u\n", sProfileCount[done]);
 
     memset(sPcProfile[done], 0, sizeof(sPcProfile[done]));
     memset(sLrProfile[done], 0, sizeof(sLrProfile[done]));
     memset(sGcProfile[done], 0, sizeof(sGcProfile[done]));
+    memset(sBkProfile[done], 0, sizeof(sBkProfile[done]));
     sProfileCount[done] = 0;
 }
 
@@ -734,6 +741,27 @@ static inline bool ProfileIsGameText(uint32_t address) {
     return address >= sGameTextStart && address < sGameTextEnd;
 }
 
+static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp) {
+    if (ProfileIsGameText(lr)) {
+        return lr;
+    }
+    for (int depth = 0; depth < 16; ++depth) {
+        if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
+            return 0;
+        }
+        const uint32_t next = *(const volatile uint32_t*)sp;
+        if (next <= sp || next >= 0x50000000u) {
+            return 0;
+        }
+        const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
+        if (ProfileIsGameText(savedLr)) {
+            return savedLr;
+        }
+        sp = next;
+    }
+    return 0;
+}
+
 static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     (void)alarm;
     if (context == nullptr) {
@@ -744,23 +772,13 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     ProfileAdd(sLrProfile[set], context->lr & ~0xFu);
     const uint32_t pc = context->srr0;
     if (!ProfileIsGameText(pc)) {
-        uint32_t caller = ProfileIsGameText(context->lr) ? context->lr : 0;
-        uint32_t sp = context->gpr[1];
-        for (int depth = 0; caller == 0 && depth < 12; ++depth) {
-            if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
-                break;
-            }
-            const uint32_t next = *(const volatile uint32_t*)sp;
-            if (next <= sp || next >= 0x50000000u) {
-                break;
-            }
-            const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
-            if (ProfileIsGameText(savedLr)) {
-                caller = savedLr;
-            }
-            sp = next;
-        }
+        const uint32_t caller = ProfileFirstGameReturn(context->lr, context->gpr[1]);
         ProfileAdd(sGcProfile[set], caller != 0 ? (caller & ~0xFu) : 0xFFFFFFF0u);
+    }
+    if (sSampleThread != nullptr && OSGetCurrentThread() != sSampleThread) {
+        const uint32_t blocked =
+            ProfileFirstGameReturn(sSampleThread->context.lr, sSampleThread->context.gpr[1]);
+        ProfileAdd(sBkProfile[set], blocked != 0 ? (blocked & ~0xFu) : 0xFFFFFFF0u);
     }
     ++sProfileCount[set];
 }
@@ -989,7 +1007,9 @@ void Start() {
     {
         const uint32_t bias = (uint32_t)(uintptr_t)&__init - 0x02000080u;
         sGameTextStart = bias + 0x02000000u;
-        sGameTextEnd = bias + 0x05000000u;
+        // .text currently ends at ELF 0x04BBE870; 0x04C00000 keeps non-code words found on the
+        // stack (a 0x04C32E00 data address was attributed as a "caller") out of the tables.
+        sGameTextEnd = bias + 0x04C00000u;
     }
     // Set from the game thread so the alarm fires on (and samples) the game thread's core.
     OSCreateAlarm(&sProfileAlarm);
