@@ -115,8 +115,10 @@ struct LeakChurnTop {
     uint64_t max;
 };
 
-static LeakEntry sLeakTable[kLeakTableSize];
-static LeakSite sLeakSites[kLeakSiteTableSize];
+// Allocated on first use, not static: as .bss these were 11.5 MB and soh923m1 never reached main().
+static LeakEntry* sLeakTable = nullptr;
+static LeakSite* sLeakSites = nullptr;
+static volatile uint32_t sLeakTablesState = 0; // 0 = not tried, 1 = initialising, 2 = ready, 3 = failed
 static volatile uint32_t sLeakLock = 0;
 static volatile uint32_t sLeakTracked = 0;
 static volatile uint32_t sLeakDropped = 0;
@@ -410,8 +412,32 @@ static void LeakRemoveLocked(uintptr_t address) {
     }
 }
 
+// Called with the caller's reentrancy flag held, so the real allocator is not tracked. Allocates
+// before LeakLock is taken, so the tracker lock is never held across newlib's malloc lock.
+static bool LeakTablesReady() {
+    if (sLeakTablesState == 2) {
+        return true;
+    }
+    if (!__sync_bool_compare_and_swap(&sLeakTablesState, 0, 1)) {
+        return false;
+    }
+    LeakEntry* table = (LeakEntry*)__real_memalign(64, sizeof(LeakEntry) * kLeakTableSize);
+    LeakSite* sites = (LeakSite*)__real_memalign(64, sizeof(LeakSite) * kLeakSiteTableSize);
+    if (table == nullptr || sites == nullptr) {
+        sLeakTablesState = 3;
+        return false;
+    }
+    memset(table, 0, sizeof(LeakEntry) * kLeakTableSize);
+    memset(sites, 0, sizeof(LeakSite) * kLeakSiteTableSize);
+    sLeakTable = table;
+    sLeakSites = sites;
+    __sync_synchronize();
+    sLeakTablesState = 2;
+    return true;
+}
+
 static void LeakRecord(uintptr_t address, uint64_t bytes, const uint32_t key[3]) {
-    if (address == 0) {
+    if (address == 0 || !LeakTablesReady()) {
         return;
     }
     LeakLock();
@@ -420,7 +446,7 @@ static void LeakRecord(uintptr_t address, uint64_t bytes, const uint32_t key[3])
 }
 
 static void LeakForget(uintptr_t address) {
-    if (address == 0) {
+    if (address == 0 || !LeakTablesReady()) {
         return;
     }
     LeakLock();
@@ -430,6 +456,9 @@ static void LeakForget(uintptr_t address) {
 
 static void LeakReplace(uintptr_t oldAddress, uintptr_t newAddress, uint64_t bytes, const uint32_t key[3],
                         bool removeOld) {
+    if (!LeakTablesReady()) {
+        return;
+    }
     LeakLock();
     if (removeOld) {
         LeakRemoveLocked(oldAddress);
@@ -441,6 +470,10 @@ static void LeakReplace(uintptr_t oldAddress, uintptr_t newAddress, uint64_t byt
 }
 
 static void LeakEmitReport() {
+    if (sLeakTablesState != 2) {
+        ::Ship::WiiU::Watchdog::Emit("LEAK: tables not ready state=%u\n", sLeakTablesState);
+        return;
+    }
     LeakTop top[kLeakTopCount] = {};
     LeakChurnTop churnTop[kLeakChurnTopCount] = {};
     uint32_t topCount = 0;
