@@ -52,10 +52,11 @@ void* __real_calloc(size_t, size_t);
 void* __real_realloc(void*, size_t);
 void* __real_memalign(size_t, size_t);
 void* __real_aligned_alloc(size_t, size_t);
-void* __real__Znwm(size_t) __attribute__((weak));
-void* __real__Znam(size_t) __attribute__((weak));
-void* __real__Znwj(size_t) __attribute__((weak));
-void* __real__Znaj(size_t) __attribute__((weak));
+// Strong, not weak: a weak reference does not pull libstdc++'s new_op.o out of the archive, so
+// __real__Znwj resolved to 0 and every operator new threw bad_alloc before main() ("Abort called").
+// Only the 32-bit (unsigned int) forms exist on this target; _Znwm/_Znam are not wrapped.
+void* __real__Znwj(size_t);
+void* __real__Znaj(size_t);
 }
 
 // This tracker is intentionally independent of the watchdog's C++/socket path.  The wrapped
@@ -159,8 +160,6 @@ void* __wrap_realloc(void*, size_t);
 void* __wrap_memalign(size_t, size_t);
 int __wrap_posix_memalign(void**, size_t, size_t);
 void* __wrap_aligned_alloc(size_t, size_t);
-void* __wrap__Znwm(size_t);
-void* __wrap__Znam(size_t);
 void* __wrap__Znwj(size_t);
 void* __wrap__Znaj(size_t);
 }
@@ -195,8 +194,6 @@ static bool LeakIsWrapperFrame(uint32_t address) {
            address == (uint32_t)(uintptr_t)&__wrap_memalign ||
            address == (uint32_t)(uintptr_t)&__wrap_posix_memalign ||
            address == (uint32_t)(uintptr_t)&__wrap_aligned_alloc ||
-           address == (uint32_t)(uintptr_t)&__wrap__Znwm ||
-           address == (uint32_t)(uintptr_t)&__wrap__Znam ||
            address == (uint32_t)(uintptr_t)&__wrap__Znwj ||
            address == (uint32_t)(uintptr_t)&__wrap__Znaj;
 }
@@ -639,8 +636,10 @@ void __wrap_free(void* pointer) {
         __real_free(pointer);
         return;
     }
-    __real_free(pointer);
+    // Forget first: once freed, another thread can be handed this address and record it,
+    // and a late forget would then delete the new record.
     LeakForget((uintptr_t)pointer);
+    __real_free(pointer);
     __sync_lock_release(&state->reentrant);
 }
 
@@ -770,64 +769,12 @@ void* __wrap_aligned_alloc(size_t alignment, size_t size) {
     return result;
 }
 
-void* __wrap__Znwm(size_t size) {
-    LeakThreadState* state = LeakCurrentThreadState();
-    uint32_t key[3];
-    LeakCaptureKey(key, false);
-    if (__real__Znwm == nullptr) {
-        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
-        throw std::bad_alloc();
-    }
-    ++state->newDepth;
-    void* result;
-    try {
-        result = __real__Znwm(size);
-    } catch (const std::bad_alloc&) {
-        --state->newDepth;
-        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
-        throw;
-    }
-    --state->newDepth;
-    if (result == nullptr) {
-        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
-        throw std::bad_alloc();
-    }
-    return result;
-}
 
-void* __wrap__Znam(size_t size) {
-    LeakThreadState* state = LeakCurrentThreadState();
-    uint32_t key[3];
-    LeakCaptureKey(key, false);
-    if (__real__Znam == nullptr) {
-        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
-        throw std::bad_alloc();
-    }
-    ++state->newDepth;
-    void* result;
-    try {
-        result = __real__Znam(size);
-    } catch (const std::bad_alloc&) {
-        --state->newDepth;
-        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
-        throw;
-    }
-    --state->newDepth;
-    if (result == nullptr) {
-        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
-        throw std::bad_alloc();
-    }
-    return result;
-}
 
 void* __wrap__Znwj(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     uint32_t key[3];
     LeakCaptureKey(key, false);
-    if (__real__Znwj == nullptr) {
-        LeakEmitAllocFailureIfUnreentrant(state, "new", size, 0, key);
-        throw std::bad_alloc();
-    }
     ++state->newDepth;
     void* result;
     try {
@@ -849,10 +796,6 @@ void* __wrap__Znaj(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     uint32_t key[3];
     LeakCaptureKey(key, false);
-    if (__real__Znaj == nullptr) {
-        LeakEmitAllocFailureIfUnreentrant(state, "new[]", size, 0, key);
-        throw std::bad_alloc();
-    }
     ++state->newDepth;
     void* result;
     try {
