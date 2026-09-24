@@ -433,8 +433,15 @@ static bool LeakTablesReady() {
     return true;
 }
 
+// SoH holds more than 262144 live allocations, which filled the table in soh923m4. Every block of
+// 64 KB or more is tracked; smaller ones are sampled 1-in-16 by address, so a free always looks up
+// the same decision. Small-block LEAK bytes/counts are therefore 1/16 of the real figures.
+static bool LeakSampled(uintptr_t address, uint64_t bytes) {
+    return bytes >= 65536u || (LeakAddressHash(address) & 15u) == 0u;
+}
+
 static void LeakRecord(uintptr_t address, uint64_t bytes, const uint32_t key[3]) {
-    if (address == 0 || !LeakTablesReady()) {
+    if (address == 0 || !LeakSampled(address, bytes) || !LeakTablesReady()) {
         return;
     }
     LeakLock();
@@ -460,7 +467,7 @@ static void LeakReplace(uintptr_t oldAddress, uintptr_t newAddress, uint64_t byt
     if (removeOld) {
         LeakRemoveLocked(oldAddress);
     }
-    if (newAddress != 0) {
+    if (newAddress != 0 && LeakSampled(newAddress, bytes)) {
         LeakAddLocked(newAddress, bytes, key);
     }
     LeakUnlock();
@@ -563,7 +570,7 @@ static void LeakEmitReport() {
             churnTop[index].key[1], churnTop[index].key[2], (unsigned long long)churnTop[index].bytes,
             churnTop[index].count, (unsigned long long)churnTop[index].min, (unsigned long long)churnTop[index].max);
     }
-    Ship::WiiU::Watchdog::Emit("LEAK: tracked=%u dropped=%u\n", tracked, dropped);
+    Ship::WiiU::Watchdog::Emit("LEAK: tracked=%u dropped=%u sample=1/16 below 64KB\n", tracked, dropped);
 }
 
 static uint64_t LeakProbeLargest() {
