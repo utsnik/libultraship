@@ -450,6 +450,11 @@ volatile uint32_t gOtrCacheHits = 0;
 volatile uint32_t gOtrCacheMisses = 0;
 volatile uint32_t gOtrResourceManagerLookups = 0;
 volatile uint32_t gDrawBufferHighWaterBytes = 0;
+volatile uint32_t gGx2SlotWaits = 0;
+volatile uint32_t gFrameTimingCount = 0;
+volatile uint32_t gFrameTimingGpuUs = 0;
+volatile uint32_t gFrameTimingCpuUs = 0;
+volatile uint32_t gFrameTimingWaitUs = 0;
 // Keep the periodic watchdog and explicitly requested diagnostics, but do not stream every
 // watchdog Enter/Leave pair from the GX2 hot path.
 volatile uint32_t gEventStream = 0;
@@ -461,6 +466,22 @@ volatile uint32_t gEmitFail = 0;
 // sessions. This is the workstation running wiiu/udplog.py; udplog.py binds 0.0.0.0 so it
 // receives unicast without any change. If the listener moves, this constant moves with it.
 static const uint32_t kLogHostAddr = 0x0A0104ABu; // 10.1.4.171
+
+void RecordGX2Wait(uint32_t microseconds) {
+    __sync_fetch_and_add(&gFrameTimingWaitUs, microseconds);
+}
+
+void RecordGX2SlotWait(uint32_t microseconds) {
+    __sync_fetch_and_add(&gGx2SlotWaits, 1);
+    RecordGX2Wait(microseconds);
+}
+
+void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds) {
+    __sync_fetch_and_add(&gFrameTimingGpuUs, gpuMicroseconds);
+    __sync_fetch_and_add(&gFrameTimingCpuUs, cpuMicroseconds);
+    __sync_synchronize();
+    __sync_fetch_and_add(&gFrameTimingCount, 1);
+}
 
 static OSThread sThread;
 // 32 KB, statically reserved. The watchdog must survive a stall inside the allocator,
@@ -490,6 +511,8 @@ static const char* PhaseName(uint32_t phase) {
             return "end-frame";
         case PH_GX2_DRAW_DONE:
             return "gx2-draw-done";
+        case PH_GX2_SLOT_WAIT:
+            return "gx2-slot-wait";
         case PH_GX2_SET_PIXEL_TEXTURE:
             return "gx2-set-pixel-texture";
         case PH_GX2_DRAW_TRIANGLES:
@@ -672,10 +695,20 @@ static int Main(int, const char**) {
             // ExpHeap" assumption is WRONG and the field is dropped rather than left lying.
             // texCount/texBytes/lastTexPtr are our own counters and are kept.
             (void)mem2;
+            const uint32_t timingFrames = __sync_lock_test_and_set(&gFrameTimingCount, 0);
+            const uint32_t timingGpuUs = __sync_lock_test_and_set(&gFrameTimingGpuUs, 0);
+            const uint32_t timingCpuUs = __sync_lock_test_and_set(&gFrameTimingCpuUs, 0);
+            const uint32_t timingWaitUs = __sync_lock_test_and_set(&gFrameTimingWaitUs, 0);
+            const uint32_t slotWaits = __sync_lock_test_and_set(&gGx2SlotWaits, 0);
+            const uint32_t gpuAvgUs = timingFrames ? timingGpuUs / timingFrames : 0;
+            const uint32_t cpuAvgUs = timingFrames ? timingCpuUs / timingFrames : 0;
+            const uint32_t waitAvgUs = timingFrames ? timingWaitUs / timingFrames : 0;
             Emit("WDOG: mem texCount=%u texBytes=%u lastTexPtr=0x%08X audioSeq=%u audioPhase=%u flips=%u "
-                 "emitOk=%u emitFail=%u otrHit=%u otrMiss=%u rmLookup=%u drawHwm=%u\n",
+                 "emitOk=%u emitFail=%u otrHit=%u otrMiss=%u rmLookup=%u drawHwm=%u frames=%u gpuUs=%u cpuUs=%u "
+                 "waitUs=%u slotWaits=%u\n",
                  gTexCount, gTexBytes, gLastTexPtr, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail,
-                 gOtrCacheHits, gOtrCacheMisses, gOtrResourceManagerLookups, gDrawBufferHighWaterBytes);
+                 gOtrCacheHits, gOtrCacheMisses, gOtrResourceManagerLookups, gDrawBufferHighWaterBytes, timingFrames,
+                 gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits);
         }
 
         OSSleepTicks(OSMillisecondsToTicks(WDOG_TICK_INTERVAL_MS));

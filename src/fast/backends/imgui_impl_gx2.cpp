@@ -10,9 +10,12 @@
 #include <whb/gfx.h>
 #include <gx2/registers.h>
 #include <gx2/draw.h>
+#include <gx2/event.h>
+#include <gx2/state.h>
 #include <gx2/utils.h>
 #include <gx2/mem.h>
 #include <gx2r/surface.h>
+#include <coreinit/time.h>
 
 #include "port/wiiu/WiiUWatchdog.h"
 #include "fast/backends/gfx_wiiu.h"
@@ -20,13 +23,20 @@
 // Include shader data
 #include "shaders/shader.h"
 
-// GX2 Data
-struct ImGui_ImplGX2_Data
+struct ImGui_ImplGX2_BufferSlot
 {
     uint32_t VertexBufferSize;
     void* VertexBuffer;
     uint32_t IndexBufferSize;
     void* IndexBuffer;
+    OSTime SubmittedTimestamp;
+};
+
+// GX2 Data
+struct ImGui_ImplGX2_Data
+{
+    ImGui_ImplGX2_BufferSlot BufferSlots[2];
+    uint32_t CurrentBufferSlot;
 
     ImGui_ImplGX2_Texture* FontTexture;
 
@@ -39,6 +49,37 @@ struct ImGui_ImplGX2_Data
 static ImGui_ImplGX2_Data* ImGui_ImplGX2_GetBackendData()
 {
     return ImGui::GetCurrentContext() ? (ImGui_ImplGX2_Data*)ImGui::GetIO().BackendRendererUserData : NULL;
+}
+
+static uint32_t ImGui_ImplGX2_ElapsedMicroseconds(OSTime start, OSTime end)
+{
+    if (end <= start)
+        return 0;
+    const uint64_t microseconds = OSTicksToMicroseconds(end - start);
+    return microseconds > UINT32_MAX ? UINT32_MAX : (uint32_t)microseconds;
+}
+
+static void ImGui_ImplGX2_DrawDone(const char* detail)
+{
+    const OSTime start = OSGetSystemTime();
+    {
+        WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_DRAW_DONE, detail);
+        GX2DrawDone();
+    }
+    Ship::WiiU::Watchdog::RecordGX2Wait(ImGui_ImplGX2_ElapsedMicroseconds(start, OSGetSystemTime()));
+}
+
+static void ImGui_ImplGX2_WaitForBufferSlot(ImGui_ImplGX2_BufferSlot& slot)
+{
+    if (slot.SubmittedTimestamp == 0 || slot.SubmittedTimestamp <= GX2GetRetiredTimeStamp())
+        return;
+
+    const OSTime start = OSGetSystemTime();
+    {
+        WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_SLOT_WAIT, "gx2-slot-wait");
+        GX2WaitTimeStamp(slot.SubmittedTimestamp);
+    }
+    Ship::WiiU::Watchdog::RecordGX2SlotWait(ImGui_ImplGX2_ElapsedMicroseconds(start, OSGetSystemTime()));
 }
 
 // Functions
@@ -142,6 +183,9 @@ void    ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
 
     ImGui_ImplGX2_Data* bd = ImGui_ImplGX2_GetBackendData();
 
+    ImGui_ImplGX2_BufferSlot& slot = bd->BufferSlots[bd->CurrentBufferSlot];
+    ImGui_ImplGX2_WaitForBufferSlot(slot);
+
     ImGui_ImplGX2_SetupRenderState(draw_data, fb_width, fb_height);
 
     // Will project scissor/clipping rectangles into framebuffer space
@@ -153,22 +197,34 @@ void    ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
     uint32_t idx_buffer_size = (uint32_t)draw_data->TotalIdxCount * (int)sizeof(ImDrawIdx);
 
     // Grow buffers if needed
-    if (bd->VertexBufferSize < vtx_buffer_size)
+    if (slot.VertexBufferSize < vtx_buffer_size)
     {
-        bd->VertexBufferSize = vtx_buffer_size;
-        free(bd->VertexBuffer);
-        bd->VertexBuffer = memalign(GX2_VERTEX_BUFFER_ALIGNMENT, vtx_buffer_size);
+        void* vertex_buffer = memalign(GX2_VERTEX_BUFFER_ALIGNMENT, vtx_buffer_size);
+        if (!vertex_buffer)
+        {
+            SPDLOG_ERROR("ImGui_ImplGX2_RenderDrawData: vertex buffer allocation failed for {} bytes", vtx_buffer_size);
+            return;
+        }
+        free(slot.VertexBuffer);
+        slot.VertexBufferSize = vtx_buffer_size;
+        slot.VertexBuffer = vertex_buffer;
     }
-    if (bd->IndexBufferSize < idx_buffer_size)
+    if (slot.IndexBufferSize < idx_buffer_size)
     {
-        bd->IndexBufferSize = idx_buffer_size;
-        free(bd->IndexBuffer);
-        bd->IndexBuffer = memalign(GX2_INDEX_BUFFER_ALIGNMENT, idx_buffer_size);
+        void* index_buffer = memalign(GX2_INDEX_BUFFER_ALIGNMENT, idx_buffer_size);
+        if (!index_buffer)
+        {
+            SPDLOG_ERROR("ImGui_ImplGX2_RenderDrawData: index buffer allocation failed for {} bytes", idx_buffer_size);
+            return;
+        }
+        free(slot.IndexBuffer);
+        slot.IndexBufferSize = idx_buffer_size;
+        slot.IndexBuffer = index_buffer;
     }
 
     // Copy data into continuous buffers
-    uint8_t* vtx_dst = (uint8_t*)bd->VertexBuffer;
-    uint8_t* idx_dst = (uint8_t*)bd->IndexBuffer;
+    uint8_t* vtx_dst = (uint8_t*)slot.VertexBuffer;
+    uint8_t* idx_dst = (uint8_t*)slot.IndexBuffer;
     for (int n = 0; n < draw_data->CmdListsCount; n++)
     {
         const ImDrawList* cmd_list = draw_data->CmdLists[n];
@@ -181,10 +237,10 @@ void    ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
     }
 
     // Flush memory
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, bd->VertexBuffer, vtx_buffer_size);
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU, bd->IndexBuffer, idx_buffer_size);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, slot.VertexBuffer, vtx_buffer_size);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU, slot.IndexBuffer, idx_buffer_size);
 
-    GX2SetAttribBuffer(0, vtx_buffer_size, sizeof(ImDrawVert), bd->VertexBuffer);
+    GX2SetAttribBuffer(0, vtx_buffer_size, sizeof(ImDrawVert), slot.VertexBuffer);
 
     // Render command lists
     // (Because we merged all buffers into a single one, we maintain our own offset into them)
@@ -230,13 +286,18 @@ void    ImGui_ImplGX2_RenderDrawData(ImDrawData* draw_data)
 
                 GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pcmd->ElemCount,
                     sizeof(ImDrawIdx) == 2 ? GX2_INDEX_TYPE_U16 : GX2_INDEX_TYPE_U32,
-                    (uint8_t*) bd->IndexBuffer + (pcmd->IdxOffset + global_idx_offset) * sizeof(ImDrawIdx),
+                    (uint8_t*) slot.IndexBuffer + (pcmd->IdxOffset + global_idx_offset) * sizeof(ImDrawIdx),
                     global_vtx_offset + pcmd->VtxOffset, 1);
             }
         }
         global_idx_offset += cmd_list->IdxBuffer.Size;
         global_vtx_offset += cmd_list->VtxBuffer.Size;
     }
+
+    // The slot is not reusable until every command above has retired.
+    GX2Flush();
+    slot.SubmittedTimestamp = GX2GetLastSubmittedTimeStamp();
+    bd->CurrentBufferSlot = (bd->CurrentBufferSlot + 1) % 2;
 }
 
 bool ImGui_ImplGX2_CreateFontsTexture()
@@ -406,11 +467,17 @@ void    ImGui_ImplGX2_DestroyDeviceObjects()
     if (!bd)
         return;
 
-    free(bd->VertexBuffer);
-    bd->VertexBuffer = NULL;
+    if (!gfx_wiiu_gx2_is_down())
+        ImGui_ImplGX2_DrawDone("shader destruction");
 
-    free(bd->IndexBuffer);
-    bd->IndexBuffer = NULL;
+    for (ImGui_ImplGX2_BufferSlot& slot : bd->BufferSlots)
+    {
+        free(slot.VertexBuffer);
+        slot.VertexBuffer = NULL;
+        free(slot.IndexBuffer);
+        slot.IndexBuffer = NULL;
+        slot.SubmittedTimestamp = 0;
+    }
 
     if (gfx_wiiu_gx2_is_down())
         WDOG_EMIT("IMGUI: skipping WHBGfxFreeShaderGroup after GX2 shutdown\n");

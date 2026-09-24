@@ -672,7 +672,11 @@ static bool gfx_wiiu_start_frame(void) {
         wait_count++;
         // Blocks on the GPU's vsync interrupt. If the display pipeline stops, this never
         // returns - which is one way the main thread could stop without any CPU fault.
+        const OSTime wait_start = OSGetSystemTime();
         GX2WaitForVsync();
+        const uint64_t wait_microseconds = OSTicksToMicroseconds(OSGetSystemTime() - wait_start);
+        Ship::WiiU::Watchdog::RecordGX2Wait(wait_microseconds > UINT32_MAX ? UINT32_MAX
+                                                                          : (uint32_t)wait_microseconds);
     }
 
     return true;

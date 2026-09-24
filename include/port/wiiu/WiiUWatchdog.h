@@ -32,6 +32,7 @@ enum Phase : uint32_t {
     PH_FLUSH,        // Interpreter Flush()
     PH_ENDFRAME,     // Interpreter EndFrame()
     PH_GX2_DRAW_DONE, // GX2DrawDone() serialisation
+    PH_GX2_SLOT_WAIT, // waiting for a reusable double-buffered GX2 slot
     PH_GX2_SET_PIXEL_TEXTURE, // GX2SetPixelTexture()
     PH_GX2_DRAW_TRIANGLES,    // backend triangle draw submission
     PH_GX2_GENERATE_SHADER,   // gx2GenerateShaderGroup()
@@ -125,6 +126,17 @@ extern volatile uint32_t gOtrCacheHits;
 extern volatile uint32_t gOtrCacheMisses;
 extern volatile uint32_t gOtrResourceManagerLookups;
 extern volatile uint32_t gDrawBufferHighWaterBytes;
+extern volatile uint32_t gGx2SlotWaits;
+extern volatile uint32_t gFrameTimingCount;
+extern volatile uint32_t gFrameTimingGpuUs;
+extern volatile uint32_t gFrameTimingCpuUs;
+extern volatile uint32_t gFrameTimingWaitUs;
+
+// Updated by the graphics thread and sampled/reset atomically by the watchdog
+// thread at each periodic mem line.
+void RecordGX2Wait(uint32_t microseconds);
+void RecordGX2SlotWait(uint32_t microseconds);
+void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds);
 
 // Raw UDP diagnostic output shared with GX2 callbacks. This must remain allocation-free.
 void Emit(const char* fmt, ...);

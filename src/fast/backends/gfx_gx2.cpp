@@ -45,6 +45,15 @@
 
 #include "fast/backends/imgui_impl_gx2.h"
 
+// WUT exports these GX2 GPU-cycle imports, but the installed event header does
+// not declare them. Their ABI is the Cafe OS pointer form used by the GX2
+// imports: the GPU writes a 64-bit cycle sample into the supplied address.
+extern "C" {
+void GX2SampleTopGPUCycle(uint64_t* result);
+void GX2SampleBottomGPUCycle(uint64_t* result);
+uint64_t GX2GPUTimeToCPUTime(uint64_t gpuTime);
+}
+
 // The whole translation unit lives in namespace Fast: the ported GPU7 code uses
 // FilteringMode, GfxClipParameters and ShaderProgram, all of which libultraship
 // moved into that namespace.
@@ -109,9 +118,22 @@ static int current_tile;
 
 // 96 Mb (should be more than enough to draw everything without waiting for the GPU)
 #define DRAW_BUFFER_SIZE 0x6000000
+struct DrawBufferSlot {
+    uint8_t* buffer = nullptr;
+    OSTime submitted_timestamp = 0;
+    uint64_t gpu_top_cycle = 0;
+    uint64_t gpu_bottom_cycle = 0;
+    uint32_t cpu_microseconds = 0;
+    bool gpu_timing_pending = false;
+};
+
+static DrawBufferSlot draw_buffer_slots[2];
+static uint32_t draw_buffer_slot_index = 0;
+static bool draw_buffer_double_buffered = false;
 static uint8_t* draw_buffer = nullptr;
 static uint8_t* draw_ptr = nullptr;
 static uint32_t draw_buffer_frame_high_water = 0;
+static OSTime frame_start_time = 0;
 
 static uint32_t frame_count;
 static bool gfx_gx2_trace_first_frame = true;
@@ -135,6 +157,72 @@ static uint32_t current_scissor_height = WIIU_DEFAULT_FB_HEIGHT;
 static bool current_zmode_decal = false;
 static bool current_SSDB = -2.0f;
 static bool current_use_alpha = false;
+
+static uint32_t gfx_gx2_elapsed_microseconds(OSTime start, OSTime end) {
+    if (end <= start) {
+        return 0;
+    }
+    const uint64_t microseconds = OSTicksToMicroseconds(end - start);
+    return microseconds > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(microseconds);
+}
+
+static void gfx_gx2_draw_done(const char* detail) {
+    const OSTime start = OSGetSystemTime();
+    {
+        WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_DRAW_DONE, detail);
+        GX2DrawDone();
+    }
+    Ship::WiiU::Watchdog::RecordGX2Wait(gfx_gx2_elapsed_microseconds(start, OSGetSystemTime()));
+}
+
+static void gfx_gx2_collect_gpu_timing(DrawBufferSlot& slot) {
+    if (!slot.gpu_timing_pending) {
+        return;
+    }
+
+    // The timestamp output is written by the GPU. This function is called only
+    // after the slot's submission timestamp has retired, so reading it cannot
+    // introduce a hidden synchronization point.
+    const uint64_t top_cpu_time = GX2GPUTimeToCPUTime(slot.gpu_top_cycle);
+    const uint64_t bottom_cpu_time = GX2GPUTimeToCPUTime(slot.gpu_bottom_cycle);
+    uint32_t gpu_microseconds = 0;
+    if (bottom_cpu_time > top_cpu_time) {
+        gpu_microseconds = gfx_gx2_elapsed_microseconds(top_cpu_time, bottom_cpu_time);
+    }
+    Ship::WiiU::Watchdog::RecordFrameTiming(gpu_microseconds, slot.cpu_microseconds);
+    slot.gpu_timing_pending = false;
+}
+
+static void gfx_gx2_wait_for_draw_buffer_slot(DrawBufferSlot& slot) {
+    if (slot.submitted_timestamp != 0) {
+        const OSTime retired_timestamp = GX2GetRetiredTimeStamp();
+        if (slot.submitted_timestamp > retired_timestamp) {
+            const OSTime start = OSGetSystemTime();
+            {
+                WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_SLOT_WAIT, "gx2-slot-wait");
+                GX2WaitTimeStamp(slot.submitted_timestamp);
+            }
+            Ship::WiiU::Watchdog::RecordGX2SlotWait(gfx_gx2_elapsed_microseconds(start, OSGetSystemTime()));
+        }
+    }
+
+    gfx_gx2_collect_gpu_timing(slot);
+}
+
+static void gfx_gx2_prepare_draw_buffer_slot() {
+    DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
+    if (draw_buffer_double_buffered) {
+        gfx_gx2_wait_for_draw_buffer_slot(slot);
+    }
+    draw_buffer = slot.buffer;
+    draw_ptr = draw_buffer;
+
+    slot.gpu_top_cycle = 0;
+    slot.gpu_bottom_cycle = 0;
+    slot.cpu_microseconds = 0;
+    slot.gpu_timing_pending = true;
+    GX2SampleTopGPUCycle(&slot.gpu_top_cycle);
+}
 
 static inline GX2SamplerVar* GX2GetPixelSamplerVar(const GX2PixelShader* shader, const char* name) {
     for (uint32_t i = 0; i < shader->samplerVarCount; ++i) {
@@ -351,6 +439,7 @@ static void gfx_gx2_delete_texture(uint32_t texture_id) {
     struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
 
     if (tex->texture.surface.image) {
+        gfx_gx2_draw_done("texture free");
         free(tex->texture.surface.image);
     }
 
@@ -432,7 +521,7 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
             // else while the GPU is still reading it, which wedges the GPU and
             // hard-freezes the console with no CPU-side error at all. The
             // framebuffer path already guards its frees this way.
-            GX2DrawDone();
+            gfx_gx2_draw_done("texture reallocation");
             free(tex->texture.surface.image);
             tex->texture.surface.image = nullptr;
         }
@@ -768,7 +857,7 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
 
     if (draw_ptr + vbo_len >= draw_buffer + DRAW_BUFFER_SIZE) {
         printf("Waiting on GPU!!!\n");
-        GX2DrawDone();
+        gfx_gx2_draw_done("draw-buffer arena exhaustion");
         draw_ptr = draw_buffer;
     }
 
@@ -881,14 +970,29 @@ static void gfx_gx2_init(void) {
 
     current_framebuffer = &main_framebuffer;
 
-    // allocate draw buffer
-    SPDLOG_INFO("gfx_gx2_init: draw-buffer allocation ... size=0x{:X}", DRAW_BUFFER_SIZE);
-    draw_buffer = (uint8_t*)memalign(GX2_VERTEX_BUFFER_ALIGNMENT, DRAW_BUFFER_SIZE);
-    SPDLOG_INFO("gfx_gx2_init: draw-buffer allocation returned ptr={}", static_cast<const void*>(draw_buffer));
-    if (!draw_buffer) {
+    // Allocate two frame arenas so the CPU can prepare the next frame while
+    // the GPU consumes the previous one. The second allocation is optional:
+    // retain the proven single-arena/DrawDone path if MEM2 cannot provide it.
+    SPDLOG_INFO("gfx_gx2_init: draw-buffer allocation ... size=0x{:X} per slot", DRAW_BUFFER_SIZE);
+    draw_buffer_slots[0].buffer = (uint8_t*)memalign(GX2_VERTEX_BUFFER_ALIGNMENT, DRAW_BUFFER_SIZE);
+    SPDLOG_INFO("gfx_gx2_init: draw-buffer slot 0 returned ptr={}",
+                static_cast<const void*>(draw_buffer_slots[0].buffer));
+    if (!draw_buffer_slots[0].buffer) {
         SPDLOG_ERROR("gfx_gx2: failed to allocate draw buffer");
         return;
     }
+
+    draw_buffer_slots[1].buffer = (uint8_t*)memalign(GX2_VERTEX_BUFFER_ALIGNMENT, DRAW_BUFFER_SIZE);
+    SPDLOG_INFO("gfx_gx2_init: draw-buffer slot 1 returned ptr={}",
+                static_cast<const void*>(draw_buffer_slots[1].buffer));
+    if (!draw_buffer_slots[1].buffer) {
+        SPDLOG_ERROR("gfx_gx2: second draw-buffer slot allocation failed; using single arena with per-frame GX2DrawDone");
+        draw_buffer_double_buffered = false;
+    } else {
+        draw_buffer_double_buffered = true;
+    }
+    draw_buffer_slot_index = 0;
+    draw_buffer = draw_buffer_slots[0].buffer;
     draw_ptr = draw_buffer;
 
     SPDLOG_INFO("gfx_gx2_init: GX2SetRasterizerClipControl ...");
@@ -916,7 +1020,7 @@ void gfx_gx2_shutdown(void) {
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown enter\n");
 
     if (has_foreground) {
-        GX2DrawDone();
+        gfx_gx2_draw_done("shutdown");
 
         if (depthReadBuffer.surface.image) {
             gfx_wiiu_free_mem1(depthReadBuffer.surface.image);
@@ -934,11 +1038,18 @@ void gfx_gx2_shutdown(void) {
         }
     }
 
-    if (draw_buffer) {
-        free(draw_buffer);
-        draw_buffer = nullptr;
-        draw_ptr = nullptr;
+    for (DrawBufferSlot& slot : draw_buffer_slots) {
+        if (slot.buffer) {
+            free(slot.buffer);
+            slot.buffer = nullptr;
+        }
+        slot.submitted_timestamp = 0;
+        slot.gpu_timing_pending = false;
     }
+    draw_buffer_double_buffered = false;
+    draw_buffer_slot_index = 0;
+    draw_buffer = nullptr;
+    draw_ptr = nullptr;
 
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown exit\n");
 }
@@ -948,6 +1059,8 @@ static void gfx_gx2_on_resize(void) {
 
 static void gfx_gx2_start_frame(void) {
     const bool trace = gfx_gx2_trace_first_frame;
+    frame_start_time = OSGetSystemTime();
+    gfx_gx2_prepare_draw_buffer_slot();
     draw_buffer_frame_high_water = 0;
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame state setup begin");
@@ -1009,12 +1122,29 @@ static void gfx_gx2_start_frame(void) {
 
 static void gfx_gx2_end_frame(void) {
     const bool trace = gfx_gx2_trace_first_frame;
+    DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
     Ship::WiiU::Watchdog::gDrawBufferHighWaterBytes = draw_buffer_frame_high_water;
-    draw_ptr = draw_buffer;
 
-    {
-        WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_DRAW_DONE, "GX2DrawDone");
-        GX2DrawDone();
+    // Close the GPU-side timing interval and submit the command buffer. The
+    // submitted timestamp is the fence for both the draw arena and its timing
+    // samples; neither is read until this timestamp has retired.
+    GX2SampleBottomGPUCycle(&slot.gpu_bottom_cycle);
+    GX2Flush();
+    const OSTime submit_time = OSGetSystemTime();
+    slot.cpu_microseconds = gfx_gx2_elapsed_microseconds(frame_start_time, submit_time);
+    slot.submitted_timestamp = GX2GetLastSubmittedTimeStamp();
+
+    if (draw_buffer_double_buffered) {
+        draw_buffer_slot_index = (draw_buffer_slot_index + 1) % 2;
+        draw_buffer = draw_buffer_slots[draw_buffer_slot_index].buffer;
+        draw_ptr = draw_buffer;
+    } else {
+        // Allocation failure at init deliberately preserves the old behavior:
+        // the single arena is serialized once per frame.
+        gfx_gx2_draw_done("GX2DrawDone");
+        gfx_gx2_collect_gpu_timing(slot);
+        slot.submitted_timestamp = 0;
+        draw_ptr = draw_buffer;
     }
 
     if (trace) {
@@ -1080,7 +1210,7 @@ static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32
     }
 
     // make sure the GPU no longer writes to the buffer
-    GX2DrawDone();
+    gfx_gx2_draw_done("framebuffer resize");
 
     if (buffer->texture.surface.image) {
         if (buffer->colorBufferMem1) {
@@ -1356,7 +1486,7 @@ gfx_gx2_get_pixel_depth(int fb_id, const std::set<std::pair<float, float>>& coor
                          dstPoints);
 
         // Wait for draws to be done and restore context, in case GPU was used
-        GX2DrawDone();
+        gfx_gx2_draw_done("depth readback");
         gfx_wiiu_set_context_state();
 
         // read the pixels from the depthReadBuffer
@@ -1441,6 +1571,9 @@ void GfxRenderingAPIGX2::ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, b
 void GfxRenderingAPIGX2::ClearShaderCache() {
     // New in the modern interface. Free every generated GX2 shader group and drop
     // the pool; the next draw regenerates on demand via CreateAndLoadNewShader.
+    if (!shader_program_pool.empty() && !gfx_wiiu_gx2_is_down()) {
+        gfx_gx2_draw_done("shader destruction");
+    }
     for (auto& entry : shader_program_pool) {
         gx2FreeShaderGroup(&entry.second.group);
     }
