@@ -1,4 +1,5 @@
 #ifdef __WIIU__
+#include <malloc.h>
 #include "port/wiiu/WiiUImpl.h"
 
 #include <exception>
@@ -686,7 +687,7 @@ static int Main(int, const char**) {
         // MEM2 pressure, every 200th tick (~100 s) and on its own line. Deliberately NOT folded
         // into the alive/STALLED lines: Emit's buffer is 512 bytes and a long detail= path
         // would push these fields off the end of exactly the line we most need intact.
-        if ((tick++ % 200u) == 0u) {
+        if ((tick++ % 20u) == 0u) {
             const MEMHeapHandle mem2 = MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM2);
             // Cross-check: heapFree is a base-heap query whose heap type is assumed, so it is
             // unverified on first use. texBytes/texCount/lastPtr are our own counters and
@@ -703,12 +704,16 @@ static int Main(int, const char**) {
             const uint32_t gpuAvgUs = timingFrames ? timingGpuUs / timingFrames : 0;
             const uint32_t cpuAvgUs = timingFrames ? timingCpuUs / timingFrames : 0;
             const uint32_t waitAvgUs = timingFrames ? timingWaitUs / timingFrames : 0;
+            // newlib heap (what malloc/new actually use): arena = bytes obtained via sbrk,
+            // used = bytes in allocated chunks. Growth of "used" is the leak/pressure signal.
+            const struct mallinfo heapInfo = mallinfo();
             Emit("WDOG: mem texCount=%u texBytes=%u lastTexPtr=0x%08X audioSeq=%u audioPhase=%u flips=%u "
                  "emitOk=%u emitFail=%u otrHit=%u otrMiss=%u rmLookup=%u drawHwm=%u frames=%u gpuUs=%u cpuUs=%u "
-                 "waitUs=%u slotWaits=%u\n",
+                 "waitUs=%u slotWaits=%u heapArena=%u heapUsed=%u\n",
                  gTexCount, gTexBytes, gLastTexPtr, gAudioSeq, gAudioPhase, gFlipCount, gEmitOk, gEmitFail,
                  gOtrCacheHits, gOtrCacheMisses, gOtrResourceManagerLookups, gDrawBufferHighWaterBytes, timingFrames,
-                 gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits);
+                 gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits, (uint32_t)heapInfo.arena,
+                 (uint32_t)heapInfo.uordblks);
         }
 
         OSSleepTicks(OSMillisecondsToTicks(WDOG_TICK_INTERVAL_MS));
