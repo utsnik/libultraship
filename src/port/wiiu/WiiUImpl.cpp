@@ -1715,7 +1715,9 @@ static int Main(int, const char**) {
             //      stuck - but it costs one call to find out.
             // Nothing here allocates before the Emit: a held heap lock must not be what
             // stops the report.
-            if (!sRescueFired && (stalledTicks * WDOG_TICK_INTERVAL_MS) >= WDOG_STALL_RESCUE_MS) {
+            // Only after the first flip: boot is legitimately slow (40 s under the leak tracker) and
+            // an early rescue sent a healthy, still-loading soh923m3 back to the Menu.
+            if (!sRescueFired && gFlipCount > 0 && (stalledTicks * WDOG_TICK_INTERVAL_MS) >= WDOG_STALL_RESCUE_MS) {
                 sRescueFired = true;
                 Emit("WDOG: stalled %ums - watchdog thread IS alive; attempting SYSLaunchMenu\n",
                      stalledTicks * WDOG_TICK_INTERVAL_MS);
