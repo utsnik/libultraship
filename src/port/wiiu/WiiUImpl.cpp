@@ -462,6 +462,33 @@ volatile uint32_t gEventStream = 0;
 volatile uint32_t gEmitOk = 0;
 volatile uint32_t gEmitFail = 0;
 
+// The profiler is deliberately a small, allocation-free open-addressed table. The watchdog
+// samples the render thread while it is suspended, then does all table work only after the
+// thread has been resumed.
+static const uint32_t kProfileTableSize = 1024;
+static const uint32_t kProfileTopPcCount = 24;
+static const uint32_t kProfileTopLrCount = 12;
+static const uint32_t kProfileEntriesPerLine = 6;
+static const uint32_t kProfileSampleIntervalMs = 10;
+static const uint32_t kProfileSamplesPerReport = 1000;
+static const uint32_t kProfileSamplesPerWatchdogTick = WDOG_TICK_INTERVAL_MS / kProfileSampleIntervalMs;
+
+struct ProfileBucket {
+    uint32_t address;
+    uint32_t count;
+};
+
+struct ProfileTop {
+    uint32_t address;
+    uint32_t count;
+};
+
+static ProfileBucket sPcProfile[kProfileTableSize];
+static ProfileBucket sLrProfile[kProfileTableSize];
+static ProfileTop sTopPcs[kProfileTopPcCount];
+static ProfileTop sTopLrs[kProfileTopLrCount];
+static uint32_t sProfileSampleCount = 0;
+
 // UNICAST, not broadcast. Broadcast is what died at 322 datagrams/second on 2026-09-13 and
 // took every diagnostic line with it, which then read as a PowerPC-wide wedge for two
 // sessions. This is the workstation running wiiu/udplog.py; udplog.py binds 0.0.0.0 so it
@@ -485,6 +512,7 @@ void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds) {
 }
 
 static OSThread sThread;
+static OSThread* sSampleThread = nullptr;
 // 32 KB, statically reserved. The watchdog must survive a stall inside the allocator,
 // so nothing here may touch the heap after Start() returns.
 static uint8_t sStack[32 * 1024] __attribute__((aligned(16)));
@@ -590,6 +618,112 @@ void Emit(const char* fmt, ...) {
     }
 }
 
+static uint32_t ProfileHash(uint32_t address) {
+    return ((address >> 4) ^ (address >> 12) ^ (address >> 20)) & (kProfileTableSize - 1);
+}
+
+static void ProfileAdd(ProfileBucket* table, uint32_t address) {
+    if (address == 0) {
+        return;
+    }
+
+    const uint32_t start = ProfileHash(address);
+    for (uint32_t probe = 0; probe < kProfileTableSize; ++probe) {
+        ProfileBucket* bucket = &table[(start + probe) & (kProfileTableSize - 1)];
+        if (bucket->address == address) {
+            ++bucket->count;
+            return;
+        }
+        if (bucket->address == 0) {
+            bucket->address = address;
+            bucket->count = 1;
+            return;
+        }
+    }
+}
+
+static void ProfileSelectTop(const ProfileBucket* table, ProfileTop* top, uint32_t topCount) {
+    memset(top, 0, sizeof(ProfileTop) * topCount);
+
+    for (uint32_t bucketIndex = 0; bucketIndex < kProfileTableSize; ++bucketIndex) {
+        const ProfileBucket& bucket = table[bucketIndex];
+        if (bucket.address == 0 || bucket.count == 0) {
+            continue;
+        }
+
+        uint32_t insertAt = topCount;
+        for (uint32_t topIndex = 0; topIndex < topCount; ++topIndex) {
+            if (bucket.count > top[topIndex].count) {
+                insertAt = topIndex;
+                break;
+            }
+        }
+        if (insertAt == topCount) {
+            continue;
+        }
+
+        for (uint32_t topIndex = topCount - 1; topIndex > insertAt; --topIndex) {
+            top[topIndex] = top[topIndex - 1];
+        }
+        top[insertAt].address = bucket.address;
+        top[insertAt].count = bucket.count;
+    }
+}
+
+static void EmitProfileTop(const char* kind, const ProfileTop* top, uint32_t topCount) {
+    uint32_t first = 0;
+    while (first < topCount && top[first].count != 0) {
+        char line[384];
+        int length = snprintf(line, sizeof(line), "PROF: %s=", kind);
+        if (length < 0 || (size_t)length >= sizeof(line)) {
+            return;
+        }
+
+        uint32_t emitted = 0;
+        while (first < topCount && emitted < kProfileEntriesPerLine && top[first].count != 0) {
+            const int written = snprintf(line + length, sizeof(line) - (size_t)length, "%s0x%08X:%u",
+                                         emitted == 0 ? "" : " ", top[first].address, top[first].count);
+            if (written < 0 || (size_t)written >= sizeof(line) - (size_t)length) {
+                return;
+            }
+            length += written;
+            ++first;
+            ++emitted;
+        }
+        Emit("%s\n", line);
+    }
+}
+
+static void EmitProfileReport() {
+    ProfileSelectTop(sPcProfile, sTopPcs, kProfileTopPcCount);
+    ProfileSelectTop(sLrProfile, sTopLrs, kProfileTopLrCount);
+    EmitProfileTop("pc", sTopPcs, kProfileTopPcCount);
+    EmitProfileTop("lr", sTopLrs, kProfileTopLrCount);
+    Emit("PROF: samples=%u\n", sProfileSampleCount);
+
+    memset(sPcProfile, 0, sizeof(sPcProfile));
+    memset(sLrProfile, 0, sizeof(sLrProfile));
+    sProfileSampleCount = 0;
+}
+
+static void ProfileSample() {
+    if (sSampleThread == nullptr) {
+        return;
+    }
+
+    OSSuspendThread(sSampleThread);
+    const uint32_t pc = sSampleThread->context.srr0;
+    const uint32_t lr = sSampleThread->context.lr;
+    OSResumeThread(sSampleThread);
+
+    ProfileAdd(sPcProfile, pc);
+    ProfileAdd(sLrProfile, lr & ~0xFu);
+    ++sProfileSampleCount;
+    if (sProfileSampleCount >= kProfileSamplesPerReport) {
+        EmitProfileReport();
+    }
+}
+
 void TraceEvent(uint32_t phase, const char* event) {
     if (gTraceState != TRACE_ACTIVE && gEventStream == 0) {
         return;
@@ -639,8 +773,17 @@ static int Main(int, const char**) {
     uint32_t lastSeq = 0xFFFFFFFFu;
     uint32_t stalledTicks = 0;
     uint32_t tick = 0;
+    uint32_t samplesSinceWatchdogTick = 0;
 
     for (;;) {
+        ProfileSample();
+        ++samplesSinceWatchdogTick;
+        if (samplesSinceWatchdogTick < kProfileSamplesPerWatchdogTick) {
+            OSSleepTicks(OSMillisecondsToTicks(kProfileSampleIntervalMs));
+            continue;
+        }
+        samplesSinceWatchdogTick = 0;
+
         const uint32_t seq = gSeq;
         const uint32_t phase = gPhase;
         const uint32_t frame = gFrame;
@@ -716,7 +859,7 @@ static int Main(int, const char**) {
                  (uint32_t)heapInfo.uordblks);
         }
 
-        OSSleepTicks(OSMillisecondsToTicks(WDOG_TICK_INTERVAL_MS));
+        OSSleepTicks(OSMillisecondsToTicks(kProfileSampleIntervalMs));
     }
     return 0;
 }
@@ -741,6 +884,7 @@ void Start() {
         return;
     }
     sStarted = true;
+    sSampleThread = OSGetCurrentThread();
 
     // wut wants the socket library brought up before any BSD call. WHBLogUdpInit() has
     // already run by this point and does this for its own socket, but whether that init is

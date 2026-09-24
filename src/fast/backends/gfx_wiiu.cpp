@@ -653,7 +653,7 @@ static bool gfx_wiiu_start_frame(void) {
     while (true) {
         GX2GetSwapStatus(&swap_count, &flip_count, &last_flip, &last_vsync);
 
-        if (flip_count >= swap_count) {
+        if (swap_count - flip_count <= 1) {
             break;
         }
 
