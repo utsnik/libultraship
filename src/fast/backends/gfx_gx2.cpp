@@ -42,6 +42,7 @@
 
 #include <proc_ui/procui.h>
 #include <coreinit/memory.h>
+#include <coreinit/cache.h>
 
 #include "fast/backends/imgui_impl_gx2.h"
 
@@ -121,13 +122,17 @@ static int current_tile;
 struct DrawBufferSlot {
     uint8_t* buffer = nullptr;
     OSTime submitted_timestamp = 0;
-    uint64_t gpu_top_cycle = 0;
-    uint64_t gpu_bottom_cycle = 0;
     uint32_t cpu_microseconds = 0;
     bool gpu_timing_pending = false;
 };
 
 static DrawBufferSlot draw_buffer_slots[2];
+// GPU-written timestamp pair per slot ([0]=top, [1]=bottom), each on its own cache line so
+// CPU writebacks of neighbouring data can never clobber what the GPU wrote.
+alignas(64) static uint64_t gpu_timing_samples[2][8];
+static uint64_t* gfx_gx2_gpu_samples(DrawBufferSlot& slot) {
+    return gpu_timing_samples[&slot - draw_buffer_slots];
+}
 static uint32_t draw_buffer_slot_index = 0;
 static bool draw_buffer_double_buffered = false;
 static uint8_t* draw_buffer = nullptr;
@@ -183,8 +188,10 @@ static void gfx_gx2_collect_gpu_timing(DrawBufferSlot& slot) {
     // The timestamp output is written by the GPU. This function is called only
     // after the slot's submission timestamp has retired, so reading it cannot
     // introduce a hidden synchronization point.
-    const uint64_t top_cpu_time = GX2GPUTimeToCPUTime(slot.gpu_top_cycle);
-    const uint64_t bottom_cpu_time = GX2GPUTimeToCPUTime(slot.gpu_bottom_cycle);
+    uint64_t* samples = gfx_gx2_gpu_samples(slot);
+    DCInvalidateRange(samples, sizeof(gpu_timing_samples[0]));
+    const uint64_t top_cpu_time = GX2GPUTimeToCPUTime(samples[0]);
+    const uint64_t bottom_cpu_time = GX2GPUTimeToCPUTime(samples[1]);
     uint32_t gpu_microseconds = 0;
     if (bottom_cpu_time > top_cpu_time) {
         gpu_microseconds = gfx_gx2_elapsed_microseconds(top_cpu_time, bottom_cpu_time);
@@ -217,11 +224,13 @@ static void gfx_gx2_prepare_draw_buffer_slot() {
     draw_buffer = slot.buffer;
     draw_ptr = draw_buffer;
 
-    slot.gpu_top_cycle = 0;
-    slot.gpu_bottom_cycle = 0;
+    uint64_t* samples = gfx_gx2_gpu_samples(slot);
+    samples[0] = 0;
+    samples[1] = 0;
+    DCFlushRange(samples, sizeof(gpu_timing_samples[0]));
     slot.cpu_microseconds = 0;
     slot.gpu_timing_pending = true;
-    GX2SampleTopGPUCycle(&slot.gpu_top_cycle);
+    GX2SampleTopGPUCycle(&samples[0]);
 }
 
 static inline GX2SamplerVar* GX2GetPixelSamplerVar(const GX2PixelShader* shader, const char* name) {
@@ -1128,7 +1137,7 @@ static void gfx_gx2_end_frame(void) {
     // Close the GPU-side timing interval and submit the command buffer. The
     // submitted timestamp is the fence for both the draw arena and its timing
     // samples; neither is read until this timestamp has retired.
-    GX2SampleBottomGPUCycle(&slot.gpu_bottom_cycle);
+    GX2SampleBottomGPUCycle(&gfx_gx2_gpu_samples(slot)[1]);
     GX2Flush();
     const OSTime submit_time = OSGetSystemTime();
     slot.cpu_microseconds = gfx_gx2_elapsed_microseconds(frame_start_time, submit_time);
