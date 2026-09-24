@@ -963,7 +963,14 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
 
     size_t vbo_len = sizeof(float) * buf_vbo_len;
 
-    if (draw_ptr + vbo_len >= draw_buffer + DRAW_BUFFER_SIZE) {
+    if (vbo_len >= DRAW_BUFFER_SIZE) {
+        SPDLOG_ERROR("gfx_gx2: draw request of {} bytes exceeds the {}-byte arena", vbo_len,
+                     DRAW_BUFFER_SIZE);
+        return;
+    }
+
+    const size_t draw_buffer_used = static_cast<size_t>(draw_ptr - draw_buffer);
+    if (draw_buffer_used + vbo_len >= DRAW_BUFFER_SIZE) {
         SPDLOG_WARN("gfx_gx2: draw-buffer arena exhausted; serializing GPU for fallback");
         gfx_gx2_draw_done("draw-buffer arena exhaustion");
         draw_ptr = draw_buffer;
@@ -971,9 +978,9 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
 
     float* new_vbo = (float*)draw_ptr;
     draw_ptr += ALIGN(vbo_len, GX2_VERTEX_BUFFER_ALIGNMENT);
-    const uint32_t draw_buffer_used = static_cast<uint32_t>(draw_ptr - draw_buffer);
-    if (draw_buffer_used > draw_buffer_frame_high_water) {
-        draw_buffer_frame_high_water = draw_buffer_used;
+    const uint32_t draw_buffer_used_after = static_cast<uint32_t>(draw_ptr - draw_buffer);
+    if (draw_buffer_used_after > draw_buffer_frame_high_water) {
+        draw_buffer_frame_high_water = draw_buffer_used_after;
     }
 
     if (trace) {
@@ -1619,29 +1626,41 @@ gfx_gx2_get_pixel_depth(int fb_id, const std::set<std::pair<float, float>>& coor
         buffer = &main_framebuffer;
     }
 
-    // Poll only: never wait in the depth path. Retired slots update the cache;
-    // an in-flight result remains eligible on a later frame.
-    gfx_gx2_collect_retired_depth_readbacks();
-
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
     DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
+
+    if (coordinates.empty()) {
+        return res;
+    }
+
+    slot.depth_read_requests.clear();
     for (const auto& coordinate : coordinates) {
-        const auto cached = depth_readback_cache.find({ buffer, coordinate });
-        res.emplace(coordinate, cached == depth_readback_cache.end() ? 65532 : cached->second);
+        slot.depth_read_requests.push_back({ buffer, coordinate });
+    }
 
-        const auto already_queued = std::find_if(
-            slot.depth_read_requests.begin(), slot.depth_read_requests.end(),
-            [buffer, &coordinate](const DepthReadbackRequest& request) {
-                return request.framebuffer == buffer && request.coordinate == coordinate;
-            });
-        if (already_queued == slot.depth_read_requests.end()) {
-            slot.depth_read_requests.push_back({ buffer, coordinate });
+    gfx_gx2_enqueue_depth_readback(slot);
+    if (!slot.depth_readback_pending) {
+        for (const auto& coordinate : coordinates) {
+            res.emplace(coordinate, 65532);
         }
+        return res;
     }
 
-    if (slot.depth_read_requests.size() <= UINT32_MAX) {
-        gfx_gx2_resize_depth_readback(slot, static_cast<uint32_t>(slot.depth_read_requests.size()));
+    // Preserve the original synchronous depth-readback contract. The copy is
+    // queued above, and this wait makes the slot's CPU-visible results valid
+    // before returning to the interpreter.
+    gfx_gx2_draw_done("depth readback");
+    DCInvalidateRange(slot.depth_read_buffer.surface.image, slot.depth_read_buffer.surface.imageSize);
+    const uint32_t* depth_values = static_cast<const uint32_t*>(slot.depth_read_buffer.surface.image);
+    for (size_t i = 0; i < slot.depth_read_requests.size(); ++i) {
+        const uint32_t bits = __builtin_bswap32(depth_values[i]);
+        float depth;
+        memcpy(&depth, &bits, sizeof(depth));
+        res.emplace(slot.depth_read_requests[i].coordinate, static_cast<uint16_t>(depth * 65532.0f));
     }
+
+    slot.depth_readback_pending = false;
+    slot.depth_read_requests.clear();
 
     return res;
 }
