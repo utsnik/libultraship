@@ -52,7 +52,6 @@ void* _memalign_r(void*, size_t, size_t);
 void* _realloc_r(void*, void*, size_t);
 void* _calloc_r(void*, size_t, size_t);
 int _malloc_trim_r(void*, size_t);
-void* _Znwj(size_t);
 void* __real_malloc(size_t);
 void __real_free(void*);
 void* __real_calloc(size_t, size_t);
@@ -1733,18 +1732,19 @@ static void ProfileAddAllocatorRange(uintptr_t address, uint32_t size) {
 }
 
 static void ProfileInitAllocatorRanges() {
+    // --wrap=malloc etc. is on, so &malloc here would be __wrap_malloc: name the real ones.
     sAllocatorRangeCount = 0;
-    ProfileAddAllocatorRange((uintptr_t)&malloc, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&free, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&memalign, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&realloc, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&__real_malloc, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&__real_free, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&__real_memalign, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&__real_realloc, 0x80);
     ProfileAddAllocatorRange((uintptr_t)&_malloc_r, 0x910);
     ProfileAddAllocatorRange((uintptr_t)&_free_r, 0x330);
     ProfileAddAllocatorRange((uintptr_t)&_memalign_r, 0x1E0);
     ProfileAddAllocatorRange((uintptr_t)&_realloc_r, 0x640);
     ProfileAddAllocatorRange((uintptr_t)&_calloc_r, 0x100);
     ProfileAddAllocatorRange((uintptr_t)&_malloc_trim_r, 0x140);
-    ProfileAddAllocatorRange((uintptr_t)&_Znwj, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&__real__Znwj, 0x80);
     ProfileAddAllocatorRange((uintptr_t)&__wrap_malloc, 0x200);
     ProfileAddAllocatorRange((uintptr_t)&__wrap_free, 0x200);
     ProfileAddAllocatorRange((uintptr_t)&__wrap_memalign, 0x200);
