@@ -1432,6 +1432,8 @@ static ProfileBucket sGcProfile[2][kProfileTableSize];
 // running something else), the game thread is waiting. Its saved context is valid then, so
 // walking its own stack names the game function it is blocked under.
 static ProfileBucket sBkProfile[2][kProfileTableSize];
+// Interrupted OSThread pointers, validated only by their tag in the alarm callback.
+static ProfileBucket sThProfile[2][kProfileTableSize];
 static OSAlarm sProfileAlarm;
 static ProfileTop sTopPcs[kProfileTopPcCount];
 static ProfileTop sTopLrs[kProfileTopLrCount];
@@ -1647,6 +1649,30 @@ static void EmitProfileTop(const char* kind, const ProfileTop* top, uint32_t top
     }
 }
 
+static bool ProfileIsThread(uint32_t address) {
+    return address >= 0x10000000u && address < 0x50000000u && (address & 3u) == 0 &&
+           *(const volatile uint32_t*)(address + 0x320u) == OS_THREAD_TAG;
+}
+
+static void EmitProfileThreads(const ProfileTop* top, uint32_t topCount) {
+    for (uint32_t index = 0; index < topCount && top[index].count != 0; ++index) {
+        const uint32_t address = top[index].address;
+        const char* name = "<not-a-thread>";
+        uint32_t entry = 0;
+        int32_t priority = 0;
+        uint32_t affinity = 0;
+        if (ProfileIsThread(address)) {
+            const uint32_t nameAddress = *(const volatile uint32_t*)(address + 0x5C0u);
+            name = nameAddress != 0 ? (const char*)(uintptr_t)nameAddress : "<unnamed>";
+            entry = *(const volatile uint32_t*)(address + 0x39Cu);
+            priority = *(const volatile int32_t*)(address + 0x32Cu);
+            affinity = *(const volatile uint8_t*)(address + 0x325u);
+        }
+        Emit("PROF: thr=0x%08X:%u name=%s entry=0x%08X prio=%d aff=0x%X\n", address,
+             top[index].count, name, entry, priority, affinity);
+    }
+}
+
 static void EmitProfileReport() {
     const uint32_t done = sProfileActive;
     sProfileActive = done ^ 1u;
@@ -1660,12 +1686,15 @@ static void EmitProfileReport() {
     EmitProfileTop("gc", sTopPcs, kProfileTopPcCount);
     ProfileSelectTop(sBkProfile[done], sTopPcs, kProfileTopPcCount);
     EmitProfileTop("bk", sTopPcs, kProfileTopPcCount);
+    ProfileSelectTop(sThProfile[done], sTopPcs, kProfileTopPcCount);
+    EmitProfileThreads(sTopPcs, kProfileTopPcCount);
     Emit("PROF: samples=%u\n", sProfileCount[done]);
 
     memset(sPcProfile[done], 0, sizeof(sPcProfile[done]));
     memset(sLrProfile[done], 0, sizeof(sLrProfile[done]));
     memset(sGcProfile[done], 0, sizeof(sGcProfile[done]));
     memset(sBkProfile[done], 0, sizeof(sBkProfile[done]));
+    memset(sThProfile[done], 0, sizeof(sThProfile[done]));
     sProfileCount[done] = 0;
 }
 
@@ -1702,10 +1731,20 @@ static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp) {
 
 static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     (void)alarm;
+    const uint32_t set = sProfileActive;
+    uint32_t thread = 0xFFFFFFF1u;
+    if (context != nullptr) {
+        const uint32_t address = (uint32_t)(uintptr_t)context;
+        if (address >= 0x10000000u && address < 0x50000000u && (address & 3u) == 0 &&
+            *(const volatile uint32_t*)(address + 0x320u) == OS_THREAD_TAG) {
+            thread = address;
+        }
+    }
+    ProfileAdd(sThProfile[set], thread);
     if (context == nullptr) {
+        ++sProfileCount[set];
         return;
     }
-    const uint32_t set = sProfileActive;
     ProfileAdd(sPcProfile[set], context->srr0);
     ProfileAdd(sLrProfile[set], context->lr & ~0xFu);
     const uint32_t pc = context->srr0;
