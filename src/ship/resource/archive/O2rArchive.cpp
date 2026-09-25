@@ -2,10 +2,10 @@
 
 #include "ship/Context.h"
 #include "ship/window/Window.h"
-#include "port/wiiu/WiiUWatchdog.h"
 #include "spdlog/spdlog.h"
 
 #ifdef __WIIU__
+#include "port/wiiu/WiiUWatchdog.h"
 #include <coreinit/fastmutex.h>
 #include <coreinit/time.h>
 #include <cstdio>
@@ -86,7 +86,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         return nullptr;
     }
 
+#ifdef __WIIU__
     const OSTime locateStart = OSGetSystemTime();
+#endif
     auto zipEntryIndex = zip_name_locate(mZipArchive, filePath.c_str(), 0);
     if (zipEntryIndex < 0) {
         SPDLOG_TRACE("Failed to find file {} in zip archive  {}.", filePath, GetPath());
@@ -99,7 +101,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         SPDLOG_TRACE("Failed to get entry information for file {} in zip archive  {}.", filePath, GetPath());
         return nullptr;
     }
+#ifdef __WIIU__
     sO2rLocateMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - locateStart);
+#endif
 
     // Filesize 0, no logging needed
     if (zipEntryStat.size == 0) {
