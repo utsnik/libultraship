@@ -200,6 +200,7 @@ bool O2rArchive::Open() {
 
     mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipError);
     if (mZipArchive == nullptr) {
+        zip_source_free(source); // also closes archiveFile
         zip_error_fini(&zipError);
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;
