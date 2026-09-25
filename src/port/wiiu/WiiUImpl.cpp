@@ -46,12 +46,6 @@ void Emit(const char* fmt, ...);
 }
 
 extern "C" {
-void* _malloc_r(void*, size_t);
-void _free_r(void*, void*);
-void* _memalign_r(void*, size_t, size_t);
-void* _realloc_r(void*, void*, size_t);
-void* _calloc_r(void*, size_t, size_t);
-int _malloc_trim_r(void*, size_t);
 void* __real_malloc(size_t);
 void __real_free(void*);
 void* __real_calloc(size_t, size_t);
@@ -1731,26 +1725,47 @@ static void ProfileAddAllocatorRange(uintptr_t address, uint32_t size) {
     }
 }
 
+// Allocator entry points, named by asm label: in this TU their declarations overload in C++,
+// so &_malloc_r / &__wrap_malloc have no single type. Only the addresses are used (profiler ranges).
+extern "C" const char kProfSym_malloc_r[] __asm__("_malloc_r");
+extern "C" const char kProfSym_free_r[] __asm__("_free_r");
+extern "C" const char kProfSym_memalign_r[] __asm__("_memalign_r");
+extern "C" const char kProfSym_realloc_r[] __asm__("_realloc_r");
+extern "C" const char kProfSym_calloc_r[] __asm__("_calloc_r");
+extern "C" const char kProfSym_malloc_trim_r[] __asm__("_malloc_trim_r");
+
+extern "C" const char kProfSym__real_malloc[] __asm__("__real_malloc");
+extern "C" const char kProfSym__real_free[] __asm__("__real_free");
+extern "C" const char kProfSym__real_memalign[] __asm__("__real_memalign");
+extern "C" const char kProfSym__real_realloc[] __asm__("__real_realloc");
+extern "C" const char kProfSym__real__Znwj[] __asm__("__real__Znwj");
+extern "C" const char kProfSym__wrap_malloc[] __asm__("__wrap_malloc");
+extern "C" const char kProfSym__wrap_free[] __asm__("__wrap_free");
+extern "C" const char kProfSym__wrap_memalign[] __asm__("__wrap_memalign");
+extern "C" const char kProfSym__wrap_realloc[] __asm__("__wrap_realloc");
+extern "C" const char kProfSym__wrap_calloc[] __asm__("__wrap_calloc");
+extern "C" const char kProfSym__wrap__Znwj[] __asm__("__wrap__Znwj");
+
 static void ProfileInitAllocatorRanges() {
     // --wrap=malloc etc. is on, so &malloc here would be __wrap_malloc: name the real ones.
     sAllocatorRangeCount = 0;
-    ProfileAddAllocatorRange((uintptr_t)&__real_malloc, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&__real_free, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&__real_memalign, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&__real_realloc, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&_malloc_r, 0x910);
-    ProfileAddAllocatorRange((uintptr_t)&_free_r, 0x330);
-    ProfileAddAllocatorRange((uintptr_t)&_memalign_r, 0x1E0);
-    ProfileAddAllocatorRange((uintptr_t)&_realloc_r, 0x640);
-    ProfileAddAllocatorRange((uintptr_t)&_calloc_r, 0x100);
-    ProfileAddAllocatorRange((uintptr_t)&_malloc_trim_r, 0x140);
-    ProfileAddAllocatorRange((uintptr_t)&__real__Znwj, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)&__wrap_malloc, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)&__wrap_free, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)&__wrap_memalign, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)&__wrap_realloc, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)&__wrap_calloc, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)&__wrap__Znwj, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_malloc, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_free, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_memalign, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_realloc, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym_malloc_r, 0x910);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym_free_r, 0x330);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym_memalign_r, 0x1E0);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym_realloc_r, 0x640);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym_calloc_r, 0x100);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym_malloc_trim_r, 0x140);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__real__Znwj, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_malloc, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_free, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_memalign, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_realloc, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_calloc, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap__Znwj, 0x200);
 }
 
 static inline bool ProfileIsAllocator(uint32_t address) {
