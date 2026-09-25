@@ -27,6 +27,10 @@ class O2rArchive final : virtual public Archive {
     std::shared_ptr<File> LoadFile(const std::string& filePath);
     std::shared_ptr<File> LoadFile(uint64_t hash);
 
+#ifdef __WIIU__
+    static void GetStats(uint32_t& loads, uint64_t& compressedBytes, uint64_t& microseconds);
+#endif
+
   private:
     zip_t* mZipArchive;
 };

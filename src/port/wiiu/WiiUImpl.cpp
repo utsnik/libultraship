@@ -16,6 +16,7 @@
 
 #include <ship/window/Window.h>
 #include <ship/Context.h>
+#include <ship/resource/archive/O2rArchive.h>
 
 #include "port/wiiu/WiiUWatchdog.h"
 
@@ -2067,6 +2068,10 @@ static int Main(int, const char**) {
             // newlib heap (what malloc/new actually use): arena = bytes obtained via sbrk,
             // used = bytes in allocated chunks. Growth of "used" is the leak/pressure signal.
             const struct mallinfo heapInfo = mallinfo();
+            uint32_t o2rLoads = 0;
+            uint64_t o2rCompressedBytes = 0;
+            uint64_t o2rMicroseconds = 0;
+            O2rArchive::GetStats(o2rLoads, o2rCompressedBytes, o2rMicroseconds);
             // Two lines: with the live cache counters one line exceeded Emit's 512-byte buffer
             // and would have truncated heapUsed, the field that matters most.
             Emit("WDOG: mem texCount=%u texBytes=%u texLiveCount=%u texLiveBytes=%u lastTexPtr=0x%08X "
@@ -2077,10 +2082,11 @@ static int Main(int, const char**) {
                  gDrawBufferHighWaterBytes, timingFrames, gpuAvgUs, cpuAvgUs, waitAvgUs, slotWaits,
                  (uint32_t)heapInfo.arena, (uint32_t)heapInfo.uordblks);
             Emit("WDOG: caches texCache=%u freeTexIds=%u otrCache=%u rawPath=%u rawHash=%u resourceCache=%u "
-                 "shaderPool=%u texLiveBytes=%u heapUsed=%u bigFree=%u bigLargest=%u\n",
+                 "shaderPool=%u texLiveBytes=%u heapUsed=%u bigFree=%u bigLargest=%u o2rLoads=%u o2rKB=%u o2rMs=%u\n",
                  gTextureCacheSize, gFreeTextureIdsSize, gOtrTextureCacheSize, gRawPointerByPathSize,
                  gRawPointerByHashSize, gResourceCacheSize, gShaderProgramPoolSize, gTexLiveBytes,
-                 (uint32_t)heapInfo.uordblks, BigHeapFreeBytes(), BigHeapLargestFree());
+                 (uint32_t)heapInfo.uordblks, BigHeapFreeBytes(), BigHeapLargestFree(), o2rLoads,
+                 static_cast<uint32_t>(o2rCompressedBytes / 1024), static_cast<uint32_t>(o2rMicroseconds / 1000));
         }
 
         // The allocation table is sampled independently of the heap-pressure line.  At 500 ms
