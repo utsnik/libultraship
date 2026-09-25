@@ -2,13 +2,16 @@
 
 #include "ship/Context.h"
 #include "ship/window/Window.h"
+#include "port/wiiu/WiiUWatchdog.h"
 #include "spdlog/spdlog.h"
 
 #ifdef __WIIU__
+#include <coreinit/fastmutex.h>
 #include <coreinit/time.h>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <unordered_set>
 #include <zlib.h>
 #endif
 
@@ -16,8 +19,21 @@ namespace Ship {
 #ifdef __WIIU__
 namespace {
 static uint32_t sO2rLoadCount = 0;
+static uint32_t sO2rRepeatLoads = 0;
 static uint64_t sO2rCompressedBytes = 0;
 static uint64_t sO2rLoadMicroseconds = 0;
+static uint64_t sO2rLocateMicroseconds = 0;
+static uint64_t sO2rOpenMicroseconds = 0;
+static uint64_t sO2rReadMicroseconds = 0;
+static uint64_t sO2rInflateMicroseconds = 0;
+static uint64_t sO2rRepeatCompressedBytes = 0;
+static std::unordered_set<std::string> sO2rLoadedPaths;
+static OSFastMutex sO2rLoadedPathsMutex;
+
+struct O2rMutexInitializer {
+    O2rMutexInitializer() { OSFastMutex_Init(&sO2rLoadedPathsMutex, "O2rLoadedPaths"); }
+};
+static O2rMutexInitializer sO2rMutexInitializer;
 
 class O2rLoadTimer {
   public:
@@ -25,7 +41,13 @@ class O2rLoadTimer {
     }
 
     ~O2rLoadTimer() {
-        sO2rLoadMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - mStart);
+        Record();
+    }
+
+    void Record() {
+        const OSTime now = OSGetSystemTime();
+        sO2rLoadMicroseconds += OSTicksToMicroseconds(now - mStart);
+        mStart = now;
     }
 
   private:
@@ -64,6 +86,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         return nullptr;
     }
 
+    const OSTime locateStart = OSGetSystemTime();
     auto zipEntryIndex = zip_name_locate(mZipArchive, filePath.c_str(), 0);
     if (zipEntryIndex < 0) {
         SPDLOG_TRACE("Failed to find file {} in zip archive  {}.", filePath, GetPath());
@@ -76,6 +99,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         SPDLOG_TRACE("Failed to get entry information for file {} in zip archive  {}.", filePath, GetPath());
         return nullptr;
     }
+    sO2rLocateMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - locateStart);
 
     // Filesize 0, no logging needed
     if (zipEntryStat.size == 0) {
@@ -86,8 +110,10 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
     const bool readCompressed =
         zipEntryStat.comp_method == ZIP_CM_STORE || zipEntryStat.comp_method == ZIP_CM_DEFLATE;
+    const OSTime openStart = OSGetSystemTime();
     struct zip_file* zipEntryFile =
         zip_fopen_index(mZipArchive, zipEntryIndex, readCompressed ? ZIP_FL_COMPRESSED : 0);
+    sO2rOpenMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - openStart);
 #else
     struct zip_file* zipEntryFile = zip_fopen_index(mZipArchive, zipEntryIndex, 0);
 #endif
@@ -111,7 +137,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
     if (readCompressed) {
         std::vector<char> compressedData(zipEntryStat.comp_size);
+        const OSTime readStart = OSGetSystemTime();
         const zip_int64_t bytesRead = zip_fread(zipEntryFile, compressedData.data(), zipEntryStat.comp_size);
+        sO2rReadMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - readStart);
         if (bytesRead != static_cast<zip_int64_t>(zipEntryStat.comp_size)) {
             SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
             zip_fclose(zipEntryFile);
@@ -119,6 +147,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         }
 
         zip_uint64_t outputSize = 0;
+        const OSTime inflateStart = OSGetSystemTime();
         if (zipEntryStat.comp_method == ZIP_CM_STORE) {
             outputSize = zipEntryStat.comp_size;
             if (outputSize == zipEntryStat.size) {
@@ -140,6 +169,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
                 }
             }
         }
+        sO2rInflateMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - inflateStart);
 
         if (outputSize != zipEntryStat.size) {
             SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
@@ -147,11 +177,13 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
             return nullptr;
         }
     } else {
+        const OSTime readStart = OSGetSystemTime();
 #endif
     if (zip_fread(zipEntryFile, fileToLoad->Buffer->data(), zipEntryStat.size) < 0) {
         SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
     }
 #ifdef __WIIU__
+    sO2rReadMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - readStart);
     }
 #endif
 
@@ -169,6 +201,24 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
     sO2rLoadCount++;
     sO2rCompressedBytes += zipEntryStat.comp_size;
+
+    OSFastMutex_Lock(&sO2rLoadedPathsMutex);
+    const bool repeatLoad = !sO2rLoadedPaths.insert(filePath).second;
+    if (repeatLoad) {
+        sO2rRepeatLoads++;
+        sO2rRepeatCompressedBytes += zipEntryStat.comp_size;
+    }
+    OSFastMutex_Unlock(&sO2rLoadedPathsMutex);
+
+    if ((sO2rLoadCount % 256) == 0) {
+        loadTimer.Record();
+        Ship::WiiU::Watchdog::Emit(
+            "O2R: loads=%u repeats=%u repeatKB=%u locateMs=%u openMs=%u readMs=%u inflateMs=%u totalMs=%u\n",
+            sO2rLoadCount, sO2rRepeatLoads, static_cast<uint32_t>(sO2rRepeatCompressedBytes / 1024),
+            static_cast<uint32_t>(sO2rLocateMicroseconds / 1000), static_cast<uint32_t>(sO2rOpenMicroseconds / 1000),
+            static_cast<uint32_t>(sO2rReadMicroseconds / 1000), static_cast<uint32_t>(sO2rInflateMicroseconds / 1000),
+            static_cast<uint32_t>(sO2rLoadMicroseconds / 1000));
+    }
 #endif
 
     return fileToLoad;
