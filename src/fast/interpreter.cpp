@@ -3016,8 +3016,17 @@ static void* CachedRawPointer(uint64_t hash) {
     return pointer;
 }
 
+// Texture lookups by path, cached like CachedRawPointer above. Each entry keeps its own copy of
+// the path and a hit must strcmp-match it: a caller that formats paths into a reused buffer then
+// misses and reloads instead of getting the previous path's texture. strcmp allocates nothing,
+// unlike the std::string + ResourceIdentifier that LoadResourceProcess builds per call.
+struct CachedTextureEntry {
+    std::string path;
+    std::shared_ptr<Fast::Texture> texture;
+};
+
 static std::shared_ptr<Fast::Texture> CachedTextureByPath(const char* path) {
-    static std::unordered_map<const void*, std::shared_ptr<Fast::Texture>> cache;
+    static std::unordered_map<const void*, CachedTextureEntry> cache;
     static uint32_t generation = 0xFFFFFFFFu;
 
     Ship::ResourceManager* resourceManager = RawPointerCacheResourceManager();
@@ -3028,14 +3037,14 @@ static std::shared_ptr<Fast::Texture> CachedTextureByPath(const char* path) {
     }
 
     auto it = cache.find(path);
-    if (it != cache.end()) {
-        return it->second;
+    if (it != cache.end() && strcmp(it->second.path.c_str(), path) == 0) {
+        return it->second.texture;
     }
 
     std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
         resourceManager->LoadResourceProcess(path));
     if (texture != nullptr) {
-        cache.emplace(path, texture);
+        cache[path] = CachedTextureEntry{ path, texture };
     }
     return texture;
 }
