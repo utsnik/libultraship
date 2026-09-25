@@ -46,6 +46,13 @@ void Emit(const char* fmt, ...);
 }
 
 extern "C" {
+void* _malloc_r(void*, size_t);
+void _free_r(void*, void*);
+void* _memalign_r(void*, size_t, size_t);
+void* _realloc_r(void*, void*, size_t);
+void* _calloc_r(void*, size_t, size_t);
+int _malloc_trim_r(void*, size_t);
+void* _Znwj(size_t);
 void* __real_malloc(size_t);
 void __real_free(void*);
 void* __real_calloc(size_t, size_t);
@@ -1428,6 +1435,9 @@ static volatile uint32_t sProfileCount[2] = { 0, 0 };
 // "Game caller": for samples outside the game's .text, the first return address on the
 // stack that IS game code - attributes system/GX2/lock time to the game function behind it.
 static ProfileBucket sGcProfile[2][kProfileTableSize];
+// "Allocator caller": game returns hidden behind allocator code, recorded only for samples
+// interrupted in an allocator or whose stack walk had to skip allocator returns.
+static ProfileBucket sAcProfile[2][kProfileTableSize];
 // "Blocked in": when the game thread is NOT the one running on its core (the core is idle or
 // running something else), the game thread is waiting. Its saved context is valid then, so
 // walking its own stack names the game function it is blocked under.
@@ -1684,6 +1694,8 @@ static void EmitProfileReport() {
     EmitProfileTop("lr", sTopLrs, kProfileTopLrCount);
     ProfileSelectTop(sGcProfile[done], sTopPcs, kProfileTopPcCount);
     EmitProfileTop("gc", sTopPcs, kProfileTopPcCount);
+    ProfileSelectTop(sAcProfile[done], sTopPcs, kProfileTopPcCount);
+    EmitProfileTop("ac", sTopPcs, kProfileTopPcCount);
     ProfileSelectTop(sBkProfile[done], sTopPcs, kProfileTopPcCount);
     EmitProfileTop("bk", sTopPcs, kProfileTopPcCount);
     ProfileSelectTop(sThProfile[done], sTopPcs, kProfileTopPcCount);
@@ -1693,6 +1705,7 @@ static void EmitProfileReport() {
     memset(sPcProfile[done], 0, sizeof(sPcProfile[done]));
     memset(sLrProfile[done], 0, sizeof(sLrProfile[done]));
     memset(sGcProfile[done], 0, sizeof(sGcProfile[done]));
+    memset(sAcProfile[done], 0, sizeof(sAcProfile[done]));
     memset(sBkProfile[done], 0, sizeof(sBkProfile[done]));
     memset(sThProfile[done], 0, sizeof(sThProfile[done]));
     sProfileCount[done] = 0;
@@ -1704,6 +1717,51 @@ static void EmitProfileReport() {
 // No locks, no allocation, no Emit in here.
 static uint32_t sGameTextStart = 0;
 static uint32_t sGameTextEnd = 0;
+struct ProfileAddressRange {
+    uint32_t start;
+    uint32_t end;
+};
+static ProfileAddressRange sAllocatorRanges[17];
+static uint32_t sAllocatorRangeCount = 0;
+
+static void ProfileAddAllocatorRange(uintptr_t address, uint32_t size) {
+    if (sAllocatorRangeCount < sizeof(sAllocatorRanges) / sizeof(sAllocatorRanges[0])) {
+        sAllocatorRanges[sAllocatorRangeCount].start = (uint32_t)address;
+        sAllocatorRanges[sAllocatorRangeCount].end = (uint32_t)address + size;
+        ++sAllocatorRangeCount;
+    }
+}
+
+static void ProfileInitAllocatorRanges() {
+    sAllocatorRangeCount = 0;
+    ProfileAddAllocatorRange((uintptr_t)&malloc, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&free, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&memalign, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&realloc, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&_malloc_r, 0x910);
+    ProfileAddAllocatorRange((uintptr_t)&_free_r, 0x330);
+    ProfileAddAllocatorRange((uintptr_t)&_memalign_r, 0x1E0);
+    ProfileAddAllocatorRange((uintptr_t)&_realloc_r, 0x640);
+    ProfileAddAllocatorRange((uintptr_t)&_calloc_r, 0x100);
+    ProfileAddAllocatorRange((uintptr_t)&_malloc_trim_r, 0x140);
+    ProfileAddAllocatorRange((uintptr_t)&_Znwj, 0x80);
+    ProfileAddAllocatorRange((uintptr_t)&__wrap_malloc, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)&__wrap_free, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)&__wrap_memalign, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)&__wrap_realloc, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)&__wrap_calloc, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)&__wrap__Znwj, 0x200);
+}
+
+static inline bool ProfileIsAllocator(uint32_t address) {
+    for (uint32_t index = 0; index < sAllocatorRangeCount; ++index) {
+        if (address >= sAllocatorRanges[index].start && address < sAllocatorRanges[index].end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static inline bool ProfileIsGameText(uint32_t address) {
     return address >= sGameTextStart && address < sGameTextEnd;
 }
@@ -1712,7 +1770,7 @@ static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp) {
     if (ProfileIsGameText(lr)) {
         return lr;
     }
-    for (int depth = 0; depth < 16; ++depth) {
+    for (int depth = 0; depth < 24; ++depth) {
         if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
             return 0;
         }
@@ -1723,6 +1781,36 @@ static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp) {
         const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
         if (ProfileIsGameText(savedLr)) {
             return savedLr;
+        }
+        sp = next;
+    }
+    return 0;
+}
+
+static uint32_t ProfileFirstNonAllocatorGameReturn(uint32_t lr, uint32_t sp, bool* skippedAllocator) {
+    *skippedAllocator = false;
+    if (ProfileIsGameText(lr)) {
+        if (ProfileIsAllocator(lr)) {
+            *skippedAllocator = true;
+        } else {
+            return lr;
+        }
+    }
+    for (int depth = 0; depth < 24; ++depth) {
+        if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
+            return 0;
+        }
+        const uint32_t next = *(const volatile uint32_t*)sp;
+        if (next <= sp || next >= 0x50000000u) {
+            return 0;
+        }
+        const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
+        if (ProfileIsGameText(savedLr)) {
+            if (ProfileIsAllocator(savedLr)) {
+                *skippedAllocator = true;
+            } else {
+                return savedLr;
+            }
         }
         sp = next;
     }
@@ -1748,6 +1836,13 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     ProfileAdd(sPcProfile[set], context->srr0);
     ProfileAdd(sLrProfile[set], context->lr & ~0xFu);
     const uint32_t pc = context->srr0;
+    const bool pcInAllocator = ProfileIsAllocator(pc);
+    bool skippedAllocator = false;
+    const uint32_t allocatorCaller =
+        ProfileFirstNonAllocatorGameReturn(context->lr, context->gpr[1], &skippedAllocator);
+    if (pcInAllocator || skippedAllocator) {
+        ProfileAdd(sAcProfile[set], allocatorCaller != 0 ? (allocatorCaller & ~0xFu) : 0xFFFFFFF0u);
+    }
     if (!ProfileIsGameText(pc)) {
         const uint32_t caller = ProfileFirstGameReturn(context->lr, context->gpr[1]);
         ProfileAdd(sGcProfile[set], caller != 0 ? (caller & ~0xFu) : 0xFFFFFFF0u);
@@ -2005,6 +2100,7 @@ void Start() {
         // stack (a 0x04C32E00 data address was attributed as a "caller") out of the tables.
         sGameTextEnd = bias + 0x04C00000u;
     }
+    ProfileInitAllocatorRanges();
     // Set from the game thread so the alarm fires on (and samples) the game thread's core.
     // 9973 us, not a whole ms: a 10 ms period phase-locked with AX's 3 ms tick and put exactly 1/3 of
     // all samples on {SYS AX IST} at one PC (2026-09-25).
