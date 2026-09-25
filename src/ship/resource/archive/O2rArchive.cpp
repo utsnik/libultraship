@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <malloc.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <zlib.h>
 #endif
@@ -34,6 +36,13 @@ struct O2rMutexInitializer {
     O2rMutexInitializer() { OSFastMutex_Init(&sO2rLoadedPathsMutex, "O2rLoadedPaths"); }
 };
 static O2rMutexInitializer sO2rMutexInitializer;
+
+// stdio buffer for each open archive. It is ours, not newlib's: newlib allocates it through the
+// wrapped malloc (ExpHeap from 64 KiB up) but fclose frees it with _free_r, which corrupted the heap
+// with a 128 KiB buffer (soh923p15). 0x40 alignment also lets wut's __wut_fsa_read fill it with one
+// FSAReadFile instead of splitting off an unaligned head through its 64-byte bounce buffer.
+constexpr size_t kO2rStdioBufferSize = 16 * 1024;
+static std::unordered_map<const void*, void*> sO2rStdioBuffers;
 
 class O2rLoadTimer {
   public:
@@ -239,8 +248,11 @@ bool O2rArchive::Open() {
     // Unbuffered made zip_open parse the central directory with one FSA read per entry (oot.o2r:
     // ~23 s instead of 0.7 s, soh923p12). 16 KiB lets one read cover a small entry's local header
     // and its data, without paying a large transfer per random-access load.
-    if (std::setvbuf(archiveFile, nullptr, _IOFBF, 128 * 1024) != 0) {
+    void* stdioBuffer = memalign(0x40, kO2rStdioBufferSize);
+    if (stdioBuffer == nullptr ||
+        std::setvbuf(archiveFile, static_cast<char*>(stdioBuffer), _IOFBF, kO2rStdioBufferSize) != 0) {
         std::fclose(archiveFile);
+        free(stdioBuffer);
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;
     }
@@ -250,6 +262,7 @@ bool O2rArchive::Open() {
     zip_source_t* source = zip_source_filep_create(archiveFile, 0, ZIP_LENGTH_TO_END, &zipError);
     if (source == nullptr) {
         std::fclose(archiveFile);
+        free(stdioBuffer);
         zip_error_fini(&zipError);
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;
@@ -258,11 +271,13 @@ bool O2rArchive::Open() {
     mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipError);
     if (mZipArchive == nullptr) {
         zip_source_free(source); // also closes archiveFile
+        free(stdioBuffer);
         zip_error_fini(&zipError);
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;
     }
     zip_error_fini(&zipError);
+    sO2rStdioBuffers[this] = stdioBuffer;
 #else
     mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
     if (mZipArchive == nullptr) {
@@ -299,6 +314,14 @@ bool O2rArchive::Close() {
     }
 
     mZipArchive = nullptr;
+#ifdef __WIIU__
+    // zip_close has fclose'd the FILE, so its buffer is no longer referenced.
+    auto stdioBuffer = sO2rStdioBuffers.find(this);
+    if (stdioBuffer != sO2rStdioBuffers.end()) {
+        free(stdioBuffer->second);
+        sO2rStdioBuffers.erase(stdioBuffer);
+    }
+#endif
     return true;
 }
 
