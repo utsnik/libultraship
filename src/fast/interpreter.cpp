@@ -69,6 +69,14 @@ namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
 
+static const std::array<float, 256> byte_to_unit = [] {
+    std::array<float, 256> table{};
+    for (int i = 0; i < 256; i++) {
+        table[i] = (float)i / 255.0f;
+    }
+    return table;
+}();
+
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
     F3DEX2_G_CULL_FRONT,     F3DEX2_G_CULL_BACK, F3DEX2_G_CULL_BOTH,
@@ -1812,6 +1820,28 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
 
+    float tex_width_inv[2], tex_height_inv[2];
+    float texture_scale_s[2], texture_scale_t[2];
+    float uls_div4[2], ult_div4[2];
+    float clamp_s[2], clamp_t[2];
+    for (int t = 0; t < 2; t++) {
+        if (!usedTextures[t]) {
+            continue;
+        }
+
+        tex_width_inv[t] = 1.0f / tex_width[t];
+        tex_height_inv[t] = 1.0f / tex_height[t];
+
+        int shifts = mRdp->texture_tile[mRdp->first_tile_index + t].shifts;
+        int shiftt = mRdp->texture_tile[mRdp->first_tile_index + t].shiftt;
+        texture_scale_s[t] = shifts == 0 ? 1.0f : shifts <= 10 ? 1.0f / (1 << shifts) : (float)(1 << (16 - shifts));
+        texture_scale_t[t] = shiftt == 0 ? 1.0f : shiftt <= 10 ? 1.0f / (1 << shiftt) : (float)(1 << (16 - shiftt));
+        uls_div4[t] = mRdp->texture_tile[mRdp->first_tile_index + t].uls / 4.0f;
+        ult_div4[t] = mRdp->texture_tile[mRdp->first_tile_index + t].ult / 4.0f;
+        clamp_s[t] = (tex_width2[t] - 0.5f) / tex_width[t];
+        clamp_t[t] = (tex_height2[t] - 0.5f) / tex_height[t];
+    }
+
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
     for (int i = 0; i < 3; i++) {
@@ -1832,25 +1862,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             float u = v_arr[i]->u / 32.0f;
             float v = v_arr[i]->v / 32.0f;
 
-            int shifts = mRdp->texture_tile[mRdp->first_tile_index + t].shifts;
-            int shiftt = mRdp->texture_tile[mRdp->first_tile_index + t].shiftt;
-            if (shifts != 0) {
-                if (shifts <= 10) {
-                    u /= 1 << shifts;
-                } else {
-                    u *= 1 << (16 - shifts);
-                }
-            }
-            if (shiftt != 0) {
-                if (shiftt <= 10) {
-                    v /= 1 << shiftt;
-                } else {
-                    v *= 1 << (16 - shiftt);
-                }
-            }
+            u *= texture_scale_s[t];
+            v *= texture_scale_t[t];
 
-            u -= mRdp->texture_tile[mRdp->first_tile_index + t].uls / 4.0f;
-            v -= mRdp->texture_tile[mRdp->first_tile_index + t].ult / 4.0f;
+            u -= uls_div4[t];
+            v -= ult_div4[t];
 
             if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
                 // Linear filter adds 0.5f to the coordinates
@@ -1860,33 +1876,33 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
-            mBufVbo[mBufVboLen++] = u / tex_width[t];
-            mBufVbo[mBufVboLen++] = v / tex_height[t];
+            mBufVbo[mBufVboLen++] = u * tex_width_inv[t];
+            mBufVbo[mBufVboLen++] = v * tex_height_inv[t];
 
             bool clampS = tm & (1 << 2 * t);
             bool clampT = tm & (1 << 2 * t + 1);
 
             if (clampS) {
-                mBufVbo[mBufVboLen++] = (tex_width2[t] - 0.5f) / tex_width[t];
+                mBufVbo[mBufVboLen++] = clamp_s[t];
             }
 
             if (clampT) {
-                mBufVbo[mBufVboLen++] = (tex_height2[t] - 0.5f) / tex_height[t];
+                mBufVbo[mBufVboLen++] = clamp_t[t];
             }
         }
 
         if (use_fog) {
-            mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
-            mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->fog_color.r];
+            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->fog_color.g];
+            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->fog_color.b];
+            mBufVbo[mBufVboLen++] = byte_to_unit[v_arr[i]->color.a]; // fog factor (not alpha)
         }
 
         if (use_grayscale) {
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.r / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.g / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.b / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.a / 255.0f; // lerp interpolation factor (not alpha)
+            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.r];
+            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.g];
+            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.b];
+            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.a]; // lerp interpolation factor (not alpha)
         }
 
         for (int j = 0; j < numInputs; j++) {
@@ -1947,15 +1963,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                 }
                 if (k == 0) {
-                    mBufVbo[mBufVboLen++] = color->r / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->g / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->b / 255.0f;
+                    mBufVbo[mBufVboLen++] = byte_to_unit[color->r];
+                    mBufVbo[mBufVboLen++] = byte_to_unit[color->g];
+                    mBufVbo[mBufVboLen++] = byte_to_unit[color->b];
                 } else {
                     if (use_fog && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for fog
                         mBufVbo[mBufVboLen++] = 1.0f;
                     } else {
-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
+                        mBufVbo[mBufVboLen++] = byte_to_unit[color->a];
                     }
                 }
             }
