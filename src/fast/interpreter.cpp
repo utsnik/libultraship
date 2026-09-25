@@ -1341,6 +1341,31 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    for (size_t offset = 0; offset < n_vertices * sizeof(F3DVtx); offset += 32) {
+        __builtin_prefetch(reinterpret_cast<const char*>(vertices) + offset);
+    }
+
+    const float(*MP_matrix)[4] = mRsp->MP_matrix;
+    const uint32_t geometry_mode = mRsp->geometry_mode;
+    const uint16_t texture_scale_s = mRsp->texture_scaling_factor.s;
+    const uint16_t texture_scale_t = mRsp->texture_scaling_factor.t;
+    const int16_t fog_mul = mRsp->fog_mul;
+    const int16_t fog_offset = mRsp->fog_offset;
+    const float aspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
+
+    if (geometry_mode & G_LIGHTING) {
+        if (mRsp->lights_changed) {
+            for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+                CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
+            }
+            /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
+            static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
+            CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
+            CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+            mRsp->lights_changed = false;
+        }
+    }
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -1350,47 +1375,34 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             return;
         }
 
-        float x = v->ob[0] * mRsp->MP_matrix[0][0] + v->ob[1] * mRsp->MP_matrix[1][0] +
-                  v->ob[2] * mRsp->MP_matrix[2][0] + mRsp->MP_matrix[3][0];
-        float y = v->ob[0] * mRsp->MP_matrix[0][1] + v->ob[1] * mRsp->MP_matrix[1][1] +
-                  v->ob[2] * mRsp->MP_matrix[2][1] + mRsp->MP_matrix[3][1];
-        float z = v->ob[0] * mRsp->MP_matrix[0][2] + v->ob[1] * mRsp->MP_matrix[1][2] +
-                  v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
-        float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
-                  v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+        const float normal[3] = { (float)vn->n[0], (float)vn->n[1], (float)vn->n[2] };
+
+        float x = v->ob[0] * MP_matrix[0][0] + v->ob[1] * MP_matrix[1][0] + v->ob[2] * MP_matrix[2][0] + MP_matrix[3][0];
+        float y = v->ob[0] * MP_matrix[0][1] + v->ob[1] * MP_matrix[1][1] + v->ob[2] * MP_matrix[2][1] + MP_matrix[3][1];
+        float z = v->ob[0] * MP_matrix[0][2] + v->ob[1] * MP_matrix[1][2] + v->ob[2] * MP_matrix[2][2] + MP_matrix[3][2];
+        float w = v->ob[0] * MP_matrix[0][3] + v->ob[1] * MP_matrix[1][3] + v->ob[2] * MP_matrix[2][3] + MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
-        if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
+        if (geometry_mode & G_LIGHTING_POSITIONAL) {
             float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
 
-        x = AdjXForAspectRatio(x);
+        x = mFbActive ? x : x * (4.0f / 3.0f) / aspect;
 
-        short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
-        short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
+        short U = v->tc[0] * texture_scale_s >> 16;
+        short V = v->tc[1] * texture_scale_t >> 16;
 
-        if (mRsp->geometry_mode & G_LIGHTING) {
-            if (mRsp->lights_changed) {
-                for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
-                    CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
-                }
-                /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
-                static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
-                CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
-                CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
-                mRsp->lights_changed = false;
-            }
-
+        if (geometry_mode & G_LIGHTING) {
             int r = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[0];
             int g = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[1];
             int b = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[2];
 
             for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
                 float intensity = 0;
-                if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
+                if ((geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
                     // Calculate distance from the light to the vertex
                     float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - world_pos[0],
                                           mRsp->current_lights[i].p.pos[1] - world_pos[1],
@@ -1413,8 +1425,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     }
 
                     // Adjust intensity based on surface normal and sum up total
-                    float total_intensity =
-                        light_intensity[0] * vn->n[0] + light_intensity[1] * vn->n[1] + light_intensity[2] * vn->n[2];
+                    float total_intensity = light_intensity[0] * normal[0] + light_intensity[1] * normal[1] +
+                                            light_intensity[2] * normal[2];
                     total_intensity = std::clamp(total_intensity, -1.0f, 1.0f);
 
                     // Attenuate intensity based on attenuation values.
@@ -1428,10 +1440,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                                         1.0f;
                     intensity = total_intensity / attenuation;
                 } else {
-                    intensity += vn->n[0] * mRsp->current_lights_coeffs[i][0];
-                    intensity += vn->n[1] * mRsp->current_lights_coeffs[i][1];
-                    intensity += vn->n[2] * mRsp->current_lights_coeffs[i][2];
-                    intensity /= 127.0f;
+                    intensity += normal[0] * mRsp->current_lights_coeffs[i][0];
+                    intensity += normal[1] * mRsp->current_lights_coeffs[i][1];
+                    intensity += normal[2] * mRsp->current_lights_coeffs[i][2];
+                    intensity *= (1.0f / 127.0f);
                 }
                 if (intensity > 0.0f) {
                     r += intensity * mRsp->current_lights[i].l.col[0];
@@ -1444,22 +1456,22 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->color.g = g > 255 ? 255 : g;
             d->color.b = b > 255 ? 255 : b;
 
-            if (mRsp->geometry_mode & G_TEXTURE_GEN) {
+            if (geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
-                dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
-                dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
-                dotx += vn->n[2] * mRsp->current_lookat_coeffs[0][2];
-                doty += vn->n[0] * mRsp->current_lookat_coeffs[1][0];
-                doty += vn->n[1] * mRsp->current_lookat_coeffs[1][1];
-                doty += vn->n[2] * mRsp->current_lookat_coeffs[1][2];
+                dotx += normal[0] * mRsp->current_lookat_coeffs[0][0];
+                dotx += normal[1] * mRsp->current_lookat_coeffs[0][1];
+                dotx += normal[2] * mRsp->current_lookat_coeffs[0][2];
+                doty += normal[0] * mRsp->current_lookat_coeffs[1][0];
+                doty += normal[1] * mRsp->current_lookat_coeffs[1][1];
+                doty += normal[2] * mRsp->current_lookat_coeffs[1][2];
 
-                dotx /= 127.0f;
-                doty /= 127.0f;
+                dotx *= (1.0f / 127.0f);
+                doty *= (1.0f / 127.0f);
 
                 dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
                 doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
 
-                if (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) {
+                if (geometry_mode & G_TEXTURE_GEN_LINEAR) {
                     // Not sure exactly what formula we should use to get accurate values
                     /*dotx = (2.906921f * dotx * dotx + 1.36114f) * dotx;
                     doty = (2.906921f * doty * doty + 1.36114f) * doty;
@@ -1472,8 +1484,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     doty = (doty + 1.0f) / 4.0f;
                 }
 
-                U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
-                V = (int32_t)(doty * mRsp->texture_scaling_factor.t);
+                U = (int32_t)(dotx * texture_scale_s);
+                V = (int32_t)(doty * texture_scale_t);
             }
         } else {
             d->color.r = v->cn[0];
@@ -1508,7 +1520,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         d->z = z;
         d->w = w;
 
-        if (mRsp->geometry_mode & G_FOG) {
+        if (geometry_mode & G_FOG) {
             if (fabsf(w) < 0.001f) {
                 // To avoid division by zero
                 w = 0.001f;
@@ -1519,7 +1531,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 winv = std::numeric_limits<int16_t>::max();
             }
 
-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
+            float fog_z = z * winv * fog_mul + fog_offset;
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {
