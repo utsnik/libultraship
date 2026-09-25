@@ -668,17 +668,19 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
 
         tex->texture.surface.image = memalign(tex->texture.surface.alignment, tex->texture.surface.imageSize);
         WDOG_TEXALLOC(tex->texture.surface.image, tex->texture.surface.imageSize);
-        const uint32_t mem1Free = gfx_wiiu_mem1_free();
-        const uint32_t mem1Largest = gfx_wiiu_mem1_largest();
-        if (!tex->texture.surface.image) {
+        // Log every allocation only for the first 64, then every 256th, and always a failure: two
+        // log lines (spdlog + UDP) plus two MEM1 heap walks per texture stretched every scene-load
+        // hitch with the 512 pack (~2,600 textures by the first scene, 2026-09-25).
+        const bool texAllocFailed = tex->texture.surface.image == nullptr;
+        const uint32_t texAllocCount = ::Ship::WiiU::Watchdog::gTexCount;
+        const bool logTexAlloc = texAllocFailed || texAllocCount < 64 || (texAllocCount & 255u) == 0;
+        const uint32_t mem1Free = logTexAlloc ? gfx_wiiu_mem1_free() : 0;
+        if (texAllocFailed) {
+            const uint32_t mem1Largest = gfx_wiiu_mem1_largest();
             SPDLOG_ERROR("gfx_gx2: !! texture allocation failed dimensions={}x{} imageSize={} ptr={} mem1Free={} "
                          "mem1Largest={}",
                          width, height, tex->texture.surface.imageSize,
                          static_cast<const void*>(tex->texture.surface.image), mem1Free, mem1Largest);
-        } else {
-            SPDLOG_INFO("gfx_gx2: texture allocation dimensions={}x{} imageSize={} ptr={} mem1Free={} mem1Largest={}",
-                        width, height, tex->texture.surface.imageSize,
-                        static_cast<const void*>(tex->texture.surface.image), mem1Free, mem1Largest);
         }
         if (trace) {
             SPDLOG_INFO("gfx_gx2: first frame texture: allocation returned ptr={}",
@@ -687,11 +689,13 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
         // Raw channel, not spdlog: the 2026-09-12 capture ends inside this function and
         // contains none of the SPDLOG lines above it, so the spdlog path is lossy exactly
         // where it matters. These numbers are the ones that identify a bogus surface.
-        WDOG_EMIT("GX2TEX: alloc %ux%u pitch=%u imageSize=%u align=%u ptr=0x%08X mem1Free=%u count=%u\n",
-                  (unsigned int)width, (unsigned int)height, (unsigned int)tex->texture.surface.pitch,
-                  (unsigned int)tex->texture.surface.imageSize, (unsigned int)tex->texture.surface.alignment,
-                  (unsigned int)(uintptr_t)tex->texture.surface.image, (unsigned int)mem1Free,
-                  (unsigned int)::Ship::WiiU::Watchdog::gTexCount);
+        if (logTexAlloc) {
+            WDOG_EMIT("GX2TEX: alloc %ux%u pitch=%u imageSize=%u align=%u ptr=0x%08X mem1Free=%u count=%u\n",
+                      (unsigned int)width, (unsigned int)height, (unsigned int)tex->texture.surface.pitch,
+                      (unsigned int)tex->texture.surface.imageSize, (unsigned int)tex->texture.surface.alignment,
+                      (unsigned int)(uintptr_t)tex->texture.surface.image, (unsigned int)mem1Free,
+                      (unsigned int)texAllocCount);
+        }
         WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_ALLOC);
     }
 
