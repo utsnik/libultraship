@@ -2685,6 +2685,8 @@ void Interpreter::GfxDpSetOtherMode(uint32_t h, uint32_t l) {
     mRdp->other_mode_l = l;
 }
 
+static std::shared_ptr<Fast::Texture> CachedTextureByPath(const char* path);
+
 void Interpreter::Gfxs2dexBgCopy(F3DuObjBg* bg) {
     /*
     bg->b.imageX = 0;
@@ -2707,8 +2709,7 @@ void Interpreter::Gfxs2dexBgCopy(F3DuObjBg* bg) {
     RawTexMetadata rawTexMetadata = {};
 
     if ((bool)gfx_check_image_signature((char*)data)) {
-        std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-            Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess((char*)data));
+        std::shared_ptr<Fast::Texture> tex = CachedTextureByPath((char*)data);
         texFlags = tex->Flags;
         rawTexMetadata.width = tex->Width;
         rawTexMetadata.height = tex->Height;
@@ -2744,8 +2745,7 @@ void Interpreter::Gfxs2dexBg1cyc(F3DuObjBg* bg) {
     RawTexMetadata rawTexMetadata = {};
 
     if ((bool)gfx_check_image_signature((char*)data)) {
-        std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-            Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess((char*)data));
+        std::shared_ptr<Fast::Texture> tex = CachedTextureByPath((char*)data);
         texFlags = tex->Flags;
         rawTexMetadata.width = tex->Width;
         rawTexMetadata.height = tex->Height;
@@ -3014,6 +3014,30 @@ static void* CachedRawPointer(uint64_t hash) {
     sRawPointerByHash.emplace(hash, pointer);
     WDOG_RAW_POINTER_CACHE_SIZES(sRawPointerByPath.size(), sRawPointerByHash.size());
     return pointer;
+}
+
+static std::shared_ptr<Fast::Texture> CachedTextureByPath(const char* path) {
+    static std::unordered_map<const void*, std::shared_ptr<Fast::Texture>> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+
+    Ship::ResourceManager* resourceManager = RawPointerCacheResourceManager();
+    const uint32_t current = resourceManager->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+
+    auto it = cache.find(path);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
+        resourceManager->LoadResourceProcess(path));
+    if (texture != nullptr) {
+        cache.emplace(path, texture);
+    }
+    return texture;
 }
 
 bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
@@ -3597,8 +3621,7 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
-            std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-                Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(imgData));
+            std::shared_ptr<Fast::Texture> tex = CachedTextureByPath(imgData);
 
             if (tex == nullptr) {
                 (*cmd0)++;
@@ -3686,8 +3709,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(fileName));
+    std::shared_ptr<Fast::Texture> texture = CachedTextureByPath(fileName);
     if (texture != nullptr) {
         Interpreter* gfx = mInstance.lock().get();
         texFlags = texture->Flags;
