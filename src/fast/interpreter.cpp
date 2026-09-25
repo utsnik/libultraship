@@ -1349,10 +1349,6 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
-    for (size_t offset = 0; offset < n_vertices * sizeof(F3DVtx); offset += 32) {
-        __builtin_prefetch(reinterpret_cast<const char*>(vertices) + offset);
-    }
-
     const float(*MP_matrix)[4] = mRsp->MP_matrix;
     const uint32_t geometry_mode = mRsp->geometry_mode;
     const uint16_t texture_scale_s = mRsp->texture_scaling_factor.s;
@@ -1360,6 +1356,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     const int16_t fog_mul = mRsp->fog_mul;
     const int16_t fog_offset = mRsp->fog_offset;
     const float aspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
+    const float aspect_scale = (4.0f / 3.0f) / aspect;
 
     if (geometry_mode & G_LIGHTING) {
         if (mRsp->lights_changed) {
@@ -1375,6 +1372,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     }
 
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
+        if ((i & 1) == 0 && i + 4 < n_vertices) {
+            __builtin_prefetch(&vertices[i + 4]);
+        }
+
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
         struct LoadedVertex* d = &mRsp->loaded_vertices[dest_index];
@@ -1398,7 +1399,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
 
-        x = mFbActive ? x : x * (4.0f / 3.0f) / aspect;
+        x = mFbActive ? x : x * aspect_scale;
 
         short U = v->tc[0] * texture_scale_s >> 16;
         short V = v->tc[1] * texture_scale_t >> 16;
