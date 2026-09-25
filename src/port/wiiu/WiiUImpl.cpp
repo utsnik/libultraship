@@ -1714,7 +1714,7 @@ struct ProfileAddressRange {
     uint32_t start;
     uint32_t end;
 };
-static ProfileAddressRange sAllocatorRanges[17];
+static ProfileAddressRange sAllocatorRanges[6];
 static uint32_t sAllocatorRangeCount = 0;
 
 static void ProfileAddAllocatorRange(uintptr_t address, uint32_t size) {
@@ -1725,20 +1725,10 @@ static void ProfileAddAllocatorRange(uintptr_t address, uint32_t size) {
     }
 }
 
-// Allocator entry points, named by asm label: in this TU their declarations overload in C++,
-// so &_malloc_r / &__wrap_malloc have no single type. Only the addresses are used (profiler ranges).
-extern "C" const char kProfSym_malloc_r[] __asm__("_malloc_r");
-extern "C" const char kProfSym_free_r[] __asm__("_free_r");
-extern "C" const char kProfSym_memalign_r[] __asm__("_memalign_r");
-extern "C" const char kProfSym_realloc_r[] __asm__("_realloc_r");
-extern "C" const char kProfSym_calloc_r[] __asm__("_calloc_r");
-extern "C" const char kProfSym_malloc_trim_r[] __asm__("_malloc_trim_r");
+// The --wrap entry points every allocation goes through, named by asm label (their declarations
+// overload in this TU, so &__wrap_malloc has no single type). Do NOT add newlib's _malloc_r & co:
+// referencing them pulled wut's own malloc object in instead of newlib's and soh923p3 never booted.
 
-extern "C" const char kProfSym__real_malloc[] __asm__("__real_malloc");
-extern "C" const char kProfSym__real_free[] __asm__("__real_free");
-extern "C" const char kProfSym__real_memalign[] __asm__("__real_memalign");
-extern "C" const char kProfSym__real_realloc[] __asm__("__real_realloc");
-extern "C" const char kProfSym__real__Znwj[] __asm__("__real__Znwj");
 extern "C" const char kProfSym__wrap_malloc[] __asm__("__wrap_malloc");
 extern "C" const char kProfSym__wrap_free[] __asm__("__wrap_free");
 extern "C" const char kProfSym__wrap_memalign[] __asm__("__wrap_memalign");
@@ -1747,25 +1737,14 @@ extern "C" const char kProfSym__wrap_calloc[] __asm__("__wrap_calloc");
 extern "C" const char kProfSym__wrap__Znwj[] __asm__("__wrap__Znwj");
 
 static void ProfileInitAllocatorRanges() {
-    // --wrap=malloc etc. is on, so &malloc here would be __wrap_malloc: name the real ones.
+    // Sizes from nm -S of soh923p2 (0xF8-0x198), rounded up so a range never covers a neighbour.
     sAllocatorRangeCount = 0;
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_malloc, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_free, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_memalign, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__real_realloc, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym_malloc_r, 0x910);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym_free_r, 0x330);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym_memalign_r, 0x1E0);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym_realloc_r, 0x640);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym_calloc_r, 0x100);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym_malloc_trim_r, 0x140);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__real__Znwj, 0x80);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_malloc, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_free, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_memalign, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_realloc, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_calloc, 0x200);
-    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap__Znwj, 0x200);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_malloc, 0x100);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_free, 0x110);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_memalign, 0x110);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_realloc, 0x120);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_calloc, 0x1A0);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap__Znwj, 0x100);
 }
 
 static inline bool ProfileIsAllocator(uint32_t address) {
@@ -1802,34 +1781,37 @@ static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp) {
     return 0;
 }
 
-static uint32_t ProfileFirstNonAllocatorGameReturn(uint32_t lr, uint32_t sp, bool* skippedAllocator) {
-    *skippedAllocator = false;
+// Allocator caller: the first game return above a __wrap_* frame. Everything below the wrapper
+// (newlib, heap locks) is allocator internals, so no other allocator symbol is needed.
+// Returns 0 when the sample is not inside an allocation at all.
+static uint32_t ProfileAllocatorCaller(uint32_t pc, uint32_t lr, uint32_t sp) {
+    bool aboveWrapper = ProfileIsAllocator(pc);
     if (ProfileIsGameText(lr)) {
         if (ProfileIsAllocator(lr)) {
-            *skippedAllocator = true;
-        } else {
+            aboveWrapper = true;
+        } else if (aboveWrapper) {
             return lr;
         }
     }
     for (int depth = 0; depth < 24; ++depth) {
         if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
-            return 0;
+            break;
         }
         const uint32_t next = *(const volatile uint32_t*)sp;
         if (next <= sp || next >= 0x50000000u) {
-            return 0;
+            break;
         }
         const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
         if (ProfileIsGameText(savedLr)) {
             if (ProfileIsAllocator(savedLr)) {
-                *skippedAllocator = true;
-            } else {
+                aboveWrapper = true;
+            } else if (aboveWrapper) {
                 return savedLr;
             }
         }
         sp = next;
     }
-    return 0;
+    return aboveWrapper ? 0xFFFFFFF0u : 0;
 }
 
 static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
@@ -1851,12 +1833,9 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     ProfileAdd(sPcProfile[set], context->srr0);
     ProfileAdd(sLrProfile[set], context->lr & ~0xFu);
     const uint32_t pc = context->srr0;
-    const bool pcInAllocator = ProfileIsAllocator(pc);
-    bool skippedAllocator = false;
-    const uint32_t allocatorCaller =
-        ProfileFirstNonAllocatorGameReturn(context->lr, context->gpr[1], &skippedAllocator);
-    if (pcInAllocator || skippedAllocator) {
-        ProfileAdd(sAcProfile[set], allocatorCaller != 0 ? (allocatorCaller & ~0xFu) : 0xFFFFFFF0u);
+    const uint32_t allocatorCaller = ProfileAllocatorCaller(pc, context->lr, context->gpr[1]);
+    if (allocatorCaller != 0) {
+        ProfileAdd(sAcProfile[set], allocatorCaller & ~0xFu);
     }
     if (!ProfileIsGameText(pc)) {
         const uint32_t caller = ProfileFirstGameReturn(context->lr, context->gpr[1]);
