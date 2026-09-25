@@ -85,6 +85,12 @@ extern volatile uint32_t gOpcode;
 extern volatile uint32_t gCmd;    // command pointer, as an integer
 extern volatile uint32_t gFrame;
 extern char gDetail[128];
+// Lazy detail for per-draw scopes: a format literal plus six 32-bit args, formatted only when a
+// line is actually emitted. Eager vsnprintf on every shader/texture/sampler set was ~2.5% of the
+// game core in busy frames (2026-09-25). nullptr = use gDetail. Args are stored before the format,
+// so a reader racing a writer sees a valid literal with possibly mixed args - diagnostics only.
+extern const char* volatile gDetailFmt;
+extern volatile uint32_t gDetailArgs[6];
 extern char gTexturePath[128];
 // Diagnosis switch: when non-zero every Enter/Leave transmits its own line immediately,
 // instead of only being visible if a 500 ms tick happens to sample it. The wedge being
@@ -204,6 +210,7 @@ inline void OtrResourceManagerLookup() {
 }
 
 inline void SetDetail(const char* s) {
+    gDetailFmt = nullptr;
     if (s == nullptr) {
         gDetail[0] = '\0';
         return;
@@ -228,6 +235,7 @@ inline void SetTexturePath(const char* s) {
 }
 
 inline void SetDetailV(const char* fmt, va_list ap) {
+    gDetailFmt = nullptr;
     if (fmt == nullptr) {
         gDetail[0] = '\0';
         return;
@@ -236,6 +244,17 @@ inline void SetDetailV(const char* fmt, va_list ap) {
     if (n < 0) {
         gDetail[0] = '\0';
     }
+}
+
+// The detail text for an emitted line: gDetail, or the lazy format rendered into buf.
+inline const char* DetailText(char* buf, size_t size) {
+    const char* fmt = gDetailFmt;
+    if (fmt == nullptr) {
+        return gDetail;
+    }
+    snprintf(buf, size, fmt, gDetailArgs[0], gDetailArgs[1], gDetailArgs[2], gDetailArgs[3], gDetailArgs[4],
+             gDetailArgs[5]);
+    return buf;
 }
 
 inline void Enter(uint32_t phase, const char* detail) {
@@ -303,6 +322,31 @@ struct Scope {
     Scope& operator=(const Scope&) = delete;
 };
 
+// Like ScopeFmt, but stores the args and formats nothing unless a line is emitted. Every
+// conversion in fmt must take a 32-bit int (%d/%u/%X...): split 64-bit values into two words.
+struct ScopeArgs {
+    uint32_t mPhase;
+    ScopeArgs(uint32_t phase, const char* fmt, uint32_t a0 = 0, uint32_t a1 = 0, uint32_t a2 = 0, uint32_t a3 = 0,
+              uint32_t a4 = 0, uint32_t a5 = 0)
+        : mPhase(phase) {
+        gDetailArgs[0] = a0;
+        gDetailArgs[1] = a1;
+        gDetailArgs[2] = a2;
+        gDetailArgs[3] = a3;
+        gDetailArgs[4] = a4;
+        gDetailArgs[5] = a5;
+        gDetailFmt = fmt;
+        gPhase = phase;
+        ++gSeq;
+        TraceEvent(phase, "enter");
+    }
+    ~ScopeArgs() {
+        Leave(mPhase);
+    }
+    ScopeArgs(const ScopeArgs&) = delete;
+    ScopeArgs& operator=(const ScopeArgs&) = delete;
+};
+
 struct ScopeFmt {
     uint32_t mPhase;
     ScopeFmt(uint32_t phase, const char* fmt, ...) : mPhase(phase) {
@@ -344,6 +388,8 @@ void StopProfiler();
 #define WDOG_SCOPE(phase, detail) ::Ship::WiiU::Watchdog::Scope WDOG_CAT(wdogScope_, __LINE__)(phase, detail)
 #define WDOG_SCOPE_FMT(phase, fmt, ...) \
     ::Ship::WiiU::Watchdog::ScopeFmt WDOG_CAT(wdogScopeFmt_, __LINE__)(phase, fmt, __VA_ARGS__)
+#define WDOG_SCOPE_ARGS(phase, fmt, ...) \
+    ::Ship::WiiU::Watchdog::ScopeArgs WDOG_CAT(wdogScopeArgs_, __LINE__)(phase, fmt, __VA_ARGS__)
 #define WDOG_TEXALLOC(ptr, size) ::Ship::WiiU::Watchdog::TexAlloc(ptr, size)
 #define WDOG_TEXFREE(size) ::Ship::WiiU::Watchdog::TexFree(size)
 #define WDOG_TEXTURE_CACHE_SIZES(mapSize, freeSize) \
@@ -370,6 +416,7 @@ void StopProfiler();
 #define WDOG_TEXTURE_DETAIL() nullptr
 #define WDOG_SCOPE(phase, detail) ((void)0)
 #define WDOG_SCOPE_FMT(phase, fmt, ...) ((void)0)
+#define WDOG_SCOPE_ARGS(phase, fmt, ...) ((void)0)
 #define WDOG_TEXALLOC(ptr, size) ((void)0)
 #define WDOG_TEXFREE(size) ((void)0)
 #define WDOG_TEXTURE_CACHE_SIZES(mapSize, freeSize) ((void)0)

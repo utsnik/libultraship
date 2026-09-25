@@ -1363,6 +1363,8 @@ volatile uint32_t gOpcode = 0;
 volatile uint32_t gCmd = 0;
 volatile uint32_t gFrame = 0;
 char gDetail[128] = { 0 };
+const char* volatile gDetailFmt = nullptr;
+volatile uint32_t gDetailArgs[6] = { 0 };
 char gTexturePath[128] = { 0 };
 volatile uint32_t gTraceState = TRACE_OFF;
 volatile uint32_t gTraceFramesRemaining = 0;
@@ -1946,14 +1948,15 @@ void TraceEvent(uint32_t phase, const char* event) {
         return;
     }
     if (gTraceState == TRACE_ACTIVE && phase == PH_TEX_UPLOAD && strcmp(event, "enter") == 0 &&
-        gTraceStepState == TRACE_STEPS_WAITING && strstr(gDetail, "font_letter") != nullptr) {
+        gTraceStepState == TRACE_STEPS_WAITING && gDetailFmt == nullptr && strstr(gDetail, "font_letter") != nullptr) {
         gTraceStepState = TRACE_STEPS_ACTIVE;
         gTraceStepsRemaining = WDOG_TRACE_STEP_COUNT;
     }
     // gSeq on every line: the receiver can now tell "the game stopped" from "the datagrams
     // stopped arriving" by whether the next line it sees skipped sequence numbers.
+    char detailBuf[128];
     Emit("WDOG: trace seq=%u frame=%u phase=%s event=%s detail=%s\n", gSeq, gFrame, PhaseName(phase), event,
-         gDetail);
+         DetailText(detailBuf, sizeof(detailBuf)));
 }
 
 void TraceStep(uint32_t opcode, const void* cmd, uint32_t steps) {
@@ -1993,6 +1996,7 @@ static int Main(int, const char**) {
         }
         samplesSinceWatchdogTick = 0;
 
+        char detailBuf[128];
         const uint32_t seq = gSeq;
         const uint32_t phase = gPhase;
         const uint32_t frame = gFrame;
@@ -2026,7 +2030,7 @@ static int Main(int, const char**) {
             // a DONE flag means it stopped just after that call returned, not inside it.
             Emit("WDOG: STALLED %ums phase=%s%s frame=%u steps=%u opcode=0x%02X cmd=0x%08X detail=%s flips=%u\n",
                  stalledTicks * WDOG_TICK_INTERVAL_MS, PhaseName(phase), (phase & PH_DONE) ? "(returned)" : "(in progress)",
-                 frame, steps, opcode, cmd, gDetail, gFlipCount);
+                 frame, steps, opcode, cmd, DetailText(detailBuf, sizeof(detailBuf)), gFlipCount);
         } else {
             if (stalledTicks != 0) {
                 Emit("WDOG: recovered after %ums\n", stalledTicks * WDOG_TICK_INTERVAL_MS);
@@ -2035,7 +2039,7 @@ static int Main(int, const char**) {
             lastSeq = seq;
             Emit("WDOG: alive seq=%u phase=%s%s frame=%u steps=%u opcode=0x%02X cmd=0x%08X detail=%s flips=%u\n",
                  seq, PhaseName(phase), (phase & PH_DONE) ? "(returned)" : "(in progress)", frame, steps, opcode,
-                 cmd, gDetail, gFlipCount);
+                 cmd, DetailText(detailBuf, sizeof(detailBuf)), gFlipCount);
         }
 
         ++tick;

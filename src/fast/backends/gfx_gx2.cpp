@@ -419,27 +419,27 @@ static void gfx_gx2_load_shader(struct ShaderProgram* new_prg) {
         SPDLOG_INFO("gfx_gx2: shader load: GX2SetFetchShader ...");
     }
     {
-        WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_FETCH_SHADER,
-                       "shader_id0=0x%016llX shader_id1=0x%08X", static_cast<unsigned long long>(new_prg->shader_id0),
-                       static_cast<unsigned int>(new_prg->shader_id1));
+        WDOG_SCOPE_ARGS(::Ship::WiiU::Watchdog::PH_GX2_SET_FETCH_SHADER, "shader_id0=0x%08X%08X shader_id1=0x%08X",
+                        static_cast<uint32_t>(new_prg->shader_id0 >> 32), static_cast<uint32_t>(new_prg->shader_id0),
+                        static_cast<uint32_t>(new_prg->shader_id1));
         GX2SetFetchShader(&new_prg->group.fetchShader);
     }
     if (trace) {
         SPDLOG_INFO("gfx_gx2: shader load: GX2SetFetchShader complete; GX2SetVertexShader ...");
     }
     {
-        WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_VERTEX_SHADER,
-                       "shader_id0=0x%016llX shader_id1=0x%08X", static_cast<unsigned long long>(new_prg->shader_id0),
-                       static_cast<unsigned int>(new_prg->shader_id1));
+        WDOG_SCOPE_ARGS(::Ship::WiiU::Watchdog::PH_GX2_SET_VERTEX_SHADER, "shader_id0=0x%08X%08X shader_id1=0x%08X",
+                        static_cast<uint32_t>(new_prg->shader_id0 >> 32), static_cast<uint32_t>(new_prg->shader_id0),
+                        static_cast<uint32_t>(new_prg->shader_id1));
         GX2SetVertexShader(&new_prg->group.vertexShader);
     }
     if (trace) {
         SPDLOG_INFO("gfx_gx2: shader load: GX2SetVertexShader complete; GX2SetPixelShader ...");
     }
     {
-        WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_PIXEL_SHADER,
-                       "shader_id0=0x%016llX shader_id1=0x%08X", static_cast<unsigned long long>(new_prg->shader_id0),
-                       static_cast<unsigned int>(new_prg->shader_id1));
+        WDOG_SCOPE_ARGS(::Ship::WiiU::Watchdog::PH_GX2_SET_PIXEL_SHADER, "shader_id0=0x%08X%08X shader_id1=0x%08X",
+                        static_cast<uint32_t>(new_prg->shader_id0 >> 32), static_cast<uint32_t>(new_prg->shader_id0),
+                        static_cast<uint32_t>(new_prg->shader_id1));
         GX2SetPixelShader(&new_prg->group.pixelShader);
     }
     if (trace) {
@@ -554,16 +554,17 @@ static void gfx_gx2_delete_texture(uint32_t texture_id) {
 }
 
 static void gfx_gx2_set_pixel_texture(int tile, int32_t sampler_location, GX2Texture* texture) {
-    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_PIXEL_TEXTURE,
-                   "tile=%d samplerLocation=%d width=%u height=%u pitch=%u imageSize=%u", tile, sampler_location,
-                   static_cast<unsigned int>(texture->surface.width), static_cast<unsigned int>(texture->surface.height),
-                   static_cast<unsigned int>(texture->surface.pitch), static_cast<unsigned int>(texture->surface.imageSize));
+    WDOG_SCOPE_ARGS(::Ship::WiiU::Watchdog::PH_GX2_SET_PIXEL_TEXTURE,
+                    "tile=%d samplerLocation=%d width=%u height=%u pitch=%u imageSize=%u", (uint32_t)tile,
+                    (uint32_t)sampler_location, static_cast<uint32_t>(texture->surface.width),
+                    static_cast<uint32_t>(texture->surface.height), static_cast<uint32_t>(texture->surface.pitch),
+                    static_cast<uint32_t>(texture->surface.imageSize));
     GX2SetPixelTexture(texture, sampler_location);
 }
 
 static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
-    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SELECT_TEXTURE, "tile=%d id=0x%08X", tile,
-                   (unsigned int)texture_id);
+    WDOG_SCOPE_ARGS(::Ship::WiiU::Watchdog::PH_GX2_SELECT_TEXTURE, "tile=%d id=0x%08X", (uint32_t)tile,
+                    (uint32_t)texture_id);
     static bool trace_first_texture_select = true;
     const bool trace = trace_first_texture_select;
     struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
@@ -760,8 +761,8 @@ static GX2TexClampMode gfx_cm_to_gx2(uint32_t val) {
 }
 
 static void gfx_gx2_set_sampler_parameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
-    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_GX2_SET_SAMPLER, "tile=%d linear=%d cms=%u cmt=%u", tile,
-                   linear_filter ? 1 : 0, (unsigned int)cms, (unsigned int)cmt);
+    WDOG_SCOPE_ARGS(::Ship::WiiU::Watchdog::PH_GX2_SET_SAMPLER, "tile=%d linear=%d cms=%u cmt=%u", (uint32_t)tile,
+                    linear_filter ? 1u : 0u, (uint32_t)cms, (uint32_t)cmt);
     static bool trace_first_sampler_update = true;
     const bool trace = trace_first_sampler_update;
     struct GX2TextureEntry* tex = current_texture;
