@@ -239,7 +239,7 @@ bool O2rArchive::Open() {
     // Unbuffered made zip_open parse the central directory with one FSA read per entry (oot.o2r:
     // ~23 s instead of 0.7 s, soh923p12). 16 KiB lets one read cover a small entry's local header
     // and its data, without paying a large transfer per random-access load.
-    if (std::setvbuf(archiveFile, nullptr, _IOFBF, 16 * 1024) != 0) {
+    if (std::setvbuf(archiveFile, nullptr, _IOFBF, 128 * 1024) != 0) {
         std::fclose(archiveFile);
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;
