@@ -1714,7 +1714,7 @@ struct ProfileAddressRange {
     uint32_t start;
     uint32_t end;
 };
-static ProfileAddressRange sAllocatorRanges[6];
+static ProfileAddressRange sAllocatorRanges[7];
 static uint32_t sAllocatorRangeCount = 0;
 
 static void ProfileAddAllocatorRange(uintptr_t address, uint32_t size) {
@@ -1735,6 +1735,9 @@ extern "C" const char kProfSym__wrap_memalign[] __asm__("__wrap_memalign");
 extern "C" const char kProfSym__wrap_realloc[] __asm__("__wrap_realloc");
 extern "C" const char kProfSym__wrap_calloc[] __asm__("__wrap_calloc");
 extern "C" const char kProfSym__wrap__Znwj[] __asm__("__wrap__Znwj");
+// libstdc++'s operator new sits between __wrap__Znwj and __wrap_malloc. __wrap__Znwj above already
+// calls __real__Znwj, so this reference resolves exactly as before and pulls nothing new in.
+extern "C" const char kProfSym__real__Znwj[] __asm__("__real__Znwj");
 
 static void ProfileInitAllocatorRanges() {
     // Sizes from nm -S of soh923p2 (0xF8-0x198), rounded up so a range never covers a neighbour.
@@ -1745,6 +1748,7 @@ static void ProfileInitAllocatorRanges() {
     ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_realloc, 0x120);
     ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap_calloc, 0x1A0);
     ProfileAddAllocatorRange((uintptr_t)kProfSym__wrap__Znwj, 0x100);
+    ProfileAddAllocatorRange((uintptr_t)kProfSym__real__Znwj, 0x80);
 }
 
 static inline bool ProfileIsAllocator(uint32_t address) {
