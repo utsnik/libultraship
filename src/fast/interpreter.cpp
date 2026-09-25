@@ -1357,6 +1357,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     const int16_t fog_offset = mRsp->fog_offset;
     const float aspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
     const float aspect_scale = (4.0f / 3.0f) / aspect;
+    float light_colors[MAX_LIGHTS][3];
+    float ambient_color[3];
 
     if (geometry_mode & G_LIGHTING) {
         if (mRsp->lights_changed) {
@@ -1369,6 +1371,16 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
             mRsp->lights_changed = false;
         }
+
+        for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+            light_colors[i][0] = (float)mRsp->current_lights[i].l.col[0];
+            light_colors[i][1] = (float)mRsp->current_lights[i].l.col[1];
+            light_colors[i][2] = (float)mRsp->current_lights[i].l.col[2];
+        }
+        const int ambient_light = mRsp->current_num_lights - 1;
+        ambient_color[0] = (float)mRsp->current_lights[ambient_light].l.col[0];
+        ambient_color[1] = (float)mRsp->current_lights[ambient_light].l.col[1];
+        ambient_color[2] = (float)mRsp->current_lights[ambient_light].l.col[2];
     }
 
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
@@ -1405,9 +1417,9 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         short V = v->tc[1] * texture_scale_t >> 16;
 
         if (geometry_mode & G_LIGHTING) {
-            int r = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[0];
-            int g = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[1];
-            int b = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[2];
+            float r = ambient_color[0];
+            float g = ambient_color[1];
+            float b = ambient_color[2];
 
             for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
                 float intensity = 0;
@@ -1455,15 +1467,18 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     intensity *= (1.0f / 127.0f);
                 }
                 if (intensity > 0.0f) {
-                    r += intensity * mRsp->current_lights[i].l.col[0];
-                    g += intensity * mRsp->current_lights[i].l.col[1];
-                    b += intensity * mRsp->current_lights[i].l.col[2];
+                    r += intensity * light_colors[i][0];
+                    g += intensity * light_colors[i][1];
+                    b += intensity * light_colors[i][2];
                 }
             }
 
-            d->color.r = r > 255 ? 255 : r;
-            d->color.g = g > 255 ? 255 : g;
-            d->color.b = b > 255 ? 255 : b;
+            const int r_int = (int)r;
+            const int g_int = (int)g;
+            const int b_int = (int)b;
+            d->color.r = r_int > 255 ? 255 : r_int;
+            d->color.g = g_int > 255 ? 255 : g_int;
+            d->color.b = b_int > 255 ? 255 : b_int;
 
             if (geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
