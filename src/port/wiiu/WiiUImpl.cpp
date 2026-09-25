@@ -2006,9 +2006,11 @@ void Start() {
         sGameTextEnd = bias + 0x04C00000u;
     }
     // Set from the game thread so the alarm fires on (and samples) the game thread's core.
+    // 9973 us, not a whole ms: a 10 ms period phase-locked with AX's 3 ms tick and put exactly 1/3 of
+    // all samples on {SYS AX IST} at one PC (2026-09-25).
     OSCreateAlarm(&sProfileAlarm);
     OSSetPeriodicAlarm(&sProfileAlarm, OSGetTime() + OSMillisecondsToTicks(2000),
-                       OSMillisecondsToTicks(kProfileSampleIntervalMs), ProfileAlarmCallback);
+                       OSMicrosecondsToTicks(9973), ProfileAlarmCallback);
 
     // wut wants the socket library brought up before any BSD call. WHBLogUdpInit() has
     // already run by this point and does this for its own socket, but whether that init is
