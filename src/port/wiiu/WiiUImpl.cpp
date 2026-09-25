@@ -1693,6 +1693,29 @@ static void EmitProfileReport() {
     EmitProfileTop("bk", sTopPcs, kProfileTopPcCount);
     ProfileSelectTop(sThProfile[done], sTopPcs, kProfileTopPcCount);
     EmitProfileThreads(sTopPcs, kProfileTopPcCount);
+    // Every sampled PC, not just the top 24: the host sums them per function, so the long tail
+    // (most of the Fast3D interpreter's time) is visible too. ~1000 samples -> ~60 short lines.
+    {
+        char line[256];
+        int length = 0;
+        for (uint32_t index = 0; index < kProfileTableSize; ++index) {
+            const ProfileBucket& bucket = sPcProfile[done][index];
+            if (bucket.address == 0 || bucket.count == 0) {
+                continue;
+            }
+            if (length == 0) {
+                length = snprintf(line, sizeof(line), "PROF: all=");
+            }
+            length += snprintf(line + length, sizeof(line) - (size_t)length, " %X:%u", bucket.address, bucket.count);
+            if (length > 200) {
+                Emit("%s\n", line);
+                length = 0;
+            }
+        }
+        if (length > 0) {
+            Emit("%s\n", line);
+        }
+    }
     Emit("PROF: samples=%u\n", sProfileCount[done]);
 
     memset(sPcProfile[done], 0, sizeof(sPcProfile[done]));
