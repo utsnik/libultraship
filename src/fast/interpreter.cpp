@@ -1383,28 +1383,6 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         ambient_color[2] = (float)mRsp->current_lights[ambient_light].l.col[2];
     }
 
-    // Loop-invariant state in locals: the byte stores into d->color may alias anything, so without
-    // these the compiler reloads this->mRsp, mFbActive and the light data for every vertex.
-    RSP* const rsp = mRsp;
-    const bool fb_active = mFbActive;
-    LoadedVertex* const loaded_vertices = rsp->loaded_vertices;
-    const int num_dir_lights = rsp->current_num_lights - 1;
-    float(*const modelview)[4] = rsp->modelview_matrix_stack[rsp->modelview_matrix_stack_size - 1];
-    float lights_coeffs[MAX_LIGHTS][3];
-    float lookat_coeffs[2][3];
-    if (geometry_mode & G_LIGHTING) {
-        for (int i = 0; i < num_dir_lights; i++) {
-            lights_coeffs[i][0] = rsp->current_lights_coeffs[i][0];
-            lights_coeffs[i][1] = rsp->current_lights_coeffs[i][1];
-            lights_coeffs[i][2] = rsp->current_lights_coeffs[i][2];
-        }
-        for (int i = 0; i < 2; i++) {
-            lookat_coeffs[i][0] = rsp->current_lookat_coeffs[i][0];
-            lookat_coeffs[i][1] = rsp->current_lookat_coeffs[i][1];
-            lookat_coeffs[i][2] = rsp->current_lookat_coeffs[i][2];
-        }
-    }
-
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         if ((i & 1) == 0 && i + 4 < n_vertices) {
             __builtin_prefetch(&vertices[i + 4]);
@@ -1412,7 +1390,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
-        struct LoadedVertex* d = &loaded_vertices[dest_index];
+        struct LoadedVertex* d = &mRsp->loaded_vertices[dest_index];
 
         if (v == nullptr) {
             return;
@@ -1427,13 +1405,13 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         float world_pos[3] = { 0.0 };
         if (geometry_mode & G_LIGHTING_POSITIONAL) {
-            float(*mtx)[4] = modelview;
+            float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
 
-        x = fb_active ? x : x * aspect_scale;
+        x = mFbActive ? x : x * aspect_scale;
 
         short U = v->tc[0] * texture_scale_s >> 16;
         short V = v->tc[1] * texture_scale_t >> 16;
@@ -1443,13 +1421,13 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             float g = ambient_color[1];
             float b = ambient_color[2];
 
-            for (int i = 0; i < num_dir_lights; i++) {
+            for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
                 float intensity = 0;
-                if ((geometry_mode & G_LIGHTING_POSITIONAL) && (rsp->current_lights[i].p.unk3 != 0)) {
+                if ((geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
                     // Calculate distance from the light to the vertex
-                    float dist_vec[3] = { rsp->current_lights[i].p.pos[0] - world_pos[0],
-                                          rsp->current_lights[i].p.pos[1] - world_pos[1],
-                                          rsp->current_lights[i].p.pos[2] - world_pos[2] };
+                    float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - world_pos[0],
+                                          mRsp->current_lights[i].p.pos[1] - world_pos[1],
+                                          mRsp->current_lights[i].p.pos[2] - world_pos[2] };
                     float dist_sq =
                         dist_vec[0] * dist_vec[0] + dist_vec[1] * dist_vec[1] +
                         dist_vec[2] * dist_vec[2] * 2; // The *2 comes from GLideN64, unsure of why it does it
@@ -1458,7 +1436,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     // Transform distance vector (which acts as a direction light vector) into model's space
                     float light_model[3];
                     TransposedMatrixMul(light_model, dist_vec,
-                                        modelview);
+                                        mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
 
                     // Calculate intensity for each axis using standard formula for intensity
                     float light_intensity[3];
@@ -1477,15 +1455,15 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     // Specific coefficients for MM's microcode sourced from GLideN64
                     // https://github.com/gonetz/GLideN64/blob/3b43a13a80dfc2eb6357673440b335e54eaa3896/src/gSP.cpp#L636
                     float distf = floorf(dist);
-                    float attenuation = (distf * rsp->current_lights[i].p.unk7 * 2.0f +
-                                         distf * distf * rsp->current_lights[i].p.unkE / 8.0f) /
+                    float attenuation = (distf * mRsp->current_lights[i].p.unk7 * 2.0f +
+                                         distf * distf * mRsp->current_lights[i].p.unkE / 8.0f) /
                                             (float)0xFFFF +
                                         1.0f;
                     intensity = total_intensity / attenuation;
                 } else {
-                    intensity += normal[0] * lights_coeffs[i][0];
-                    intensity += normal[1] * lights_coeffs[i][1];
-                    intensity += normal[2] * lights_coeffs[i][2];
+                    intensity += normal[0] * mRsp->current_lights_coeffs[i][0];
+                    intensity += normal[1] * mRsp->current_lights_coeffs[i][1];
+                    intensity += normal[2] * mRsp->current_lights_coeffs[i][2];
                     intensity *= (1.0f / 127.0f);
                 }
                 if (intensity > 0.0f) {
@@ -1504,12 +1482,12 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
             if (geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
-                dotx += normal[0] * lookat_coeffs[0][0];
-                dotx += normal[1] * lookat_coeffs[0][1];
-                dotx += normal[2] * lookat_coeffs[0][2];
-                doty += normal[0] * lookat_coeffs[1][0];
-                doty += normal[1] * lookat_coeffs[1][1];
-                doty += normal[2] * lookat_coeffs[1][2];
+                dotx += normal[0] * mRsp->current_lookat_coeffs[0][0];
+                dotx += normal[1] * mRsp->current_lookat_coeffs[0][1];
+                dotx += normal[2] * mRsp->current_lookat_coeffs[0][2];
+                doty += normal[0] * mRsp->current_lookat_coeffs[1][0];
+                doty += normal[1] * mRsp->current_lookat_coeffs[1][1];
+                doty += normal[2] * mRsp->current_lookat_coeffs[1][2];
 
                 dotx *= (1.0f / 127.0f);
                 doty *= (1.0f / 127.0f);
