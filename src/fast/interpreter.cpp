@@ -1384,8 +1384,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     }
 
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
-        if ((i & 1) == 0 && i + 8 < n_vertices) {
-            __builtin_prefetch(&vertices[i + 8]);
+        if ((i & 1) == 0 && i + 4 < n_vertices) {
+            __builtin_prefetch(&vertices[i + 4]);
         }
 
         const F3DVtx_t* v = &vertices[i].v;
