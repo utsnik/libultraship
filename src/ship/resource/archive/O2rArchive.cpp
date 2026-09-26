@@ -10,6 +10,8 @@
 #include <coreinit/time.h>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
+#include <list>
 #include <limits>
 #include <malloc.h>
 #include <unordered_map>
@@ -31,11 +33,122 @@ static uint64_t sO2rInflateMicroseconds = 0;
 static uint64_t sO2rRepeatCompressedBytes = 0;
 static std::unordered_set<std::string> sO2rLoadedPaths;
 static OSFastMutex sO2rLoadedPathsMutex;
+static OSFastMutex sO2rCacheMutex;
+
+constexpr size_t kO2rCacheMaxBytes = 32 * 1024 * 1024;
+constexpr size_t kO2rCacheMaxEntryBytes = 4 * 1024 * 1024;
+
+struct O2rCacheKey {
+    const O2rArchive* archive;
+    std::string filePath;
+
+    bool operator==(const O2rCacheKey& other) const {
+        return archive == other.archive && filePath == other.filePath;
+    }
+};
+
+struct O2rCacheKeyHash {
+    size_t operator()(const O2rCacheKey& key) const {
+        const size_t archiveHash = std::hash<const O2rArchive*>{}(key.archive);
+        const size_t pathHash = std::hash<std::string>{}(key.filePath);
+        return archiveHash ^ (pathHash + 0x9e3779b9 + (archiveHash << 6) + (archiveHash >> 2));
+    }
+};
+
+struct O2rCacheEntry {
+    O2rCacheKey key;
+    std::vector<char> compressedData;
+    zip_uint16_t compMethod;
+    zip_uint64_t uncompressedSize;
+};
+
+using O2rCacheList = std::list<O2rCacheEntry>;
+static O2rCacheList sO2rCache;
+static std::unordered_map<O2rCacheKey, O2rCacheList::iterator, O2rCacheKeyHash> sO2rCacheIndex;
+static size_t sO2rCacheBytes = 0;
+static uint32_t sO2rCacheHits = 0;
+static uint64_t sO2rCacheHitBytes = 0;
 
 struct O2rMutexInitializer {
-    O2rMutexInitializer() { OSFastMutex_Init(&sO2rLoadedPathsMutex, "O2rLoadedPaths"); }
+    O2rMutexInitializer() {
+        OSFastMutex_Init(&sO2rLoadedPathsMutex, "O2rLoadedPaths");
+        OSFastMutex_Init(&sO2rCacheMutex, "O2rCache");
+    }
 };
 static O2rMutexInitializer sO2rMutexInitializer;
+
+static bool O2rCacheLoad(const O2rArchive* archive, const std::string& filePath,
+                         std::vector<char>& compressedData, zip_uint16_t& compMethod,
+                         zip_uint64_t& uncompressedSize) {
+    OSFastMutex_Lock(&sO2rCacheMutex);
+    const O2rCacheKey key{ archive, filePath };
+    auto cacheEntry = sO2rCacheIndex.find(key);
+    if (cacheEntry == sO2rCacheIndex.end()) {
+        OSFastMutex_Unlock(&sO2rCacheMutex);
+        return false;
+    }
+
+    sO2rCache.splice(sO2rCache.begin(), sO2rCache, cacheEntry->second);
+    const auto& entry = sO2rCache.front();
+    compressedData = entry.compressedData;
+    compMethod = entry.compMethod;
+    uncompressedSize = entry.uncompressedSize;
+    sO2rCacheHits++;
+    sO2rCacheHitBytes += compressedData.size();
+    OSFastMutex_Unlock(&sO2rCacheMutex);
+    return true;
+}
+
+static void O2rCacheStore(const O2rArchive* archive, const std::string& filePath,
+                          const std::vector<char>& compressedData, zip_uint16_t compMethod,
+                          zip_uint64_t uncompressedSize) {
+    if (compressedData.size() > kO2rCacheMaxEntryBytes) {
+        return;
+    }
+
+    OSFastMutex_Lock(&sO2rCacheMutex);
+    const O2rCacheKey key{ archive, filePath };
+    auto existingEntry = sO2rCacheIndex.find(key);
+    if (existingEntry != sO2rCacheIndex.end()) {
+        sO2rCacheBytes -= existingEntry->second->compressedData.size();
+        sO2rCache.erase(existingEntry->second);
+        sO2rCacheIndex.erase(existingEntry);
+    }
+
+    while (sO2rCacheBytes + compressedData.size() > kO2rCacheMaxBytes && !sO2rCache.empty()) {
+        auto leastRecentlyUsed = std::prev(sO2rCache.end());
+        sO2rCacheBytes -= leastRecentlyUsed->compressedData.size();
+        sO2rCacheIndex.erase(leastRecentlyUsed->key);
+        sO2rCache.pop_back();
+    }
+
+    sO2rCache.push_front({ key, compressedData, compMethod, uncompressedSize });
+    sO2rCacheIndex.emplace(sO2rCache.front().key, sO2rCache.begin());
+    sO2rCacheBytes += compressedData.size();
+    OSFastMutex_Unlock(&sO2rCacheMutex);
+}
+
+static void O2rCacheClear(const O2rArchive* archive) {
+    OSFastMutex_Lock(&sO2rCacheMutex);
+    for (auto cacheEntry = sO2rCache.begin(); cacheEntry != sO2rCache.end();) {
+        if (cacheEntry->key.archive == archive) {
+            sO2rCacheBytes -= cacheEntry->compressedData.size();
+            sO2rCacheIndex.erase(cacheEntry->key);
+            cacheEntry = sO2rCache.erase(cacheEntry);
+        } else {
+            ++cacheEntry;
+        }
+    }
+    OSFastMutex_Unlock(&sO2rCacheMutex);
+}
+
+static void O2rCacheGetStats(uint32_t& hits, uint64_t& hitBytes, size_t& cacheBytes) {
+    OSFastMutex_Lock(&sO2rCacheMutex);
+    hits = sO2rCacheHits;
+    hitBytes = sO2rCacheHitBytes;
+    cacheBytes = sO2rCacheBytes;
+    OSFastMutex_Unlock(&sO2rCacheMutex);
+}
 
 // stdio buffer for each open archive. It is ours, not newlib's: newlib allocates it through the
 // wrapped malloc (ExpHeap from 64 KiB up) but fclose frees it with _free_r, which corrupted the heap
@@ -123,14 +236,29 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
     const bool readCompressed =
         zipEntryStat.comp_method == ZIP_CM_STORE || zipEntryStat.comp_method == ZIP_CM_DEFLATE;
-    const OSTime openStart = OSGetSystemTime();
-    struct zip_file* zipEntryFile =
-        zip_fopen_index(mZipArchive, zipEntryIndex, readCompressed ? ZIP_FL_COMPRESSED : 0);
-    sO2rOpenMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - openStart);
+    std::vector<char> compressedData;
+    bool cacheHit = false;
+    if (readCompressed) {
+        cacheHit = O2rCacheLoad(this, filePath, compressedData, zipEntryStat.comp_method, zipEntryStat.size);
+        if (cacheHit) {
+            zipEntryStat.comp_size = compressedData.size();
+        }
+    }
+
+    struct zip_file* zipEntryFile = nullptr;
+    if (!cacheHit) {
+        const OSTime openStart = OSGetSystemTime();
+        zipEntryFile = zip_fopen_index(mZipArchive, zipEntryIndex, readCompressed ? ZIP_FL_COMPRESSED : 0);
+        sO2rOpenMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - openStart);
+    }
 #else
     struct zip_file* zipEntryFile = zip_fopen_index(mZipArchive, zipEntryIndex, 0);
 #endif
-    if (!zipEntryFile) {
+    if (!zipEntryFile
+#ifdef __WIIU__
+        && !cacheHit
+#endif
+    ) {
         SPDLOG_TRACE("Failed to open file {} in zip archive  {}.", filePath, GetPath());
         return nullptr;
     }
@@ -139,7 +267,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     if (readCompressed && (zipEntryStat.comp_size > std::numeric_limits<uInt>::max() ||
                            zipEntryStat.size > std::numeric_limits<uInt>::max())) {
         SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
-        zip_fclose(zipEntryFile);
+        if (!cacheHit) {
+            zip_fclose(zipEntryFile);
+        }
         return nullptr;
     }
 #endif
@@ -149,14 +279,17 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 
 #ifdef __WIIU__
     if (readCompressed) {
-        std::vector<char> compressedData(zipEntryStat.comp_size);
-        const OSTime readStart = OSGetSystemTime();
-        const zip_int64_t bytesRead = zip_fread(zipEntryFile, compressedData.data(), zipEntryStat.comp_size);
-        sO2rReadMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - readStart);
-        if (bytesRead != static_cast<zip_int64_t>(zipEntryStat.comp_size)) {
-            SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
-            zip_fclose(zipEntryFile);
-            return nullptr;
+        if (!cacheHit) {
+            compressedData.resize(zipEntryStat.comp_size);
+            const OSTime readStart = OSGetSystemTime();
+            const zip_int64_t bytesRead = zip_fread(zipEntryFile, compressedData.data(), zipEntryStat.comp_size);
+            sO2rReadMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - readStart);
+            if (bytesRead != static_cast<zip_int64_t>(zipEntryStat.comp_size)) {
+                SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
+                zip_fclose(zipEntryFile);
+                return nullptr;
+            }
+            O2rCacheStore(this, filePath, compressedData, zipEntryStat.comp_method, zipEntryStat.size);
         }
 
         zip_uint64_t outputSize = 0;
@@ -186,7 +319,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 
         if (outputSize != zipEntryStat.size) {
             SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
-            zip_fclose(zipEntryFile);
+            if (!cacheHit) {
+                zip_fclose(zipEntryFile);
+            }
             return nullptr;
         }
     } else {
@@ -200,10 +335,14 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     }
 #endif
 
-    if (zip_fclose(zipEntryFile) != 0) {
+    if (
+#ifdef __WIIU__
+        !cacheHit &&
+#endif
+        zip_fclose(zipEntryFile) != 0) {
         SPDLOG_TRACE("Error closing file {} in zip archive  {}.", filePath, GetPath());
 #ifdef __WIIU__
-        if (readCompressed) {
+        if (readCompressed && !cacheHit) {
             return nullptr;
         }
 #endif
@@ -224,10 +363,16 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     OSFastMutex_Unlock(&sO2rLoadedPathsMutex);
 
     if ((sO2rLoadCount % 256) == 0) {
+        uint32_t cacheHits;
+        uint64_t cacheHitBytes;
+        size_t cacheBytes;
+        O2rCacheGetStats(cacheHits, cacheHitBytes, cacheBytes);
         loadTimer.Record();
         Ship::WiiU::Watchdog::Emit(
-            "O2R: loads=%u repeats=%u repeatKB=%u locateMs=%u openMs=%u readMs=%u inflateMs=%u totalMs=%u\n",
-            sO2rLoadCount, sO2rRepeatLoads, static_cast<uint32_t>(sO2rRepeatCompressedBytes / 1024),
+            "O2R: loads=%u repeats=%u repeatKB=%u hits=%u hitKB=%u cacheKB=%u locateMs=%u openMs=%u readMs=%u "
+            "inflateMs=%u totalMs=%u\n",
+            sO2rLoadCount, sO2rRepeatLoads, static_cast<uint32_t>(sO2rRepeatCompressedBytes / 1024), cacheHits,
+            static_cast<uint32_t>(cacheHitBytes / 1024), static_cast<uint32_t>(cacheBytes / 1024),
             static_cast<uint32_t>(sO2rLocateMicroseconds / 1000), static_cast<uint32_t>(sO2rOpenMicroseconds / 1000),
             static_cast<uint32_t>(sO2rReadMicroseconds / 1000), static_cast<uint32_t>(sO2rInflateMicroseconds / 1000),
             static_cast<uint32_t>(sO2rLoadMicroseconds / 1000));
@@ -315,6 +460,7 @@ bool O2rArchive::Close() {
 
     mZipArchive = nullptr;
 #ifdef __WIIU__
+    O2rCacheClear(this);
     // zip_close has fclose'd the FILE, so its buffer is no longer referenced.
     auto stdioBuffer = sO2rStdioBuffers.find(this);
     if (stdioBuffer != sO2rStdioBuffers.end()) {
@@ -354,6 +500,9 @@ bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_
         return false;
     }
 
+#ifdef __WIIU__
+    O2rCacheClear(this);
+#endif
     SPDLOG_INFO("Successfully wrote file: {}", filePath);
 
     // Reopen the zip file so that it may continued to be used by libultraship
