@@ -1353,8 +1353,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     const uint32_t geometry_mode = mRsp->geometry_mode;
     const uint16_t texture_scale_s = mRsp->texture_scaling_factor.s;
     const uint16_t texture_scale_t = mRsp->texture_scaling_factor.t;
-    const int16_t fog_mul = mRsp->fog_mul;
-    const int16_t fog_offset = mRsp->fog_offset;
+    const float fog_mul = (float)mRsp->fog_mul;
+    const float fog_offset = (float)mRsp->fog_offset;
     const float aspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
     const float aspect_scale = (4.0f / 3.0f) / aspect;
     float light_colors[MAX_LIGHTS][3];
@@ -1492,8 +1492,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 dotx *= (1.0f / 127.0f);
                 doty *= (1.0f / 127.0f);
 
-                dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
-                doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
+                dotx = dotx < -1.0f ? -1.0f : dotx;
+                dotx = dotx > 1.0f ? 1.0f : dotx;
+                doty = doty < -1.0f ? -1.0f : doty;
+                doty = doty > 1.0f ? 1.0f : doty;
 
                 if (geometry_mode & G_TEXTURE_GEN_LINEAR) {
                     // Not sure exactly what formula we should use to get accurate values
@@ -1550,13 +1552,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 w = 0.001f;
             }
 
-            float winv = 1.0f / w;
+            float winv;
+#ifdef __WIIU__
+            __asm__ volatile("fres %0, %1" : "=f"(winv) : "f"(w));
+            winv = winv * (2.0f - w * winv);
+#else
+            winv = 1.0f / w;
+#endif
             if (winv < 0.0f) {
                 winv = std::numeric_limits<int16_t>::max();
             }
 
             float fog_z = z * winv * fog_mul + fog_offset;
-            fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
+            fog_z = fog_z < 0.0f ? 0.0f : fog_z;
+            fog_z = fog_z > 255.0f ? 255.0f : fog_z;
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {
             d->color.a = v->cn[3];
@@ -1593,16 +1602,23 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     const uint32_t cull_back = get_attr(CULL_BACK);
 
     if ((mRsp->geometry_mode & cull_both) != 0) {
-        float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
-        float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
-        float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
-        float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
-        float cross = dx1 * dy2 - dy1 * dx2;
+        float cross;
+        if (v1->w != 0.0f && v2->w != 0.0f && v3->w != 0.0f) {
+            cross = -(v1->x * (v2->y * v3->w - v2->w * v3->y) -
+                      v1->y * (v2->x * v3->w - v2->w * v3->x) +
+                      v1->w * (v2->x * v3->y - v2->y * v3->x));
+        } else {
+            float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
+            float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
+            float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
+            float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
+            cross = dx1 * dy2 - dy1 * dx2;
 
-        if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
-            // If one vertex lies behind the eye, negating cross will give the correct result.
-            // If all vertices lie behind the eye, the triangle will be rejected anyway.
-            cross = -cross;
+            if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
+                // If one vertex lies behind the eye, negating cross will give the correct result.
+                // If all vertices lie behind the eye, the triangle will be rejected anyway.
+                cross = -cross;
+            }
         }
 
         // If inverted culling is requested, negate the cross
@@ -1840,13 +1856,34 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     float texture_scale_s[2], texture_scale_t[2];
     float uls_div4[2], ult_div4[2];
     float clamp_s[2], clamp_t[2];
+    static bool tex_cache_valid[2] = {};
+    static float tex_cache_width[2], tex_cache_height[2];
+    static float tex_cache_width2[2], tex_cache_height2[2];
+    static float tex_cache_width_inv[2], tex_cache_height_inv[2];
+    static float tex_cache_clamp_s[2], tex_cache_clamp_t[2];
     for (int t = 0; t < 2; t++) {
         if (!usedTextures[t]) {
             continue;
         }
 
-        tex_width_inv[t] = 1.0f / tex_width[t];
-        tex_height_inv[t] = 1.0f / tex_height[t];
+        const float width = tex_width[t];
+        const float height = tex_height[t];
+        const float width2 = tex_width2[t];
+        const float height2 = tex_height2[t];
+        if (!tex_cache_valid[t] || tex_cache_width[t] != width || tex_cache_height[t] != height ||
+            tex_cache_width2[t] != width2 || tex_cache_height2[t] != height2) {
+            tex_cache_valid[t] = true;
+            tex_cache_width[t] = width;
+            tex_cache_height[t] = height;
+            tex_cache_width2[t] = width2;
+            tex_cache_height2[t] = height2;
+            tex_cache_width_inv[t] = 1.0f / width;
+            tex_cache_height_inv[t] = 1.0f / height;
+            tex_cache_clamp_s[t] = (width2 - 0.5f) / width;
+            tex_cache_clamp_t[t] = (height2 - 0.5f) / height;
+        }
+        tex_width_inv[t] = tex_cache_width_inv[t];
+        tex_height_inv[t] = tex_cache_height_inv[t];
 
         int shifts = mRdp->texture_tile[mRdp->first_tile_index + t].shifts;
         int shiftt = mRdp->texture_tile[mRdp->first_tile_index + t].shiftt;
@@ -1854,8 +1891,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         texture_scale_t[t] = shiftt == 0 ? 1.0f : shiftt <= 10 ? 1.0f / (1 << shiftt) : (float)(1 << (16 - shiftt));
         uls_div4[t] = mRdp->texture_tile[mRdp->first_tile_index + t].uls / 4.0f;
         ult_div4[t] = mRdp->texture_tile[mRdp->first_tile_index + t].ult / 4.0f;
-        clamp_s[t] = (tex_width2[t] - 0.5f) / tex_width[t];
-        clamp_t[t] = (tex_height2[t] - 0.5f) / tex_height[t];
+        clamp_s[t] = tex_cache_clamp_s[t];
+        clamp_t[t] = tex_cache_clamp_t[t];
     }
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
