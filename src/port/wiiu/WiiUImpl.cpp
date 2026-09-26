@@ -604,7 +604,6 @@ static void LeakEmitReport() {
     Ship::WiiU::Watchdog::Emit("LEAK: tracked=%u dropped=%u sample=1/16 below 64KB\n", tracked, dropped);
 }
 
-#endif // WIIU_DIAGNOSTICS
 
 static uint64_t ProbeLargestFree() {
     static const size_t kProbeMax = 64u * 1024u * 1024u;
@@ -626,6 +625,8 @@ static uint64_t ProbeLargestFree() {
     return largest;
 }
 
+#endif // WIIU_DIAGNOSTICS (leak tracker + ProbeLargestFree)
+
 #if WIIU_DIAGNOSTICS
 static void LeakEmitAllocFailure(const char* function, uint64_t bytes, uint64_t alignment,
                                  const uint32_t key[3]) {
@@ -646,21 +647,6 @@ static void LeakEmitAllocFailureIfUnreentrant(LeakThreadState* state, const char
     if (acquired) {
         __sync_lock_release(&state->reentrant);
     }
-}
-
-#else
-
-static void FatalAllocFailure(const char* function, uint64_t bytes, uint64_t alignment) {
-    const struct mallinfo heapInfo = mallinfo();
-    const uint64_t largest = ProbeLargestFree();
-    char message[512];
-    snprintf(message, sizeof(message),
-             "ALLOCFAIL: fn=%s size=%llu align=%llu key=0x%08X,0x%08X,0x%08X arena=%u used=%u largest=%llu "
-             "bigFree=%u bigLargest=%u\n",
-             function, (unsigned long long)bytes, (unsigned long long)alignment, 0u, 0u, 0u,
-             (uint32_t)heapInfo.arena, (uint32_t)heapInfo.uordblks, (unsigned long long)largest,
-             BigHeapFreeBytes(), BigHeapLargestFree());
-    OSFatal(message);
 }
 
 #endif // WIIU_DIAGNOSTICS
@@ -994,12 +980,11 @@ void* __wrap__Znaj(size_t size) {
 
 #else
 
+// Same semantics as the diagnostics build minus the logging: the malloc family returns nullptr
+// and operator new throws std::bad_alloc, so callers that handle failure still can. An uncaught
+// bad_alloc ends in the terminate handler's OSFatal.
 void* __wrap_malloc(size_t size) {
-    void* result = BigRouteAlloc(size, 0);
-    if (result == nullptr) {
-        FatalAllocFailure("malloc", size, 0);
-    }
-    return result;
+    return BigRouteAlloc(size, 0);
 }
 
 void __wrap_free(void* pointer) {
@@ -1007,71 +992,39 @@ void __wrap_free(void* pointer) {
 }
 
 void* __wrap_calloc(size_t count, size_t size) {
-    void* result = BigRouteCalloc(count, size);
-    if (result == nullptr) {
-        FatalAllocFailure("calloc", (uint64_t)count * (uint64_t)size, 0);
-    }
-    return result;
+    return BigRouteCalloc(count, size);
 }
 
 void* __wrap_realloc(void* pointer, size_t size) {
-    void* result = BigRouteRealloc(pointer, size);
-    if (result == nullptr && size != 0) {
-        FatalAllocFailure("realloc", size, 0);
-    }
-    return result;
+    return BigRouteRealloc(pointer, size);
 }
 
 void* __wrap_memalign(size_t alignment, size_t size) {
-    void* result = BigRouteAlloc(size, alignment);
-    if (result == nullptr) {
-        FatalAllocFailure("memalign", size, alignment);
-    }
-    return result;
+    return BigRouteAlloc(size, alignment);
 }
 
 int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
-    const int result = RoutePosixMemalign(pointer, alignment, size);
-    if (result == ENOMEM) {
-        FatalAllocFailure("posix_memalign", size, alignment);
-    }
-    return result;
+    return RoutePosixMemalign(pointer, alignment, size);
 }
 
 void* __wrap_aligned_alloc(size_t alignment, size_t size) {
-    void* result = BigRouteAlloc(size, alignment);
+    return BigRouteAlloc(size, alignment);
+}
+
+void* __wrap__Znwj(size_t size) {
+    void* result = __real__Znwj(size);
     if (result == nullptr) {
-        FatalAllocFailure("aligned_alloc", size, alignment);
+        throw std::bad_alloc();
     }
     return result;
 }
 
-void* __wrap__Znwj(size_t size) {
-    try {
-        void* result = __real__Znwj(size);
-        if (result == nullptr) {
-            FatalAllocFailure("new", size, 0);
-            throw std::bad_alloc();
-        }
-        return result;
-    } catch (const std::bad_alloc&) {
-        FatalAllocFailure("new", size, 0);
-        throw;
-    }
-}
-
 void* __wrap__Znaj(size_t size) {
-    try {
-        void* result = __real__Znaj(size);
-        if (result == nullptr) {
-            FatalAllocFailure("new[]", size, 0);
-            throw std::bad_alloc();
-        }
-        return result;
-    } catch (const std::bad_alloc&) {
-        FatalAllocFailure("new[]", size, 0);
-        throw;
+    void* result = __real__Znaj(size);
+    if (result == nullptr) {
+        throw std::bad_alloc();
     }
+    return result;
 }
 
 #endif // WIIU_DIAGNOSTICS
