@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef WIIU_DIAGNOSTICS
+#define WIIU_DIAGNOSTICS 1
+#endif
+
 // Freeze diagnosis for the Mario Kart 64 race-start hang.
 //
 // The main thread stops inside one Interpreter::Run() and the whole log goes quiet.
@@ -149,6 +153,7 @@ extern volatile uint32_t gFrameTimingWaitUs;
 
 // Updated by the graphics thread and sampled/reset atomically by the watchdog
 // thread at each periodic mem line.
+#if WIIU_DIAGNOSTICS
 void RecordGX2Wait(uint32_t microseconds);
 void RecordGX2SlotWait(uint32_t microseconds);
 void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds);
@@ -371,7 +376,42 @@ struct ScopeFmt {
 void Start();
 void StopProfiler();
 
+#else
+
+inline void RecordGX2Wait(uint32_t) {
+}
+
+inline void RecordGX2SlotWait(uint32_t) {
+}
+
+inline void RecordFrameTiming(uint32_t, uint32_t) {
+}
+
+inline void Emit(const char*, ...) {
+}
+
+inline void HeapMark(const char*) {
+}
+
+inline void TraceEvent(uint32_t, const char*) {
+}
+
+inline void TraceStep(uint32_t, const void*, uint32_t) {
+}
+
+inline void ArmTraceAfterTrackLoad() {
+}
+
+void Start();
+
+inline void StopProfiler() {
+}
+
+#endif // WIIU_DIAGNOSTICS
+
 } // namespace Ship::WiiU::Watchdog
+
+#if WIIU_DIAGNOSTICS
 
 #define WDOG_CAT_(a, b) a##b
 #define WDOG_CAT(a, b) WDOG_CAT_(a, b)
@@ -402,6 +442,33 @@ void StopProfiler();
 #define WDOG_OTR_CACHE_HIT() ::Ship::WiiU::Watchdog::OtrCacheHit()
 #define WDOG_OTR_CACHE_MISS() ::Ship::WiiU::Watchdog::OtrCacheMiss()
 #define WDOG_OTR_RM_LOOKUP() ::Ship::WiiU::Watchdog::OtrResourceManagerLookup()
+
+#else
+
+#define WDOG_ENTER(phase, detail) ((void)0)
+#define WDOG_ENTER_FMT(phase, fmt, ...) ((void)0)
+#define WDOG_EMIT(...) ((void)0)
+#define WDOG_HEAPMARK(label) ((void)0)
+#define WDOG_LEAVE(phase) ((void)0)
+#define WDOG_STEP(op, cmd, steps) ((void)0)
+#define WDOG_FRAME(n) ((void)0)
+#define WDOG_TEXTURE_PATH(path) ((void)0)
+#define WDOG_TEXTURE_DETAIL() nullptr
+#define WDOG_SCOPE(phase, detail) ((void)0)
+#define WDOG_SCOPE_FMT(phase, fmt, ...) ((void)0)
+#define WDOG_SCOPE_ARGS(phase, fmt, ...) ((void)0)
+#define WDOG_TEXALLOC(ptr, size) ((void)0)
+#define WDOG_TEXFREE(size) ((void)0)
+#define WDOG_TEXTURE_CACHE_SIZES(mapSize, freeSize) ((void)0)
+#define WDOG_OTR_TEXTURE_CACHE_SIZE(size) ((void)0)
+#define WDOG_RAW_POINTER_CACHE_SIZES(byPathSize, byHashSize) ((void)0)
+#define WDOG_RESOURCE_CACHE_SIZE(size) ((void)0)
+#define WDOG_SHADER_PROGRAM_POOL_SIZE(size) ((void)0)
+#define WDOG_OTR_CACHE_HIT() ((void)0)
+#define WDOG_OTR_CACHE_MISS() ((void)0)
+#define WDOG_OTR_RM_LOOKUP() ((void)0)
+
+#endif // WIIU_DIAGNOSTICS
 
 #else
 

@@ -1,4 +1,8 @@
 #ifdef __WIIU__
+#ifndef WIIU_DIAGNOSTICS
+#define WIIU_DIAGNOSTICS 1
+#endif
+
 #include <malloc.h>
 #include "port/wiiu/WiiUImpl.h"
 
@@ -10,9 +14,11 @@
 #include <unistd.h>
 #include <sys/iosupport.h>
 
+#include <coreinit/debug.h>
+#if WIIU_DIAGNOSTICS
 #include <whb/log.h>
 #include <whb/log_udp.h>
-#include <coreinit/debug.h>
+#endif
 
 #include <ship/window/Window.h>
 #include <ship/Context.h>
@@ -20,19 +26,23 @@
 
 #include "port/wiiu/WiiUWatchdog.h"
 
+#if WIIU_DIAGNOSTICS
 #include <coreinit/thread.h>
 #include <coreinit/alarm.h>
 #include <coreinit/dynload.h>
 #include <coreinit/time.h>
+#endif
 #include <coreinit/exception.h>
-#include <sys/socket.h>
 #include <coreinit/memheap.h>
 #include <coreinit/memexpheap.h>
+#if WIIU_DIAGNOSTICS
+#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <coreinit/core.h>
 #include <sysapp/launch.h>
 #include <nsysnet/_socket.h>
+#endif
 #include <cstdlib>
 #include <errno.h>
 #include <new>
@@ -41,7 +51,9 @@
 namespace Ship {
 namespace WiiU {
 namespace Watchdog {
+#if WIIU_DIAGNOSTICS
 void Emit(const char* fmt, ...);
+#endif
 }
 }
 }
@@ -65,6 +77,10 @@ void* __real__Znaj(size_t);
 // so every data structure here is static and every operation is bounded and allocation-free.
 namespace {
 
+static uint32_t BigHeapFreeBytes();
+static uint32_t BigHeapLargestFree();
+
+#if WIIU_DIAGNOSTICS
 // 262144 x 32 bytes = 8 MB. The first 16384-entry table would fill with long-lived allocations
 // and then drop exactly the new ones a leak is made of.
 static const uint32_t kLeakTableSize = 262144;
@@ -588,7 +604,9 @@ static void LeakEmitReport() {
     Ship::WiiU::Watchdog::Emit("LEAK: tracked=%u dropped=%u sample=1/16 below 64KB\n", tracked, dropped);
 }
 
-static uint64_t LeakProbeLargest() {
+#endif // WIIU_DIAGNOSTICS
+
+static uint64_t ProbeLargestFree() {
     static const size_t kProbeMax = 64u * 1024u * 1024u;
     static const size_t kProbeMin = 4u * 1024u;
     uint64_t largest = 0;
@@ -608,13 +626,11 @@ static uint64_t LeakProbeLargest() {
     return largest;
 }
 
-static uint32_t BigHeapFreeBytes();
-static uint32_t BigHeapLargestFree();
-
+#if WIIU_DIAGNOSTICS
 static void LeakEmitAllocFailure(const char* function, uint64_t bytes, uint64_t alignment,
                                  const uint32_t key[3]) {
     const struct mallinfo heapInfo = mallinfo();
-    const uint64_t largest = LeakProbeLargest();
+    const uint64_t largest = ProbeLargestFree();
     Ship::WiiU::Watchdog::Emit(
         "ALLOCFAIL: fn=%s size=%llu align=%llu key=0x%08X,0x%08X,0x%08X arena=%u used=%u largest=%llu bigFree=%u "
         "bigLargest=%u\n",
@@ -631,6 +647,23 @@ static void LeakEmitAllocFailureIfUnreentrant(LeakThreadState* state, const char
         __sync_lock_release(&state->reentrant);
     }
 }
+
+#else
+
+static void FatalAllocFailure(const char* function, uint64_t bytes, uint64_t alignment) {
+    const struct mallinfo heapInfo = mallinfo();
+    const uint64_t largest = ProbeLargestFree();
+    char message[512];
+    snprintf(message, sizeof(message),
+             "ALLOCFAIL: fn=%s size=%llu align=%llu key=0x%08X,0x%08X,0x%08X arena=%u used=%u largest=%llu "
+             "bigFree=%u bigLargest=%u\n",
+             function, (unsigned long long)bytes, (unsigned long long)alignment, 0u, 0u, 0u,
+             (uint32_t)heapInfo.arena, (uint32_t)heapInfo.uordblks, (unsigned long long)largest,
+             BigHeapFreeBytes(), BigHeapLargestFree());
+    OSFatal(message);
+}
+
+#endif // WIIU_DIAGNOSTICS
 
 // ---- Large-block heap -------------------------------------------------------------------
 // With the texture pack, newlib's arena hit its 943 MB ceiling while only ~555 MB was in use
@@ -752,7 +785,23 @@ static uint32_t BigHeapLargestFree() {
 
 } // namespace
 
+static int RoutePosixMemalign(void** pointer, size_t alignment, size_t size) {
+    if (pointer == nullptr) {
+        return EINVAL;
+    }
+    if (alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) {
+        return EINVAL;
+    }
+    void* result = BigRouteAlloc(size, alignment);
+    if (result == nullptr) {
+        return ENOMEM;
+    }
+    *pointer = result;
+    return 0;
+}
+
 extern "C" {
+#if WIIU_DIAGNOSTICS
 void* __wrap_malloc(size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
@@ -855,25 +904,10 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     return result;
 }
 
-static int LeakPosixMemalign(void** pointer, size_t alignment, size_t size) {
-    if (pointer == nullptr) {
-        return EINVAL;
-    }
-    if (alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) {
-        return EINVAL;
-    }
-    void* result = BigRouteAlloc(size, alignment);
-    if (result == nullptr) {
-        return ENOMEM;
-    }
-    *pointer = result;
-    return 0;
-}
-
 int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
     LeakThreadState* state = LeakCurrentThreadState();
     if (__sync_lock_test_and_set(&state->reentrant, 1) != 0) {
-        const int result = LeakPosixMemalign(pointer, alignment, size);
+        const int result = RoutePosixMemalign(pointer, alignment, size);
         if (result != 0) {
             const uint32_t key[3] = { 0, 0, 0 };
             LeakEmitAllocFailure("posix_memalign", size, alignment, key);
@@ -882,7 +916,7 @@ int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
     }
     uint32_t key[3];
     LeakCaptureKey(key, state->newDepth != 0);
-    const int result = LeakPosixMemalign(pointer, alignment, size);
+    const int result = RoutePosixMemalign(pointer, alignment, size);
     if (result == 0 && pointer != nullptr) {
         LeakRecord((uintptr_t)*pointer, size, key);
     } else if (result != 0) {
@@ -957,6 +991,90 @@ void* __wrap__Znaj(size_t size) {
     }
     return result;
 }
+
+#else
+
+void* __wrap_malloc(size_t size) {
+    void* result = BigRouteAlloc(size, 0);
+    if (result == nullptr) {
+        FatalAllocFailure("malloc", size, 0);
+    }
+    return result;
+}
+
+void __wrap_free(void* pointer) {
+    BigRouteFree(pointer);
+}
+
+void* __wrap_calloc(size_t count, size_t size) {
+    void* result = BigRouteCalloc(count, size);
+    if (result == nullptr) {
+        FatalAllocFailure("calloc", (uint64_t)count * (uint64_t)size, 0);
+    }
+    return result;
+}
+
+void* __wrap_realloc(void* pointer, size_t size) {
+    void* result = BigRouteRealloc(pointer, size);
+    if (result == nullptr && size != 0) {
+        FatalAllocFailure("realloc", size, 0);
+    }
+    return result;
+}
+
+void* __wrap_memalign(size_t alignment, size_t size) {
+    void* result = BigRouteAlloc(size, alignment);
+    if (result == nullptr) {
+        FatalAllocFailure("memalign", size, alignment);
+    }
+    return result;
+}
+
+int __wrap_posix_memalign(void** pointer, size_t alignment, size_t size) {
+    const int result = RoutePosixMemalign(pointer, alignment, size);
+    if (result == ENOMEM) {
+        FatalAllocFailure("posix_memalign", size, alignment);
+    }
+    return result;
+}
+
+void* __wrap_aligned_alloc(size_t alignment, size_t size) {
+    void* result = BigRouteAlloc(size, alignment);
+    if (result == nullptr) {
+        FatalAllocFailure("aligned_alloc", size, alignment);
+    }
+    return result;
+}
+
+void* __wrap__Znwj(size_t size) {
+    try {
+        void* result = __real__Znwj(size);
+        if (result == nullptr) {
+            FatalAllocFailure("new", size, 0);
+            throw std::bad_alloc();
+        }
+        return result;
+    } catch (const std::bad_alloc&) {
+        FatalAllocFailure("new", size, 0);
+        throw;
+    }
+}
+
+void* __wrap__Znaj(size_t size) {
+    try {
+        void* result = __real__Znaj(size);
+        if (result == nullptr) {
+            FatalAllocFailure("new[]", size, 0);
+            throw std::bad_alloc();
+        }
+        return result;
+    } catch (const std::bad_alloc&) {
+        FatalAllocFailure("new[]", size, 0);
+        throw;
+    }
+}
+
+#endif // WIIU_DIAGNOSTICS
 }
 
 static int wiiu_log_open(struct _reent*, void*, const char*, int, int) {
@@ -990,11 +1108,13 @@ void __real___cxa_throw(void* exception, std::type_info* typeInfo, void (*destru
 extern void __init(void);
 
 static void RestoreStdioDevoptab() {
+#if WIIU_DIAGNOSTICS
     // In the linked ELF, devoptab_list[STD_IN/OUT/ERR] default to &dotab_stdnull.
     // Its measured open_r, close_r, read_r, and fstat_r slots are all NULL, so
     // restoring the original entries would hand those NULL slots back during teardown.
     devoptab_list[STD_OUT] = &dotab_devnull;
     devoptab_list[STD_ERR] = &dotab_devnull;
+#endif
 }
 
 // Every SohGui::RegisterPopup OK handler calls exit(). On Cafe OS that unwinds atexit
@@ -1006,14 +1126,19 @@ static void RestoreStdioDevoptab() {
 void __real_exit(int status) __attribute__((noreturn));
 void __wrap_exit(int status) {
     Ship::WiiU::Watchdog::StopProfiler();
+#if WIIU_DIAGNOSTICS
     Ship::WiiU::Watchdog::Emit("EXIT: exit(%d) - bypassing destructor teardown\n", status);
+#endif
     KPADShutdown();
     RestoreStdioDevoptab();
+#if WIIU_DIAGNOSTICS
     WHBLogUdpDeinit();
+#endif
     _Exit(status);
 }
 
 void __wrap___cxa_throw(void* exception, std::type_info* typeInfo, void (*destructor)(void*)) {
+#if WIIU_DIAGNOSTICS
     // One frame is not enough: __cxa_throw is called BY std::__throw_out_of_range, so
     // __builtin_return_address(0) only ever names that helper. Walk the PowerPC
     // back-chain instead - r1 points at a frame whose first word is the caller's frame
@@ -1041,6 +1166,7 @@ void __wrap___cxa_throw(void* exception, std::type_info* typeInfo, void (*destru
         sp = next;
     }
     Ship::WiiU::Watchdog::Emit("%s\n", line);
+#endif
     __real___cxa_throw(exception, typeInfo, destructor);
 }
 }
@@ -1089,6 +1215,7 @@ static char* AppendExceptionRegister(char* destination, const char* name, uint32
     return destination;
 }
 
+#if WIIU_DIAGNOSTICS
 static void EmitExceptionMessage(const char* typeName, const OSContext* context) {
     // Emit formats into a 384-byte stack-local buffer, so sequential calls keep their own
     // text. Emit the register evidence before OSGetSymbolName: symbol lookup may stall or
@@ -1125,6 +1252,7 @@ static void EmitExceptionMessage(const char* typeName, const OSContext* context)
     }
     Watchdog::Emit("EXC-SYM: lr=0x%08X %s caller=0x%08X %s\n", context->lr, lrSymbol, caller, callerSymbol);
 }
+#endif
 
 static void FormatExceptionMessage(const char* typeName, const OSContext* context) {
     char* destination = sExceptionMessage;
@@ -1159,7 +1287,9 @@ static void FormatExceptionMessage(const char* typeName, const OSContext* contex
 
 static BOOL FatalException(const char* typeName, OSContext* context) {
     FormatExceptionMessage(typeName, context);
+#if WIIU_DIAGNOSTICS
     EmitExceptionMessage(typeName, context);
+#endif
     OSFatal(sExceptionMessage);
     return FALSE;
 }
@@ -1206,6 +1336,7 @@ static void InstallExceptionCallbacks() {
                              FloatingPointExceptionCallback);
 }
 
+#if WIIU_DIAGNOSTICS
 static OSThread sCrashTestThread;
 static uint8_t sCrashTestStack[4 * 1024] __attribute__((aligned(16)));
 
@@ -1236,8 +1367,8 @@ static void ArmCrashTestIfRequested() {
     OSSetThreadName(&sCrashTestThread, "Wii U crash test");
     OSResumeThread(&sCrashTestThread);
 }
+#endif // WIIU_DIAGNOSTICS
 
-#if 1 /* force UDP logging: no other way to diagnose on-device */
 extern "C" {
 void __wrap_abort() {
     // An assert() or abort() fired. printf() here only reaches the devoptab/UDP path, which is
@@ -1259,6 +1390,7 @@ void __wrap_abort() {
         ;
 }
 
+#if WIIU_DIAGNOSTICS
 static ssize_t wiiu_log_write(struct _reent* r, void* fd, const char* ptr, size_t len) {
     char buf[1024];
     snprintf(buf, sizeof(buf), "%*.*s", len, len, ptr);
@@ -1274,8 +1406,8 @@ static const devoptab_t dotab_stdout = {
     .write_r = wiiu_log_write,
     .fstat_r = wiiu_log_fstat,
 };
-};
 #endif
+};
 
 void Init(const std::string& shortName) {
     // Called twice now: once at the very top of InitOTR (so logging and the chdir are
@@ -1287,7 +1419,7 @@ void Init(const std::string& shortName) {
     }
     sInitialised = true;
 
-#if 1 /* force UDP logging: no other way to diagnose on-device */
+#if WIIU_DIAGNOSTICS
     WHBLogUdpInit();
     WHBLogPrint("Hello World!");
 
@@ -1307,15 +1439,19 @@ void Init(const std::string& shortName) {
 
     Watchdog::Start();
     InstallExceptionCallbacks();
+#if WIIU_DIAGNOSTICS
     Watchdog::Emit("EXC: exception handlers installed successfully\n");
     ArmCrashTestIfRequested();
+#endif
 }
 
 void Exit() {
     KPADShutdown();
 
     RestoreStdioDevoptab();
+#if WIIU_DIAGNOSTICS
     WHBLogUdpDeinit();
+#endif
 }
 
 void ThrowMissingOTR(const char* otrPath) {
@@ -1401,6 +1537,7 @@ volatile uint32_t gEventStream = 0;
 volatile uint32_t gEmitOk = 0;
 volatile uint32_t gEmitFail = 0;
 
+#if WIIU_DIAGNOSTICS
 // The profiler is deliberately a small, allocation-free open-addressed table. The watchdog
 // samples the render thread while it is suspended, then does all table work only after the
 // thread has been resumed.
@@ -2186,6 +2323,19 @@ void Start() {
     OSResumeThread(&sThread);
 }
 
+#else
+
+static void TerminateHandler() {
+    OSFatal("CXX: terminate\n");
+    _Exit(1);
+}
+
+void Start() {
+    std::set_terminate(TerminateHandler);
+}
+
+#endif // WIIU_DIAGNOSTICS
+
 } // namespace Watchdog
 
 }; // namespace WiiU
@@ -2193,6 +2343,7 @@ void Start() {
 
 extern "C" void modelRenderWatchdogReportInvalidDisplayList(uint32_t index, uint32_t size, const char* handler,
                                                             const void* node) {
+#if WIIU_DIAGNOSTICS
     static uint32_t emitted = 0;
     static uint64_t lastEmitTick = 0;
     static const uint64_t kTicksPerSecond = 62156250ULL;
@@ -2215,6 +2366,12 @@ extern "C" void modelRenderWatchdogReportInvalidDisplayList(uint32_t index, uint
         "MODEL: skipped invalid display-list index=%u size=%u handler=%s node=%p cmd0=0x%08X size4=0x%08X "
         "arr=[%d,%d,%d]\n",
         index, size, handler, node, words[0], words[1], (int)arr[0], (int)arr[1], (int)arr[2]);
+#else
+    (void)index;
+    (void)size;
+    (void)handler;
+    (void)node;
+#endif
 }
 
 #endif
