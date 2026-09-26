@@ -41,7 +41,7 @@ static O2rMutexInitializer sO2rMutexInitializer;
 // wrapped malloc (ExpHeap from 64 KiB up) but fclose frees it with _free_r, which corrupted the heap
 // with a 128 KiB buffer (soh923p15). 0x40 alignment also lets wut's __wut_fsa_read fill it with one
 // FSAReadFile instead of splitting off an unaligned head through its 64-byte bounce buffer.
-constexpr size_t kO2rStdioBufferSize = 128 * 1024;
+constexpr size_t kO2rStdioBufferSize = 4 * 1024;
 static std::unordered_map<const void*, void*> sO2rStdioBuffers;
 
 class O2rLoadTimer {
