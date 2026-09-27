@@ -1319,6 +1319,50 @@ static void gfx_gx2_enqueue_depth_readback(DrawBufferSlot& slot) {
     slot.depth_readback_pending = true;
 }
 
+// One performance line a minute in every build flavour, release included: average fps over the minute,
+// the worst 5-second window, CPU ms per frame and the scene, so a player's log file (logs/) says how the
+// game ran. One SD write a minute. Gaps over 1 s (HOME menu, loading) restart the windows instead of
+// counting as slow frames. The game may define wiiu_perf_scene() to name the scene.
+extern "C" int wiiu_perf_scene(void) __attribute__((weak));
+
+static void gfx_gx2_perf_tick(uint32_t cpu_us) {
+    static OSTime last = 0, minuteStart = 0, windowStart = 0;
+    static uint32_t minuteFrames = 0, windowFrames = 0;
+    static uint64_t cpuSum = 0;
+    static float worst = 0.0f;
+    const OSTime now = OSGetSystemTime();
+    if (last == 0 || OSTicksToMilliseconds(now - last) > 1000) {
+        last = minuteStart = windowStart = now;
+        minuteFrames = windowFrames = 0;
+        cpuSum = 0;
+        worst = 0.0f;
+        return;
+    }
+    last = now;
+    minuteFrames++;
+    windowFrames++;
+    cpuSum += cpu_us;
+    const float windowSec = OSTicksToMicroseconds(now - windowStart) / 1e6f;
+    if (windowSec >= 5.0f) {
+        const float fps = windowFrames / windowSec;
+        if (worst == 0.0f || fps < worst) {
+            worst = fps;
+        }
+        windowStart = now;
+        windowFrames = 0;
+    }
+    const float minuteSec = OSTicksToMicroseconds(now - minuteStart) / 1e6f;
+    if (minuteSec >= 60.0f) {
+        SPDLOG_INFO("PERF: {:.1f} fps avg over {:.0f} s, worst 5 s {:.1f} fps, cpu {:.1f} ms/frame, scene {:#x}",
+                    minuteFrames / minuteSec, minuteSec, worst, cpuSum / 1000.0f / minuteFrames,
+                    wiiu_perf_scene ? wiiu_perf_scene() : -1);
+        minuteStart = windowStart = now;
+        minuteFrames = windowFrames = 0;
+        cpuSum = 0;
+        worst = 0.0f;
+    }
+}
+
 static void gfx_gx2_end_frame(void) {
     const bool trace = gfx_gx2_trace_first_frame;
     DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
@@ -1336,6 +1380,7 @@ static void gfx_gx2_end_frame(void) {
     const OSTime submit_time = OSGetSystemTime();
     slot.cpu_microseconds = gfx_gx2_elapsed_microseconds(frame_start_time, submit_time);
     slot.submitted_timestamp = GX2GetLastSubmittedTimeStamp();
+    gfx_gx2_perf_tick(slot.cpu_microseconds);
 
     if (draw_buffer_double_buffered) {
         draw_buffer_slot_index = (draw_buffer_slot_index + 1) % 2;
