@@ -1,5 +1,6 @@
 #define NOMINMAX
 
+#include <unordered_set>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -3805,7 +3806,16 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         gfx->GfxDpSetTextureImage(fmt, size, width, fileName, texFlags, rawTexMetadata,
                                   reinterpret_cast<char*>(texture->ImageData));
     } else {
+#ifdef __WIIU__
+        // A missing texture is looked up on every draw that uses it; logging each one costs a blocking
+        // UDP send (dev) or an SD flush (release) per draw. Report each path once.
+        static std::unordered_set<std::string> reported;
+        if (reported.size() < 256 && reported.insert(fileName ? fileName : "(null)").second) {
+            SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null: {}", fileName ? fileName : "(null)");
+        }
+#else
         SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null");
+#endif
     }
     return false;
 }

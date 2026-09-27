@@ -1409,7 +1409,6 @@ static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32
     }
 
     if (buffer->texture.surface.width == width && buffer->texture.surface.height == height) {
-        SPDLOG_INFO("gfx_gx2: UpdateFramebufferParameters unchanged; complete");
         return;
     }
 
