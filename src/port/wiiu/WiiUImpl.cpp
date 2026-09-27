@@ -1564,7 +1564,6 @@ static OSThread* sSampleThread = nullptr;
 static uint8_t sStack[32 * 1024] __attribute__((aligned(16)));
 static int sSocket = -1;
 static bool sStarted = false;
-static bool sRescueFired = false;
 
 static const char* PhaseName(uint32_t phase) {
     switch (phase & ~PH_DONE) {
@@ -2097,26 +2096,11 @@ static int Main(int, const char**) {
 
         if (seq == lastSeq) {
             ++stalledTicks;
-            // Self-rescue attempt, once per run. Two things are being measured at once, and
-            // both are worth a line of code:
-            //   1. If this line ARRIVES, the watchdog thread is still running while the game
-            //      is stuck - which retires "the wedge is PowerPC-wide" as a claim, since that
-            //      only ever rested on this channel going quiet.
-            //   2. If the console then actually returns to the menu, the loop becomes
-            //      autonomous: ftpiiu and wiiload come back by themselves and no hand is
-            //      needed. It may well not work - SYSLaunchMenu needs the MAIN thread to
-            //      process the ProcUI foreground release, and that is the thread that is
-            //      stuck - but it costs one call to find out.
-            // Nothing here allocates before the Emit: a held heap lock must not be what
-            // stops the report.
-            // Only after the first flip: boot is legitimately slow (40 s under the leak tracker) and
-            // an early rescue sent a healthy, still-loading soh923m3 back to the Menu.
-            if (!sRescueFired && gFlipCount > 0 && (stalledTicks * WDOG_TICK_INTERVAL_MS) >= WDOG_STALL_RESCUE_MS) {
-                sRescueFired = true;
-                Emit("WDOG: stalled %ums - watchdog thread IS alive; attempting SYSLaunchMenu\n",
-                     stalledTicks * WDOG_TICK_INTERVAL_MS);
-                SYSLaunchMenu();
-            }
+            // No self-rescue here. The SYSLaunchMenu() attempt that used to fire after
+            // WDOG_STALL_RESCUE_MS could not tell a hang from the HOME menu or a slow exit (both stop
+            // flips), and calling it while the title was exiting DSI'd in __OSClearCopyData
+            // (<- SYSCheckSystemApplicationExists) and wedged the console (2026-09-27 16:36, and the
+            // HOME -> Close freeze at 19:03). Report only.
             // The main thread has not moved. Whatever `phase` says is where it stopped;
             // a DONE flag means it stopped just after that call returned, not inside it.
             Emit("WDOG: STALLED %ums phase=%s%s frame=%u steps=%u opcode=0x%02X cmd=0x%08X detail=%s flips=%u\n",
