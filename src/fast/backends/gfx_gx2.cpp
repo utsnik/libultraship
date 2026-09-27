@@ -119,6 +119,14 @@ static struct ShaderProgram* current_shader_program;
 static struct GX2TextureEntry* current_texture;
 static int current_tile;
 
+// The texture and sampler last selected for each tile (sampler slot). The interpreter selects and
+// uploads a draw's textures BEFORE it loads that draw's shader, and a bind is only possible while the
+// current shader has a sampler for the tile. When the previous shader had none, the bind was skipped
+// and nothing rebound it, so the draw sampled whatever texture the slot held before. Prerendered room
+// backgrounds (a textured copy after an untextured draw) came out white. load_shader rebinds these.
+static GX2Texture* tile_bound_texture[6];
+static GX2Sampler* tile_bound_sampler[6];
+
 // 8 MiB per frame arena. Exhaustion keeps the serialized fallback below.
 #define DRAW_BUFFER_SIZE 0x800000
 
@@ -447,6 +455,19 @@ static void gfx_gx2_load_shader(struct ShaderProgram* new_prg) {
     }
 
     gfx_gx2_set_uniforms(new_prg);
+
+    for (int tile = 0; tile < 6; tile++) {
+        const int32_t location = new_prg->samplers_location[tile];
+        if (location == -1) {
+            continue;
+        }
+        if (tile_bound_texture[tile]) {
+            GX2SetPixelTexture(tile_bound_texture[tile], location);
+        }
+        if (tile_bound_sampler[tile]) {
+            GX2SetPixelSampler(tile_bound_sampler[tile], location);
+        }
+    }
     if (trace) {
         SPDLOG_INFO("gfx_gx2: shader load complete");
         trace_first_shader_load = false;
@@ -543,6 +564,14 @@ static uint32_t gfx_gx2_new_texture(void) {
 
 static void gfx_gx2_delete_texture(uint32_t texture_id) {
     struct GX2TextureEntry* tex = (struct GX2TextureEntry*)texture_id;
+    for (int tile = 0; tile < 6; tile++) {
+        if (tile_bound_texture[tile] == &tex->texture) {
+            tile_bound_texture[tile] = nullptr;
+        }
+        if (tile_bound_sampler[tile] == &tex->sampler) {
+            tile_bound_sampler[tile] = nullptr;
+        }
+    }
 
     if (tex->texture.surface.image) {
         gfx_gx2_draw_done("texture free");
@@ -574,6 +603,8 @@ static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
     }
     current_texture = tex;
     current_tile = tile;
+    tile_bound_texture[tile] = tex->texture_uploaded ? &tex->texture : nullptr;
+    tile_bound_sampler[tile] = tex->sampler_set ? &tex->sampler : nullptr;
 
     if (current_shader_program) {
         int32_t sampler_location = current_shader_program->samplers_location[tile];
@@ -743,6 +774,7 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
     }
 
     tex->texture_uploaded = true;
+    tile_bound_texture[current_tile] = &tex->texture;
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame texture upload complete size={}x{}", width, height);
         trace_first_texture_upload = false;
@@ -803,6 +835,7 @@ static void gfx_gx2_set_sampler_parameters(int tile, bool linear_filter, uint32_
     }
 
     tex->sampler_set = true;
+    tile_bound_sampler[tile] = &tex->sampler;
     if (trace) {
         trace_first_sampler_update = false;
     }
@@ -1610,6 +1643,8 @@ void gfx_gx2_select_texture_fb(int fb) {
         SPDLOG_ERROR("gfx_gx2: texture framebuffer selection has no current shader");
         return;
     }
+    tile_bound_texture[0] = &buffer->texture;
+    tile_bound_sampler[0] = &buffer->sampler;
     uint32_t location = current_shader_program->samplers_location[0];
     gfx_gx2_set_pixel_texture(0, location, &buffer->texture);
     GX2SetPixelSampler(&buffer->sampler, location);
