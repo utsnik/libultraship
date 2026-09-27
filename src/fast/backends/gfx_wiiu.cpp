@@ -75,6 +75,8 @@ static MEMHeapHandle heap_MEM1 = nullptr;
 static MEMHeapHandle heap_foreground = nullptr;
 
 bool has_foreground = false;
+uint64_t gfx_wiiu_perf_vsync_wait_us = 0;
+uint32_t gfx_wiiu_perf_dropped_frames = 0;
 static void* mem1_storage = nullptr;
 static void* command_buffer_pool = nullptr;
 static void* secondary_command_buffer = nullptr;
@@ -666,6 +668,7 @@ static bool gfx_wiiu_start_frame(void) {
             // before the freeze, this is where it shows, and nothing recorded it.
             static uint32_t timeouts = 0;
             timeouts++;
+            ++gfx_wiiu_perf_dropped_frames;
             if (timeouts <= 5 || (timeouts % 60) == 0) {
                 Ship::WiiU::Watchdog::Emit("GX2: frame dropped, GPU timeout n=%u swap=%u flip=%u\n",
                                            timeouts, swap_count, flip_count);
@@ -679,6 +682,7 @@ static bool gfx_wiiu_start_frame(void) {
         const OSTime wait_start = OSGetSystemTime();
         GX2WaitForVsync();
         const uint64_t wait_microseconds = OSTicksToMicroseconds(OSGetSystemTime() - wait_start);
+        gfx_wiiu_perf_vsync_wait_us += wait_microseconds;
         Ship::WiiU::Watchdog::RecordGX2Wait(wait_microseconds > UINT32_MAX ? UINT32_MAX
                                                                           : (uint32_t)wait_microseconds);
     }

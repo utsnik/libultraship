@@ -771,6 +771,15 @@ static uint32_t BigHeapLargestFree() {
 
 } // namespace
 
+extern "C" void wiiu_get_perf_big_heap(uint32_t* free_bytes, uint32_t* largest_free_bytes) {
+    if (free_bytes != nullptr) {
+        *free_bytes = BigHeapFreeBytes();
+    }
+    if (largest_free_bytes != nullptr) {
+        *largest_free_bytes = BigHeapLargestFree();
+    }
+}
+
 static int RoutePosixMemalign(void** pointer, size_t alignment, size_t size) {
     if (pointer == nullptr) {
         return EINVAL;

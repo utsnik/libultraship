@@ -21,6 +21,9 @@
 
 extern bool has_foreground;
 extern uint32_t frametime;
+extern uint64_t gfx_wiiu_perf_vsync_wait_us;
+extern uint32_t gfx_wiiu_perf_dropped_frames;
+extern "C" void wiiu_get_perf_big_heap(uint32_t* free_bytes, uint32_t* largest_free_bytes);
 
 bool gfx_wiiu_init_mem1(void);
 

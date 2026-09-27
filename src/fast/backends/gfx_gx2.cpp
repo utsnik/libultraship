@@ -158,6 +158,11 @@ static uint8_t* draw_buffer = nullptr;
 static uint8_t* draw_ptr = nullptr;
 static uint32_t draw_buffer_frame_high_water = 0;
 static OSTime frame_start_time = 0;
+static uint64_t perf_gpu_us = 0;
+static uint32_t perf_gpu_frames = 0;
+static uint32_t perf_gpu_max_us = 0;
+static uint64_t perf_slot_wait_us = 0;
+static uint32_t perf_texture_uploads = 0;
 
 static std::map<std::pair<struct Framebuffer*, std::pair<float, float>>, uint16_t> depth_readback_cache;
 
@@ -299,6 +304,9 @@ static void gfx_gx2_collect_gpu_timing(DrawBufferSlot& slot) {
         gpu_microseconds = gfx_gx2_elapsed_microseconds(top_cpu_time, bottom_cpu_time);
     }
     Ship::WiiU::Watchdog::RecordFrameTiming(gpu_microseconds, slot.cpu_microseconds);
+    perf_gpu_us += gpu_microseconds;
+    ++perf_gpu_frames;
+    perf_gpu_max_us = std::max(perf_gpu_max_us, gpu_microseconds);
     slot.gpu_timing_pending = false;
 }
 
@@ -311,7 +319,9 @@ static void gfx_gx2_wait_for_draw_buffer_slot(DrawBufferSlot& slot) {
                 WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_SLOT_WAIT, "gx2-slot-wait");
                 GX2WaitTimeStamp(slot.submitted_timestamp);
             }
-            Ship::WiiU::Watchdog::RecordGX2SlotWait(gfx_gx2_elapsed_microseconds(start, OSGetSystemTime()));
+            const uint32_t wait_us = gfx_gx2_elapsed_microseconds(start, OSGetSystemTime());
+            perf_slot_wait_us += wait_us;
+            Ship::WiiU::Watchdog::RecordGX2SlotWait(wait_us);
         }
     }
 
@@ -759,6 +769,7 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
                    (unsigned int)tex->texture.surface.pitch);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
+    ++perf_texture_uploads;
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame texture: GX2Invalidate complete");
     }
@@ -1329,12 +1340,23 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
     static OSTime last = 0, minuteStart = 0, windowStart = 0;
     static uint32_t minuteFrames = 0, windowFrames = 0;
     static uint64_t cpuSum = 0;
+    static uint64_t vsyncWaitUs = 0;
+    static uint32_t droppedFrames = 0;
+    static uint64_t depthRequests = 0;
     static float worst = 0.0f;
     const OSTime now = OSGetSystemTime();
     if (last == 0 || OSTicksToMilliseconds(now - last) > 1000) {
         last = minuteStart = windowStart = now;
         minuteFrames = windowFrames = 0;
         cpuSum = 0;
+        vsyncWaitUs = 0;
+        droppedFrames = 0;
+        depthRequests = 0;
+        perf_gpu_us = 0;
+        perf_gpu_frames = 0;
+        perf_gpu_max_us = 0;
+        perf_slot_wait_us = 0;
+        perf_texture_uploads = 0;
         worst = 0.0f;
         return;
     }
@@ -1342,6 +1364,11 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
     minuteFrames++;
     windowFrames++;
     cpuSum += cpu_us;
+    vsyncWaitUs += gfx_wiiu_perf_vsync_wait_us;
+    gfx_wiiu_perf_vsync_wait_us = 0;
+    droppedFrames += gfx_wiiu_perf_dropped_frames;
+    gfx_wiiu_perf_dropped_frames = 0;
+    depthRequests += draw_buffer_slots[draw_buffer_slot_index].depth_read_requests.size();
     const float windowSec = OSTicksToMicroseconds(now - windowStart) / 1e6f;
     if (windowSec >= 5.0f) {
         const float fps = windowFrames / windowSec;
@@ -1353,12 +1380,36 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
     }
     const float minuteSec = OSTicksToMicroseconds(now - minuteStart) / 1e6f;
     if (minuteSec >= 60.0f) {
-        SPDLOG_INFO("PERF: {:.1f} fps avg over {:.0f} s, worst 5 s {:.1f} fps, cpu {:.1f} ms/frame, scene {:#x}",
-                    minuteFrames / minuteSec, minuteSec, worst, cpuSum / 1000.0f / minuteFrames,
-                    wiiu_perf_scene ? wiiu_perf_scene() : -1);
+        const float frames = minuteFrames ? static_cast<float>(minuteFrames) : 1.0f;
+        const float cpuMs = cpuSum / 1000.0f / frames;
+        const float vsyncMs = vsyncWaitUs / 1000.0f / frames;
+        const float slotMs = perf_slot_wait_us / 1000.0f / frames;
+        const float intervalMs = minuteSec * 1000.0f / frames;
+        const float otherMs = intervalMs - cpuMs - vsyncMs - slotMs;
+        const float gpuMs = perf_gpu_frames ? perf_gpu_us / 1000.0f / perf_gpu_frames : 0.0f;
+        const float depthPerFrame = depthRequests / frames;
+        const struct mallinfo heapInfo = mallinfo();
+        uint32_t bigFree = 0;
+        uint32_t bigLargest = 0;
+        wiiu_get_perf_big_heap(&bigFree, &bigLargest);
+        SPDLOG_INFO("PERF: {:.1f} fps avg over {:.0f} s, worst 5 s {:.1f} fps, cpu {:.1f} ms/frame, gpu {:.1f} ms/frame max {:.1f} ms, vsync {:.1f} ms/frame, dropped {}, slot {:.1f} ms/frame, other {:.1f} ms/frame, texUploads {}, texCache {} freeTexIds {} depthCache {} depthReq {:.2f}/frame shaderPool {} resourceCache {} heapUsed {} heapArena {} bigFree {} bigLargest {} scene {:#x}",
+                    minuteFrames / minuteSec, minuteSec, worst, cpuMs, gpuMs, perf_gpu_max_us / 1000.0f,
+                    vsyncMs, droppedFrames, slotMs, otherMs, perf_texture_uploads,
+                    Ship::WiiU::Watchdog::gTextureCacheSize, Ship::WiiU::Watchdog::gFreeTextureIdsSize,
+                    depth_readback_cache.size(), depthPerFrame, Ship::WiiU::Watchdog::gShaderProgramPoolSize,
+                    Ship::WiiU::Watchdog::gResourceCacheSize, (uint32_t)heapInfo.uordblks,
+                    (uint32_t)heapInfo.arena, bigFree, bigLargest, wiiu_perf_scene ? wiiu_perf_scene() : -1);
         minuteStart = windowStart = now;
         minuteFrames = windowFrames = 0;
         cpuSum = 0;
+        vsyncWaitUs = 0;
+        droppedFrames = 0;
+        depthRequests = 0;
+        perf_gpu_us = 0;
+        perf_gpu_frames = 0;
+        perf_gpu_max_us = 0;
+        perf_slot_wait_us = 0;
+        perf_texture_uploads = 0;
         worst = 0.0f;
     }
 }

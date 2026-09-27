@@ -459,11 +459,13 @@ inline void StopProfiler() {
 #define WDOG_SCOPE_ARGS(phase, fmt, ...) ((void)0)
 #define WDOG_TEXALLOC(ptr, size) ((void)0)
 #define WDOG_TEXFREE(size) ((void)0)
-#define WDOG_TEXTURE_CACHE_SIZES(mapSize, freeSize) ((void)0)
+#define WDOG_TEXTURE_CACHE_SIZES(mapSize, freeSize) \
+    (::Ship::WiiU::Watchdog::gTextureCacheSize = (uint32_t)(mapSize), \
+     ::Ship::WiiU::Watchdog::gFreeTextureIdsSize = (uint32_t)(freeSize))
 #define WDOG_OTR_TEXTURE_CACHE_SIZE(size) ((void)0)
 #define WDOG_RAW_POINTER_CACHE_SIZES(byPathSize, byHashSize) ((void)0)
-#define WDOG_RESOURCE_CACHE_SIZE(size) ((void)0)
-#define WDOG_SHADER_PROGRAM_POOL_SIZE(size) ((void)0)
+#define WDOG_RESOURCE_CACHE_SIZE(size) (::Ship::WiiU::Watchdog::gResourceCacheSize = (uint32_t)(size))
+#define WDOG_SHADER_PROGRAM_POOL_SIZE(size) (::Ship::WiiU::Watchdog::gShaderProgramPoolSize = (uint32_t)(size))
 #define WDOG_OTR_CACHE_HIT() ((void)0)
 #define WDOG_OTR_CACHE_MISS() ((void)0)
 #define WDOG_OTR_RM_LOOKUP() ((void)0)
