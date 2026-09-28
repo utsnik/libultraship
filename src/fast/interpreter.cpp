@@ -2326,10 +2326,10 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     // orig_size_bytes,
     //         mRdp->texture_to_load.siz, lrs);
 
-    const std::string& texPath =
+    const std::string_view texPath =
         mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
             ? GetBaseTexturePath(mRdp->texture_to_load.raw_tex_metadata.resource->GetInitData()->Path)
-            : "";
+            : std::string_view{};
     auto maskedTextureIter = mMaskedTextures.find(texPath);
     if (maskedTextureIter != mMaskedTextures.end()) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = true;
@@ -2396,10 +2396,10 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr + start_offset_bytes;
 
-    const std::string& texPath =
+    const std::string_view texPath =
         mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
             ? GetBaseTexturePath(mRdp->texture_to_load.raw_tex_metadata.resource->GetInitData()->Path)
-            : "";
+            : std::string_view{};
     auto maskedTextureIter = mMaskedTextures.find(texPath);
     if (maskedTextureIter != mMaskedTextures.end()) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = true;
