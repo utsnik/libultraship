@@ -29,6 +29,7 @@
 
 #include <vpad/input.h>
 #include <padscore/kpad.h>
+#include <SDL2/SDL.h>
 
 #ifndef _LANGUAGE_C
 #define _LANGUAGE_C
@@ -39,6 +40,7 @@
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_gx2.h"
 #include "ship/Context.h"
+#include "ship/config/ConsoleVariable.h"
 // LUS 9.2.3 has no Fast::Fast3dGui: the ImGui backend dispatch still lives in the
 // monolithic Ship::Gui, keyed off Window::GetWindowBackend(). Use Ship::Gui directly.
 #include "ship/window/Window.h"
@@ -649,6 +651,18 @@ static void gfx_wiiu_handle_events(void) {
     // Fast3dWindow, so hand the gamepad state straight to the ImGui Wii U backend,
     // which is the only consumer that understands VPAD/WPAD.
     ImGui_ImplWiiU_ProcessInput(&input);
+
+    // Nothing here consumes SDL events (input is read from VPAD/KPAD and SDL controller state), but the
+    // control deck calls SDL_PumpEvents every frame, so joystick/controller events queued up to SDL's
+    // 65535 cap. SDLAddRemoveDeviceEventHandler then walked that whole linked list twice per frame
+    // looking for device add/remove: ~22 ms/frame (a third of all samples, in SDL_PeepEventsInternal),
+    // growing over a session. Drop everything except the device events that handler still needs, as
+    // GfxWindowBackendSDL2::HandleEvents does by consuming them.
+    // Off switch for A/B runs: gWiiU.FlushSDLEvents 0.
+    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.FlushSDLEvents", 1)) {
+        SDL_FlushEvents(SDL_FIRSTEVENT, SDL_CONTROLLERDEVICEADDED - 1);
+        SDL_FlushEvents(SDL_CONTROLLERDEVICEREMOVED + 1, SDL_LASTEVENT);
+    }
 }
 
 static bool gfx_wiiu_start_frame(void) {
