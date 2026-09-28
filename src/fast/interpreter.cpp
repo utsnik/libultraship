@@ -3430,21 +3430,31 @@ static SubDlInfo AnalyseSubDl(const F3DGfx* cmd) {
 static const uint8_t kClipPlaneBits[5] = { 2, 1, 4, 8, 32 };
 
 static int SphereOutsideClipPlane(Interpreter* gfx, const float c[3], float r) {
+    // Plane gradients depend only on MP and the aspect scale, which change far less often than this is
+    // called (sqrtf is a libm call on Espresso), so rebuild them only when either changes.
+    static float lastM[4][4];
+    static float lastSx = -1.0f;
+    static float g[5][3], h[5], norm[5];
     const float(*m)[4] = gfx->mRsp->MP_matrix;
     const float sx =
         gfx->mFbActive ? 1.0f : (4.0f / 3.0f) / ((float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height);
-    static const float kPlanes[5][4] = {
-        { 1, 0, 0, -1 }, { -1, 0, 0, -1 }, { 0, -1, 0, -1 }, { 0, 1, 0, -1 }, { 0, 0, 1, -1 }
-    };
-    for (int p = 0; p < 5; p++) {
-        const float a[4] = { kPlanes[p][0] * sx, kPlanes[p][1], kPlanes[p][2], kPlanes[p][3] };
-        float g[3];
-        for (int j = 0; j < 3; j++) {
-            g[j] = a[0] * m[j][0] + a[1] * m[j][1] + a[2] * m[j][2] + a[3] * m[j][3];
+    if (sx != lastSx || memcmp(lastM, m, sizeof(lastM)) != 0) {
+        static const float kPlanes[5][4] = {
+            { 1, 0, 0, -1 }, { -1, 0, 0, -1 }, { 0, -1, 0, -1 }, { 0, 1, 0, -1 }, { 0, 0, 1, -1 }
+        };
+        for (int p = 0; p < 5; p++) {
+            const float a[4] = { kPlanes[p][0] * sx, kPlanes[p][1], kPlanes[p][2], kPlanes[p][3] };
+            for (int j = 0; j < 3; j++) {
+                g[p][j] = a[0] * m[j][0] + a[1] * m[j][1] + a[2] * m[j][2] + a[3] * m[j][3];
+            }
+            h[p] = a[0] * m[3][0] + a[1] * m[3][1] + a[2] * m[3][2] + a[3] * m[3][3];
+            norm[p] = sqrtf(g[p][0] * g[p][0] + g[p][1] * g[p][1] + g[p][2] * g[p][2]);
         }
-        const float h = a[0] * m[3][0] + a[1] * m[3][1] + a[2] * m[3][2] + a[3] * m[3][3];
-        const float f = g[0] * c[0] + g[1] * c[1] + g[2] * c[2] + h;
-        if (f - r * sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) > 0.0f) {
+        memcpy(lastM, m, sizeof(lastM));
+        lastSx = sx;
+    }
+    for (int p = 0; p < 5; p++) {
+        if (g[p][0] * c[0] + g[p][1] * c[1] + g[p][2] * c[2] + h[p] - r * norm[p] > 0.0f) {
             return p;
         }
     }
