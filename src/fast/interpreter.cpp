@@ -116,6 +116,25 @@ static std::string GetPathWithoutFileName(char* filePath) {
 
 constexpr size_t MAX_TRI_BUFFER = 256;
 
+enum class PerfFlushReason : size_t {
+    Texture,
+    Sampler,
+    Shader,
+    DepthZmode,
+    ViewportScissor,
+    Alpha,
+    TriangleBufferCap,
+    Explicit,
+    Count,
+};
+
+static uint64_t sPerfGfxSpVertexCount = 0;
+static uint64_t sPerfFlushCounts[static_cast<size_t>(PerfFlushReason::Count)] = {};
+
+static inline void RecordPerfFlush(PerfFlushReason reason) {
+    ++sPerfFlushCounts[static_cast<size_t>(reason)];
+}
+
 Interpreter::Interpreter() {
     mRsp = new RSP();
     mRdp = new RDP();
@@ -132,6 +151,15 @@ static std::weak_ptr<Interpreter> mInstance;
 // Set a cached pointer to the instance so we don't need to go through the window every time
 void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
+}
+
+extern "C" void FastGetAndResetInterpreterPerf(uint64_t* vertices, uint64_t flushCounts[]) {
+    *vertices = sPerfGfxSpVertexCount;
+    sPerfGfxSpVertexCount = 0;
+    for (size_t i = 0; i < static_cast<size_t>(PerfFlushReason::Count); ++i) {
+        flushCounts[i] = sPerfFlushCounts[i];
+        sPerfFlushCounts[i] = 0;
+    }
 }
 
 void Interpreter::Flush() {
@@ -409,6 +437,7 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
     if (mPrevCombiner != mColorCombinerPool.end()) {
         return &mPrevCombiner->second;
     }
+    RecordPerfFlush(PerfFlushReason::Shader);
     Flush();
     mPrevCombiner = mColorCombinerPool.insert(std::make_pair(key, ColorCombiner())).first;
     GenerateCC(&mPrevCombiner->second, key);
@@ -1350,6 +1379,7 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    sPerfGfxSpVertexCount += n_vertices;
     const float(*MP_matrix)[4] = mRsp->MP_matrix;
     const uint32_t geometry_mode = mRsp->geometry_mode;
     const uint16_t texture_scale_s = mRsp->texture_scaling_factor.s;
@@ -1648,6 +1678,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
+        RecordPerfFlush(PerfFlushReason::DepthZmode);
         Flush();
         mRapi->SetDepthTestAndMask(depth_test, depth_mask);
         mRenderingState.depth_test_and_mask = depth_test_and_mask;
@@ -1655,6 +1686,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
     if (zmode_decal != mRenderingState.decal_mode) {
+        RecordPerfFlush(PerfFlushReason::DepthZmode);
         Flush();
         mRapi->SetZmodeDecal(zmode_decal);
         mRenderingState.decal_mode = zmode_decal;
@@ -1662,11 +1694,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     if (mRdp->viewport_or_scissor_changed) {
         if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
+            RecordPerfFlush(PerfFlushReason::ViewportScissor);
             Flush();
             mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
             mRenderingState.viewport = mRdp->viewport;
         }
         if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
+            RecordPerfFlush(PerfFlushReason::ViewportScissor);
             Flush();
             mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
             mRenderingState.scissor = mRdp->scissor;
@@ -1757,6 +1791,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         uint32_t tile = mRdp->first_tile_index + i;
         if (comb->usedTextures[i]) {
             if (mRdp->textures_changed[i]) {
+                RecordPerfFlush(PerfFlushReason::Texture);
                 Flush();
                 ImportTexture(i, tile, false);
                 if (mRdp->loaded_texture[i].masked) {
@@ -1817,6 +1852,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             bool linear_filter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
             if (linear_filter != mRenderingState.mTextures[i]->second.linear_filter ||
                 cms != mRenderingState.mTextures[i]->second.cms || cmt != mRenderingState.mTextures[i]->second.cmt) {
+                RecordPerfFlush(PerfFlushReason::Sampler);
                 Flush();
 
                 // Set the same sampler params on the blended texture. Needed for opengl.
@@ -1838,12 +1874,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
     }
     if (prg != mRenderingState.mShaderProgram) {
+        RecordPerfFlush(PerfFlushReason::Shader);
         Flush();
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
         mRapi->LoadShader(prg);
         mRenderingState.mShaderProgram = prg;
     }
     if (use_alpha != mRenderingState.alpha_blend) {
+        RecordPerfFlush(PerfFlushReason::Alpha);
         Flush();
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
@@ -2040,6 +2078,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
         // if (++mBufVbo_num_tris == 1) {
+        RecordPerfFlush(PerfFlushReason::TriangleBufferCap);
         Flush();
     }
 }
@@ -3823,6 +3862,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
 bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     Interpreter* gfx = mInstance.lock().get();
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
 
     if (cmd->words.w1) {
@@ -3839,6 +3879,7 @@ bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
 
 bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->mFbActive = false;
     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
@@ -3857,6 +3898,7 @@ bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     bool* hasCopiedPtr = (bool*)cmd->words.w1;
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->CopyFrameBuffer(C0(11, 11), C0(0, 11), (bool)C0(22, 1), hasCopiedPtr);
     return false;
@@ -3879,6 +3921,7 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
     width = C1(0, 16);
     height = C1(16, 16);
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->mRapi->ReadFramebufferToCPU(fbId, width, height, rgba16Buffer);
 
@@ -3899,6 +3942,7 @@ bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     // Flush incase we are replacing a previous blended texture that hasn't been finialized to the GPU
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
 
     char* timg = (char*)cmd->words.w1;
@@ -3929,6 +3973,7 @@ bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->mRapi->SelectTextureFb((uint32_t)cmd->words.w1);
     gfx->mRdp->textures_changed[0] = false;
@@ -4674,6 +4719,7 @@ void Interpreter::RunGuiOnly() {
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     Flush();
     mGfxFrameBuffer = 0;
 
@@ -4738,6 +4784,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         gfx_step();
     }
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     Flush();
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();

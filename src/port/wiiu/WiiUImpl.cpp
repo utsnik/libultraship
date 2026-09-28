@@ -1983,6 +1983,8 @@ static void EmitSystemLandmarks() {
     static const char* const kCoreinit[] = { "OSLockMutex", "OSUnlockMutex", "OSWaitCond", "OSSignalCond",
         "OSWaitEvent", "OSSleepTicks", "OSYieldThread", "OSFastMutex_Lock", "OSUninterruptibleSpinLock_Acquire",
         "DCFlushRange", "DCStoreRange", "DCInvalidateRange", "OSBlockMove", "OSBlockSet", "memcpy", "memset",
+        "OSDisableInterrupts", "OSRestoreInterrupts", "OSSuspendThread", "OSResumeThread", "OSSleepThread",
+        "OSWakeupThread", "__OSLockScheduler",
         "OSGetTime", "OSGetSystemTime", "MEMAllocFromExpHeapEx", "MEMFreeToExpHeap", "OSCompareAndSwapAtomic",
         "OSTestThreadCancel", "OSWaitAlarm", nullptr };
     static const char* const kGx2[] = { "GX2DrawEx", "GX2DrawIndexedEx", "GX2SetAttribBuffer", "GX2SetFetchShader",

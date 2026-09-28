@@ -46,6 +46,7 @@
 #include <proc_ui/procui.h>
 #include <coreinit/memory.h>
 #include <coreinit/cache.h>
+#include <coreinit/time.h>
 
 #include "fast/backends/imgui_impl_gx2.h"
 
@@ -163,6 +164,24 @@ static uint32_t perf_gpu_frames = 0;
 static uint32_t perf_gpu_max_us = 0;
 static uint64_t perf_slot_wait_us = 0;
 static uint32_t perf_texture_uploads = 0;
+static uint64_t perf_gx2_draws = 0;
+static uint64_t perf_gx2_triangles = 0;
+static uint64_t perf_osblockmove_us = 0;
+static uint64_t perf_gx2_invalidate_us = 0;
+static uint64_t perf_gx2_set_attrib_buffer_us = 0;
+static uint64_t perf_gx2_draw_ex_us = 0;
+
+static constexpr size_t PERF_FLUSH_COUNT = 8;
+static constexpr size_t PERF_FLUSH_TEXTURE = 0;
+static constexpr size_t PERF_FLUSH_SAMPLER = 1;
+static constexpr size_t PERF_FLUSH_SHADER = 2;
+static constexpr size_t PERF_FLUSH_DEPTH_ZMODE = 3;
+static constexpr size_t PERF_FLUSH_VIEWPORT_SCISSOR = 4;
+static constexpr size_t PERF_FLUSH_ALPHA = 5;
+static constexpr size_t PERF_FLUSH_TRIANGLE_CAP = 6;
+static constexpr size_t PERF_FLUSH_EXPLICIT = 7;
+
+extern "C" void FastGetAndResetInterpreterPerf(uint64_t* vertices, uint64_t flushCounts[]);
 
 static std::map<std::pair<struct Framebuffer*, std::pair<float, float>>, uint16_t> depth_readback_cache;
 
@@ -1028,20 +1047,30 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: OSBlockMove ...");
     }
+    uint64_t tick = OSGetSystemTick();
     OSBlockMove(new_vbo, buf_vbo, vbo_len, FALSE);
+    perf_osblockmove_us += OSTicksToMicroseconds(OSGetSystemTick() - tick);
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: OSBlockMove complete; GX2Invalidate ...");
     }
+    tick = OSGetSystemTick();
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, new_vbo, vbo_len);
+    perf_gx2_invalidate_us += OSTicksToMicroseconds(OSGetSystemTick() - tick);
 
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: GX2Invalidate complete; GX2SetAttribBuffer ...");
     }
+    tick = OSGetSystemTick();
     GX2SetAttribBuffer(0, vbo_len, current_shader_program->group.stride, new_vbo);
+    perf_gx2_set_attrib_buffer_us += OSTicksToMicroseconds(OSGetSystemTick() - tick);
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: GX2SetAttribBuffer complete; GX2DrawEx ...");
     }
+    tick = OSGetSystemTick();
     GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 3 * buf_vbo_num_tris, 0, 1);
+    perf_gx2_draw_ex_us += OSTicksToMicroseconds(OSGetSystemTick() - tick);
+    ++perf_gx2_draws;
+    perf_gx2_triangles += buf_vbo_num_tris;
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: GX2DrawEx complete");
         gfx_gx2_trace_first_draw = false;
@@ -1332,12 +1361,11 @@ static void gfx_gx2_enqueue_depth_readback(DrawBufferSlot& slot) {
 
 // One performance line a minute in every build flavour, release included: average fps over the minute,
 // the worst 5-second window, CPU ms per frame and the scene, so a player's log file (logs/) says how the
-// game ran. One SD write a minute. Gaps over 1 s (HOME menu, loading) restart the windows instead of
-// counting as slow frames. The game may define wiiu_perf_scene() to name the scene.
+// game ran. One SD write a minute. The game may define wiiu_perf_scene() to name the scene.
 extern "C" int wiiu_perf_scene(void) __attribute__((weak));
 
 static void gfx_gx2_perf_tick(uint32_t cpu_us) {
-    static OSTime last = 0, minuteStart = 0, windowStart = 0;
+    static OSTime minuteStart = 0, windowStart = 0;
     static uint32_t minuteFrames = 0, windowFrames = 0;
     static uint64_t cpuSum = 0;
     static uint64_t vsyncWaitUs = 0;
@@ -1345,8 +1373,11 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
     static uint64_t depthRequests = 0;
     static float worst = 0.0f;
     const OSTime now = OSGetSystemTime();
-    if (last == 0 || OSTicksToMilliseconds(now - last) > 1000) {
-        last = minuteStart = windowStart = now;
+    if (minuteStart == 0) {
+        uint64_t ignoredVertices = 0;
+        uint64_t ignoredFlushCounts[PERF_FLUSH_COUNT] = {};
+        FastGetAndResetInterpreterPerf(&ignoredVertices, ignoredFlushCounts);
+        minuteStart = windowStart = now;
         minuteFrames = windowFrames = 0;
         cpuSum = 0;
         vsyncWaitUs = 0;
@@ -1357,10 +1388,15 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
         perf_gpu_max_us = 0;
         perf_slot_wait_us = 0;
         perf_texture_uploads = 0;
+        perf_gx2_draws = 0;
+        perf_gx2_triangles = 0;
+        perf_osblockmove_us = 0;
+        perf_gx2_invalidate_us = 0;
+        perf_gx2_set_attrib_buffer_us = 0;
+        perf_gx2_draw_ex_us = 0;
         worst = 0.0f;
         return;
     }
-    last = now;
     minuteFrames++;
     windowFrames++;
     cpuSum += cpu_us;
@@ -1388,15 +1424,25 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
         const float otherMs = intervalMs - cpuMs - vsyncMs - slotMs;
         const float gpuMs = perf_gpu_frames ? perf_gpu_us / 1000.0f / perf_gpu_frames : 0.0f;
         const float depthPerFrame = depthRequests / frames;
+        uint64_t gfxSpVertexCount = 0;
+        uint64_t flushCounts[PERF_FLUSH_COUNT] = {};
+        FastGetAndResetInterpreterPerf(&gfxSpVertexCount, flushCounts);
         const struct mallinfo heapInfo = mallinfo();
         uint32_t bigFree = 0;
         uint32_t bigLargest = 0;
         wiiu_get_perf_big_heap(&bigFree, &bigLargest);
-        SPDLOG_INFO("PERF: {:.1f} fps avg over {:.0f} s, worst 5 s {:.1f} fps, cpu {:.1f} ms/frame, gpu {:.1f} ms/frame max {:.1f} ms, vsync {:.1f} ms/frame, dropped {}, slot {:.1f} ms/frame, other {:.1f} ms/frame, texUploads {}, texCache {} freeTexIds {} depthCache {} depthReq {:.2f}/frame shaderPool {} resourceCache {} heapUsed {} heapArena {} bigFree {} bigLargest {} scene {:#x}",
+        SPDLOG_INFO("PERF: {:.1f} fps avg over {:.0f} s, worst 5 s {:.1f} fps, cpu {:.1f} ms/frame, gpu {:.1f} ms/frame max {:.1f} ms, vsync {:.1f} ms/frame, dropped {}, slot {:.1f} ms/frame, other {:.1f} ms/frame, texUploads {}, texCache {} freeTexIds {} depthCache {} depthReq {:.2f}/frame, GX2Draws {:.2f}/frame triangles {:.2f}/frame GfxSpVertex {:.2f}/frame, Flush texture {:.2f}/frame sampler {:.2f}/frame shader {:.2f}/frame depthZmode {:.2f}/frame viewportScissor {:.2f}/frame alpha {:.2f}/frame triCap {:.2f}/frame explicit {:.2f}/frame, OSBlockMove {:.1f} us/frame GX2Invalidate {:.1f} us/frame GX2SetAttribBuffer {:.1f} us/frame GX2DrawEx {:.1f} us/frame, shaderPool {} resourceCache {} heapUsed {} heapArena {} bigFree {} bigLargest {} scene {:#x}",
                     minuteFrames / minuteSec, minuteSec, worst, cpuMs, gpuMs, perf_gpu_max_us / 1000.0f,
                     vsyncMs, droppedFrames, slotMs, otherMs, perf_texture_uploads,
                     Ship::WiiU::Watchdog::gTextureCacheSize, Ship::WiiU::Watchdog::gFreeTextureIdsSize,
-                    depth_readback_cache.size(), depthPerFrame, Ship::WiiU::Watchdog::gShaderProgramPoolSize,
+                    depth_readback_cache.size(), depthPerFrame, perf_gx2_draws / frames, perf_gx2_triangles / frames,
+                    gfxSpVertexCount / frames, flushCounts[PERF_FLUSH_TEXTURE] / frames,
+                    flushCounts[PERF_FLUSH_SAMPLER] / frames, flushCounts[PERF_FLUSH_SHADER] / frames,
+                    flushCounts[PERF_FLUSH_DEPTH_ZMODE] / frames, flushCounts[PERF_FLUSH_VIEWPORT_SCISSOR] / frames,
+                    flushCounts[PERF_FLUSH_ALPHA] / frames, flushCounts[PERF_FLUSH_TRIANGLE_CAP] / frames,
+                    flushCounts[PERF_FLUSH_EXPLICIT] / frames, perf_osblockmove_us / frames,
+                    perf_gx2_invalidate_us / frames, perf_gx2_set_attrib_buffer_us / frames, perf_gx2_draw_ex_us / frames,
+                    Ship::WiiU::Watchdog::gShaderProgramPoolSize,
                     Ship::WiiU::Watchdog::gResourceCacheSize, (uint32_t)heapInfo.uordblks,
                     (uint32_t)heapInfo.arena, bigFree, bigLargest, wiiu_perf_scene ? wiiu_perf_scene() : -1);
         minuteStart = windowStart = now;
@@ -1410,6 +1456,12 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
         perf_gpu_max_us = 0;
         perf_slot_wait_us = 0;
         perf_texture_uploads = 0;
+        perf_gx2_draws = 0;
+        perf_gx2_triangles = 0;
+        perf_osblockmove_us = 0;
+        perf_gx2_invalidate_us = 0;
+        perf_gx2_set_attrib_buffer_us = 0;
+        perf_gx2_draw_ex_us = 0;
         worst = 0.0f;
     }
 }
