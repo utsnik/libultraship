@@ -25,6 +25,7 @@
 #endif
 #include "libultraship/libultra/gbi.h"
 #include "ship/config/ConsoleVariable.h"
+#include "ship/Context.h"
 
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -1013,6 +1014,24 @@ static void gfx_gx2_set_use_alpha(bool use_alpha) {
     }
 }
 
+// Copy a batch into the draw arena. dst is GX2_VERTEX_BUFFER_ALIGNMENT-aligned and the arena end is too, so
+// every 32-byte line up to ALIGN(len, 32) lies inside this draw's reservation: zero-allocate each line with
+// dcbz before writing it, so the stores do not first read a line of cold arena memory from RAM (which is
+// what made OSBlockMove cost 2-4 ms/frame for ~1-2 MB). Off switch: gWiiU.ArenaDcbzCopy 0.
+static void gfx_gx2_copy_to_arena(uint8_t* dst, const float* src, size_t len) {
+    const uint32_t* s = (const uint32_t*)src;
+    const size_t words = len / sizeof(uint32_t);
+    size_t w = 0;
+    for (uint8_t* line = dst; line < dst + len; line += 32) {
+        __asm__ volatile("dcbz 0,%0" : : "r"(line) : "memory");
+        uint32_t* d = (uint32_t*)line;
+        const size_t end = std::min(words, w + 8);
+        for (size_t i = 0; w < end; i++, w++) {
+            d[i] = s[w];
+        }
+    }
+}
+
 static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
     WDOG_SCOPE(::Ship::WiiU::Watchdog::PH_GX2_DRAW_TRIANGLES, "draw triangles");
     const bool trace = gfx_gx2_trace_first_draw;
@@ -1055,8 +1074,18 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: OSBlockMove ...");
     }
+    static uint32_t dcbzCountdown = 0;
+    static bool dcbzCopy = true;
+    if (dcbzCountdown-- == 0) {
+        dcbzCopy = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.ArenaDcbzCopy", 1) != 0;
+        dcbzCountdown = 1024;
+    }
     uint64_t tick = OSGetSystemTick();
-    OSBlockMove(new_vbo, buf_vbo, vbo_len, FALSE);
+    if (dcbzCopy) {
+        gfx_gx2_copy_to_arena((uint8_t*)new_vbo, buf_vbo, vbo_len);
+    } else {
+        OSBlockMove(new_vbo, buf_vbo, vbo_len, FALSE);
+    }
     perf_osblockmove_us += OSTicksToMicroseconds(OSGetSystemTick() - tick);
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first draw: OSBlockMove complete; GX2Invalidate ...");
