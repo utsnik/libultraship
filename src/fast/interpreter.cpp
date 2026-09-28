@@ -3014,9 +3014,46 @@ bool gfx_load_ucode_handler_f3dex2(F3DGfx** cmd) {
     return false;
 }
 
+bool gfx_end_dl_handler_common(F3DGfx** cmd0);
+
+static uint64_t sPerfCullDlTested = 0;
+static uint64_t sPerfCullDlRejected = 0;
+
+extern "C" void FastGetAndResetCullDlPerf(uint64_t* tested, uint64_t* rejected) {
+    *tested = sPerfCullDlTested;
+    *rejected = sPerfCullDlRejected;
+    sPerfCullDlTested = 0;
+    sPerfCullDlRejected = 0;
+}
+
+// gSPCullDisplayList(vstart, vend): the display list's bounding-box vertices were just loaded; if they are
+// all outside the same clip plane, the rest of the list is skipped, as the RSP does. Every triangle inside
+// the box would fail GfxSpTri1's `v1->clip_rej & v2->clip_rej & v3->clip_rej` test anyway, and the flags
+// already include the widescreen aspect scaling, so this only drops work whose output is discarded.
+// Off switch: gWiiU.CullDisplayLists 0 (in case a replacement model outgrows its original bounding box).
 bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
-    // TODO:
-    return false;
+    Interpreter* gfx = mInstance.lock().get();
+    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.CullDisplayLists", 1) == 0) {
+        return false;
+    }
+
+    const uint32_t vstart = ((*cmd)->words.w0 & 0xFFFF) / 2;
+    const uint32_t vend = ((*cmd)->words.w1 & 0xFFFF) / 2;
+    if (vstart > vend || vend >= MAX_VERTICES) {
+        return false;
+    }
+
+    ++sPerfCullDlTested;
+    uint8_t rejected = 0xFF;
+    for (uint32_t i = vstart; i <= vend && rejected != 0; i++) {
+        rejected &= gfx->mRsp->loaded_vertices[i].clip_rej;
+    }
+    if (rejected == 0) {
+        return false;
+    }
+
+    ++sPerfCullDlRejected;
+    return gfx_end_dl_handler_common(cmd);
 }
 
 bool gfx_marker_handler_otr(F3DGfx** cmd0) {
