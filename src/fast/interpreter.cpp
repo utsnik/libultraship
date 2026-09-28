@@ -129,6 +129,11 @@ enum class PerfFlushReason : size_t {
 };
 
 static uint64_t sPerfGfxSpVertexCount = 0;
+// Vertex-batch culling (see VtxBatchCulled): slots whose last load was skipped as wholly off one clip plane.
+// They carry that plane's clip_rej bit but no transformed data; a triangle that reaches them without being
+// trivially rejected is dropped and counted (sPerfStaleTris) instead of drawn from stale values.
+static uint64_t sStaleSlots = 0;
+static uint64_t sPerfStaleTris = 0;
 static uint64_t sPerfFlushCounts[static_cast<size_t>(PerfFlushReason::Count)] = {};
 
 // The reason is only counted if the following Flush() actually submits triangles: most state
@@ -1386,6 +1391,11 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
     sPerfGfxSpVertexCount += n_vertices;
+    if (sStaleSlots != 0) {
+        for (size_t i = dest_index; i < dest_index + n_vertices && i < 64; i++) {
+            sStaleSlots &= ~(1ULL << i);
+        }
+    }
     const float(*MP_matrix)[4] = mRsp->MP_matrix;
     const uint32_t geometry_mode = mRsp->geometry_mode;
     const uint16_t texture_scale_s = mRsp->texture_scaling_factor.s;
@@ -1631,6 +1641,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
+        return;
+    }
+    // (Rectangles use slots MAX_VERTICES..+3, which are never stale.)
+    if (sStaleSlots != 0 && ((vtx1_idx < 64 && ((sStaleSlots >> vtx1_idx) & 1)) ||
+                             (vtx2_idx < 64 && ((sStaleSlots >> vtx2_idx) & 1)) ||
+                             (vtx3_idx < 64 && ((sStaleSlots >> vtx3_idx) & 1)))) {
+        ++sPerfStaleTris;
         return;
     }
 
@@ -3395,6 +3412,33 @@ static SubDlInfo AnalyseSubDl(const F3DGfx* cmd) {
     return info;
 }
 
+// Index of a clip_rej plane (right, left, bottom, top, far) the sphere lies wholly outside of under the
+// current MP matrix, or -1. f = a.(x', y, z, w) > 0 with x' = x * aspect scale, exactly as GfxSpVertex sets
+// the bits, and min over the sphere of the (linear) f is f(c) - r * |grad f|.
+static const uint8_t kClipPlaneBits[5] = { 2, 1, 4, 8, 32 };
+
+static int SphereOutsideClipPlane(Interpreter* gfx, const float c[3], float r) {
+    const float(*m)[4] = gfx->mRsp->MP_matrix;
+    const float sx =
+        gfx->mFbActive ? 1.0f : (4.0f / 3.0f) / ((float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height);
+    static const float kPlanes[5][4] = {
+        { 1, 0, 0, -1 }, { -1, 0, 0, -1 }, { 0, -1, 0, -1 }, { 0, 1, 0, -1 }, { 0, 0, 1, -1 }
+    };
+    for (int p = 0; p < 5; p++) {
+        const float a[4] = { kPlanes[p][0] * sx, kPlanes[p][1], kPlanes[p][2], kPlanes[p][3] };
+        float g[3];
+        for (int j = 0; j < 3; j++) {
+            g[j] = a[0] * m[j][0] + a[1] * m[j][1] + a[2] * m[j][2] + a[3] * m[j][3];
+        }
+        const float h = a[0] * m[3][0] + a[1] * m[3][1] + a[2] * m[3][2] + a[3] * m[3][3];
+        const float f = g[0] * c[0] + g[1] * c[1] + g[2] * c[2] + h;
+        if (f - r * sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) > 0.0f) {
+            return p;
+        }
+    }
+    return -1;
+}
+
 static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
     static std::unordered_map<const F3DGfx*, SubDlInfo> cache;
     static uint32_t generation = 0xFFFFFFFFu;
@@ -3423,34 +3467,199 @@ static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
     }
     ++sPerfSubDlTested;
 
-    const float(*m)[4] = gfx->mRsp->MP_matrix;
-    const float sx =
-        gfx->mFbActive ? 1.0f : (4.0f / 3.0f) / ((float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height);
-    // clip_rej planes as f = a.(x,y,z,w) > 0, with x already scaled by sx: right, left, bottom, top, far.
-    static const float kPlanes[5][4] = {
-        { 1, 0, 0, -1 }, { -1, 0, 0, -1 }, { 0, -1, 0, -1 }, { 0, 1, 0, -1 }, { 0, 0, 1, -1 }
-    };
-    static const uint8_t kBits[5] = { 2, 1, 4, 8, 32 };
-    for (int p = 0; p < 5; p++) {
-        const float a[4] = { kPlanes[p][0] * sx, kPlanes[p][1], kPlanes[p][2], kPlanes[p][3] };
-        float g[3], h = 0.0f;
-        for (int j = 0; j < 3; j++) {
-            g[j] = a[0] * m[j][0] + a[1] * m[j][1] + a[2] * m[j][2] + a[3] * m[j][3];
-        }
-        h = a[0] * m[3][0] + a[1] * m[3][1] + a[2] * m[3][2] + a[3] * m[3][3];
-        const float f = g[0] * s.c[0] + g[1] * s.c[1] + g[2] * s.c[2] + h;
-        if (f - s.r * sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) > 0.0f) {
-            // Leave the slots it would have loaded rejected by the same plane, not stale.
-            for (uint32_t i = 0; i < MAX_VERTICES; i++) {
-                if ((s.slots >> i) & 1) {
-                    gfx->mRsp->loaded_vertices[i].clip_rej = kBits[p];
-                }
+    const int p = SphereOutsideClipPlane(gfx, s.c, s.r);
+    if (p >= 0) {
+        // Leave the slots it would have loaded rejected by the same plane, not stale.
+        for (uint32_t i = 0; i < MAX_VERTICES; i++) {
+            if ((s.slots >> i) & 1) {
+                gfx->mRsp->loaded_vertices[i].clip_rej = kClipPlaneBits[p];
             }
-            ++sPerfSubDlCulled;
-            return true;
         }
+        ++sPerfSubDlCulled;
+        return true;
     }
     return false;
+}
+
+// Vertex-batch culling. For an OTR vertex load in a resource display list (G_VTX_OTR_HASH/FILEPATH; the
+// game's per-frame lists use raw G_VTX), look ahead once: if every triangle that uses its slots uses only
+// its slots until they are all overwritten (or the list ends), and nothing else reads them (depth branch,
+// modify-vertex, calls), then when its bounding sphere is wholly outside a clip plane the load is skipped
+// and the slots just get that plane's clip_rej bit - the triangles are rejected exactly as they would be.
+// sStaleSlots/sPerfStaleTris catch any use the analysis missed. Off switch: gWiiU.VtxBatchCull 0.
+struct VtxBatchInfo {
+    bool indep;
+    float c[3];
+    float r;
+    uint64_t slots;
+};
+
+static uint64_t sPerfBatchTested = 0;
+static uint64_t sPerfBatchCulled = 0;
+
+extern "C" void FastGetAndResetVtxBatchPerf(uint64_t* tested, uint64_t* culled, uint64_t* staleTris) {
+    *tested = sPerfBatchTested;
+    *culled = sPerfBatchCulled;
+    *staleTris = sPerfStaleTris;
+    sPerfBatchTested = 0;
+    sPerfBatchCulled = 0;
+    sPerfStaleTris = 0;
+}
+
+static uint64_t SlotRange(uint32_t start, uint32_t count) {
+    if (count == 0 || start >= 64) {
+        return 0;
+    }
+    const uint32_t n = std::min<uint32_t>(count, 64 - start);
+    return (n == 64 ? ~0ULL : ((1ULL << n) - 1)) << start;
+}
+
+// Slots a vertex command loads; for the OTR forms also the vertex data (nullptr if unresolvable).
+static bool DecodeVtxCmd(const F3DGfx* cmd, uint32_t* start, uint32_t* count, const F3DVtx** vtx) {
+    const int8_t op = (int8_t)(cmd->words.w0 >> 24);
+    if (op == OTR_G_VTX_OTR_HASH) {
+        *count = C0(12, 8);
+        *start = C0(1, 7) - *count;
+        const uintptr_t offset = cmd->words.w1;
+        if (offset > 0xFFFFF) {
+            *vtx = (const F3DVtx*)offset;
+        } else {
+            const char* base = (const char*)CachedRawPointer(((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1);
+            *vtx = base ? (const F3DVtx*)(base + offset) : nullptr;
+        }
+        return true;
+    }
+    if (op == OTR_G_VTX_OTR_FILEPATH) {
+        *count = cmd[1].words.w0;
+        *start = cmd[1].words.w1 >> 16;
+        const F3DVtx* base = (const F3DVtx*)CachedRawPointer((const char*)cmd->words.w1);
+        *vtx = base ? base + (cmd[1].words.w1 & 0xFFFF) : nullptr;
+        return true;
+    }
+    if (op == F3DEX2_G_VTX) {
+        *count = C0(12, 8);
+        *start = C0(1, 7) - *count;
+        *vtx = nullptr;
+        return true;
+    }
+    return false;
+}
+
+static VtxBatchInfo AnalyseVtxBatch(const F3DGfx* cmd) {
+    VtxBatchInfo info = { false, { 0, 0, 0 }, 0, 0 };
+    uint32_t start, count;
+    const F3DVtx* vtx;
+    if (!DecodeVtxCmd(cmd, &start, &count, &vtx) || vtx == nullptr || count == 0 || start + count > 64) {
+        return info;
+    }
+    const uint64_t slots = SlotRange(start, count);
+    uint64_t owned = slots;
+    auto triOk = [&owned](uint32_t a, uint32_t b, uint32_t c) {
+        if (a >= 64 || b >= 64 || c >= 64) {
+            return false;
+        }
+        const uint64_t m = (1ULL << a) | (1ULL << b) | (1ULL << c);
+        return (m & owned) == 0 || (m & ~owned) == 0;
+    };
+    const F3DGfx* p = cmd + 2;
+    bool done = false;
+    for (int n = 0; n < 2048 && !done; n++, p++) {
+        const int8_t op = (int8_t)(p->words.w0 >> 24);
+        const F3DGfx* const cmd = p; // for C0/C1
+        uint32_t s2, n2;
+        const F3DVtx* v2;
+        if (op == F3DEX2_G_ENDDL) {
+            done = true;
+        } else if (DecodeVtxCmd(p, &s2, &n2, &v2)) {
+            owned &= ~SlotRange(s2, n2);
+            done = owned == 0;
+        } else if (op == F3DEX2_G_TRI1) {
+            if (!triOk(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2)) {
+                return info;
+            }
+        } else if (op == F3DEX2_G_TRI2 || op == F3DEX2_G_QUAD) {
+            if (!triOk(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2) || !triOk(C1(16, 8) / 2, C1(8, 8) / 2, C1(0, 8) / 2)) {
+                return info;
+            }
+        } else if (op == OTR_G_TRI1_OTR) {
+            if (!triOk(cmd->words.w0 & 0xFF, (cmd->words.w1 >> 16) & 0xFF, cmd->words.w1 & 0xFF)) {
+                return info;
+            }
+        } else if (op == F3DEX2_G_MODIFYVTX || op == F3DEX2_G_BRANCH_Z || op == OTR_G_BRANCH_Z_OTR ||
+                   op == F3DEX2_G_LINE3D || op == F3DEX2_G_DL || op == OTR_G_DL_OTR_HASH ||
+                   op == OTR_G_DL_OTR_FILEPATH || op == OTR_G_DL_INDEX) {
+            return info; // may read the slots in ways this scan cannot follow
+        }
+        if (op == OTR_G_SETTIMG_OTR_HASH || op == OTR_G_DL_OTR_HASH || op == OTR_G_VTX_OTR_HASH ||
+            op == OTR_G_BRANCH_Z_OTR || op == OTR_G_MARKER || op == OTR_G_MTX_OTR || op == OTR_G_MOVEMEM_HASH ||
+            op == OTR_G_VTX_OTR_FILEPATH) {
+            p++;
+        }
+    }
+    if (!done) {
+        return info;
+    }
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t i = 0; i < count; i++) {
+        for (int k = 0; k < 3; k++) {
+            mn[k] = std::min(mn[k], (float)vtx[i].v.ob[k]);
+            mx[k] = std::max(mx[k], (float)vtx[i].v.ob[k]);
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        info.c[k] = (mn[k] + mx[k]) * 0.5f;
+    }
+    float r2 = 0.0f;
+    for (uint32_t i = 0; i < count; i++) {
+        const float dx = vtx[i].v.ob[0] - info.c[0], dy = vtx[i].v.ob[1] - info.c[1], dz = vtx[i].v.ob[2] - info.c[2];
+        r2 = std::max(r2, dx * dx + dy * dy + dz * dz);
+    }
+    info.r = sqrtf(r2) * 1.001f + 1.0f;
+    info.slots = slots;
+    info.indep = true;
+    return info;
+}
+
+// True if the vertex command at cmd was skipped (slots marked rejected and stale).
+static bool VtxBatchCulled(Interpreter* gfx, const F3DGfx* cmd) {
+    static std::unordered_map<const F3DGfx*, VtxBatchInfo> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+    static uint32_t cvarCountdown = 0;
+    static bool enabled = true;
+
+    if (cvarCountdown-- == 0) {
+        enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.VtxBatchCull", 1) != 0;
+        cvarCountdown = 8192;
+    }
+    if (!enabled) {
+        return false;
+    }
+    const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+    auto it = cache.find(cmd);
+    if (it == cache.end()) {
+        it = cache.emplace(cmd, AnalyseVtxBatch(cmd)).first;
+    }
+    const VtxBatchInfo& b = it->second;
+    if (!b.indep) {
+        return false;
+    }
+    ++sPerfBatchTested;
+    const int p = SphereOutsideClipPlane(gfx, b.c, b.r);
+    if (p < 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        if ((b.slots >> i) & 1) {
+            gfx->mRsp->loaded_vertices[i].clip_rej = kClipPlaneBits[p];
+        }
+    }
+    sStaleSlots |= b.slots;
+    ++sPerfBatchCulled;
+    return true;
 }
 
 // Cached per path pointer (the long-lived c_str a room mesh entry holds) and centre; cleared with the
@@ -3722,6 +3931,9 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
 
     // We need to know if the offset is a cached pointer or not. An offset greater than one million is not a
     // real offset, so it must be a real pointer
+    if (VtxBatchCulled(gfx, *cmd0 - 1)) {
+        return false;
+    }
     if (offset > 0xFFFFF) {
         (*cmd0)--;
         F3DGfx* cmd = *cmd0;
@@ -3750,6 +3962,10 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     char* fileName = (char*)cmd->words.w1;
+    if (VtxBatchCulled(gfx, cmd)) {
+        (*cmd0)++;
+        return false;
+    }
     (*cmd0)++;
     cmd = *cmd0;
     size_t vtxCnt = cmd->words.w0;
