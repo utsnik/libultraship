@@ -133,7 +133,9 @@ static uint64_t sPerfGfxSpVertexCount = 0;
 // They carry that plane's clip_rej bit but no transformed data; a triangle that reaches them without being
 // trivially rejected is dropped and counted (sPerfStaleTris) instead of drawn from stale values.
 static uint64_t sStaleSlots = 0;
+static uint64_t sStaleFromSubDl = 0; // subset of sStaleSlots set by sub-DL culling
 static uint64_t sPerfStaleTris = 0;
+static uint64_t sPerfStaleTrisSubDl = 0;
 static uint64_t sPerfFlushCounts[static_cast<size_t>(PerfFlushReason::Count)] = {};
 
 // The reason is only counted if the following Flush() actually submits triangles: most state
@@ -1394,6 +1396,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     if (sStaleSlots != 0) {
         for (size_t i = dest_index; i < dest_index + n_vertices && i < 64; i++) {
             sStaleSlots &= ~(1ULL << i);
+            sStaleFromSubDl &= ~(1ULL << i);
         }
     }
     const float(*MP_matrix)[4] = mRsp->MP_matrix;
@@ -1648,6 +1651,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                              (vtx2_idx < 64 && ((sStaleSlots >> vtx2_idx) & 1)) ||
                              (vtx3_idx < 64 && ((sStaleSlots >> vtx3_idx) & 1)))) {
         ++sPerfStaleTris;
+        const uint64_t tri = (vtx1_idx < 64 ? 1ULL << vtx1_idx : 0) | (vtx2_idx < 64 ? 1ULL << vtx2_idx : 0) |
+                             (vtx3_idx < 64 ? 1ULL << vtx3_idx : 0);
+        if (tri & sStaleFromSubDl) {
+            ++sPerfStaleTrisSubDl;
+        }
         return;
     }
 
@@ -3471,6 +3479,12 @@ extern "C" uint64_t FastGetAndResetFalseCull(void) {
     return n;
 }
 
+extern "C" uint64_t FastGetAndResetStaleTrisSubDl(void) {
+    const uint64_t n = sPerfStaleTrisSubDl;
+    sPerfStaleTrisSubDl = 0;
+    return n;
+}
+
 static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
     static std::unordered_map<const F3DGfx*, SubDlInfo> cache;
     static uint32_t generation = 0xFFFFFFFFu;
@@ -3518,6 +3532,7 @@ static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
             }
         }
         sStaleSlots |= s.slots;
+        sStaleFromSubDl |= s.slots;
         ++sPerfSubDlCulled;
         return true;
     }
@@ -3614,7 +3629,9 @@ static VtxBatchInfo AnalyseVtxBatch(const F3DGfx* cmd) {
         uint32_t s2, n2;
         const F3DVtx* v2;
         if (op == F3DEX2_G_ENDDL) {
-            done = true;
+            // Slots still live at the end may be used after the return (skinned limbs join to the previous
+            // limb's vertices this way), so only loads that are fully overwritten inside the list qualify.
+            return info;
         } else if (DecodeVtxCmd(p, &s2, &n2, &v2)) {
             owned &= ~SlotRange(s2, n2);
             done = owned == 0;
@@ -3709,6 +3726,7 @@ static bool VtxBatchCulled(Interpreter* gfx, const F3DGfx* cmd) {
         }
     }
     sStaleSlots |= b.slots;
+    sStaleFromSubDl &= ~b.slots;
     ++sPerfBatchCulled;
     return true;
 }
