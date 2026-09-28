@@ -131,8 +131,12 @@ enum class PerfFlushReason : size_t {
 static uint64_t sPerfGfxSpVertexCount = 0;
 static uint64_t sPerfFlushCounts[static_cast<size_t>(PerfFlushReason::Count)] = {};
 
+// The reason is only counted if the following Flush() actually submits triangles: most state
+// changes arrive with an empty batch and cost nothing. Unlabelled Flush() calls count as Explicit.
+static PerfFlushReason sPendingFlushReason = PerfFlushReason::Explicit;
+
 static inline void RecordPerfFlush(PerfFlushReason reason) {
-    ++sPerfFlushCounts[static_cast<size_t>(reason)];
+    sPendingFlushReason = reason;
 }
 
 Interpreter::Interpreter() {
@@ -164,10 +168,12 @@ extern "C" void FastGetAndResetInterpreterPerf(uint64_t* vertices, uint64_t flus
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
+        ++sPerfFlushCounts[static_cast<size_t>(sPendingFlushReason)];
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
+    sPendingFlushReason = PerfFlushReason::Explicit;
 }
 
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
