@@ -183,6 +183,9 @@ static constexpr size_t PERF_FLUSH_EXPLICIT = 7;
 
 extern "C" void FastGetAndResetInterpreterPerf(uint64_t* vertices, uint64_t flushCounts[]);
 extern "C" void FastGetAndResetCullDlPerf(uint64_t* tested, uint64_t* rejected);
+// Defined by SoH z_room.c (cullable room entries tested / rejected by the side-plane test).
+extern "C" uint32_t gWiiURoomEntriesTested __attribute__((weak));
+extern "C" uint32_t gWiiURoomEntriesSideCulled __attribute__((weak));
 
 static std::map<std::pair<struct Framebuffer*, std::pair<float, float>>, uint16_t> depth_readback_cache;
 
@@ -1433,16 +1436,24 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
         uint64_t cullDlTested = 0;
         uint64_t cullDlRejected = 0;
         FastGetAndResetCullDlPerf(&cullDlTested, &cullDlRejected);
+        uint32_t roomTested = 0;
+        uint32_t roomCulled = 0;
+        if (&gWiiURoomEntriesTested != nullptr && &gWiiURoomEntriesSideCulled != nullptr) {
+            roomTested = gWiiURoomEntriesTested;
+            roomCulled = gWiiURoomEntriesSideCulled;
+            gWiiURoomEntriesTested = 0;
+            gWiiURoomEntriesSideCulled = 0;
+        }
         const struct mallinfo heapInfo = mallinfo();
         uint32_t bigFree = 0;
         uint32_t bigLargest = 0;
         wiiu_get_perf_big_heap(&bigFree, &bigLargest);
-        SPDLOG_INFO("PERF: {:.1f} fps avg over {:.0f} s, worst 5 s {:.1f} fps, cpu {:.1f} ms/frame, gpu {:.1f} ms/frame max {:.1f} ms, vsync {:.1f} ms/frame, dropped {}, slot {:.1f} ms/frame, other {:.1f} ms/frame, texUploads {}, texCache {} freeTexIds {} depthCache {} depthReq {:.2f}/frame, GX2Draws {:.2f}/frame triangles {:.2f}/frame GfxSpVertex {:.2f}/frame cullDL {:.1f} tested {:.1f} rejected/frame, Flush texture {:.2f}/frame sampler {:.2f}/frame shader {:.2f}/frame depthZmode {:.2f}/frame viewportScissor {:.2f}/frame alpha {:.2f}/frame triCap {:.2f}/frame explicit {:.2f}/frame, OSBlockMove {:.1f} us/frame GX2Invalidate {:.1f} us/frame GX2SetAttribBuffer {:.1f} us/frame GX2DrawEx {:.1f} us/frame, shaderPool {} resourceCache {} heapUsed {} heapArena {} bigFree {} bigLargest {} scene {:#x}",
+        SPDLOG_INFO("PERF: {:.1f} fps avg over {:.0f} s, worst 5 s {:.1f} fps, cpu {:.1f} ms/frame, gpu {:.1f} ms/frame max {:.1f} ms, vsync {:.1f} ms/frame, dropped {}, slot {:.1f} ms/frame, other {:.1f} ms/frame, texUploads {}, texCache {} freeTexIds {} depthCache {} depthReq {:.2f}/frame, GX2Draws {:.2f}/frame triangles {:.2f}/frame GfxSpVertex {:.2f}/frame cullDL {:.1f} tested {:.1f} rejected/frame, rooms {:.1f} tested {:.1f} sideCulled/frame, Flush texture {:.2f}/frame sampler {:.2f}/frame shader {:.2f}/frame depthZmode {:.2f}/frame viewportScissor {:.2f}/frame alpha {:.2f}/frame triCap {:.2f}/frame explicit {:.2f}/frame, OSBlockMove {:.1f} us/frame GX2Invalidate {:.1f} us/frame GX2SetAttribBuffer {:.1f} us/frame GX2DrawEx {:.1f} us/frame, shaderPool {} resourceCache {} heapUsed {} heapArena {} bigFree {} bigLargest {} scene {:#x}",
                     minuteFrames / minuteSec, minuteSec, worst, cpuMs, gpuMs, perf_gpu_max_us / 1000.0f,
                     vsyncMs, droppedFrames, slotMs, otherMs, perf_texture_uploads,
                     Ship::WiiU::Watchdog::gTextureCacheSize, Ship::WiiU::Watchdog::gFreeTextureIdsSize,
                     depth_readback_cache.size(), depthPerFrame, perf_gx2_draws / frames, perf_gx2_triangles / frames,
-                    gfxSpVertexCount / frames, cullDlTested / frames, cullDlRejected / frames, flushCounts[PERF_FLUSH_TEXTURE] / frames,
+                    gfxSpVertexCount / frames, cullDlTested / frames, cullDlRejected / frames, roomTested / frames, roomCulled / frames, flushCounts[PERF_FLUSH_TEXTURE] / frames,
                     flushCounts[PERF_FLUSH_SAMPLER] / frames, flushCounts[PERF_FLUSH_SHADER] / frames,
                     flushCounts[PERF_FLUSH_DEPTH_ZMODE] / frames, flushCounts[PERF_FLUSH_VIEWPORT_SCISSOR] / frames,
                     flushCounts[PERF_FLUSH_ALPHA] / frames, flushCounts[PERF_FLUSH_TRIANGLE_CAP] / frames,
