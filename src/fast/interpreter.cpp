@@ -3306,6 +3306,7 @@ struct SubDlInfo {
     float c[3];
     float r;
     uint64_t slots;
+    std::vector<std::pair<const F3DVtx*, uint32_t>> ranges; // for verify mode
 };
 
 static uint64_t sPerfSubDlTested = 0;
@@ -3319,7 +3320,7 @@ extern "C" void FastGetAndResetSubDlPerf(uint64_t* tested, uint64_t* culled) {
 }
 
 static SubDlInfo AnalyseSubDl(const F3DGfx* cmd) {
-    SubDlInfo info = { false, { 0, 0, 0 }, 0, 0 };
+    SubDlInfo info = { false, { 0, 0, 0 }, 0, 0, {} };
     struct Range {
         const F3DVtx* v;
         uint32_t n;
@@ -3409,6 +3410,9 @@ static SubDlInfo AnalyseSubDl(const F3DGfx* cmd) {
     info.r = sqrtf(r2) * 1.001f + 1.0f;
     info.slots = loaded;
     info.pure = true;
+    for (const Range& rg : ranges) {
+        info.ranges.emplace_back(rg.v, rg.n);
+    }
     return info;
 }
 
@@ -3439,17 +3443,45 @@ static int SphereOutsideClipPlane(Interpreter* gfx, const float c[3], float r) {
     return -1;
 }
 
+static uint64_t sPerfFalseCull = 0;
+
+// Verify mode (culling CVar = 2): recompute each vertex's clip_rej bit for plane p exactly as GfxSpVertex
+// does and return how many vertices lack it (i.e. the sphere test was wrong).
+static uint32_t CountClipMisses(Interpreter* gfx, const F3DVtx* v, uint32_t n, int p) {
+    const float(*m)[4] = gfx->mRsp->MP_matrix;
+    const float aspect_scale =
+        (4.0f / 3.0f) / ((float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height);
+    uint32_t misses = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float ox = v[i].v.ob[0], oy = v[i].v.ob[1], oz = v[i].v.ob[2];
+        float x = ox * m[0][0] + oy * m[1][0] + oz * m[2][0] + m[3][0];
+        const float y = ox * m[0][1] + oy * m[1][1] + oz * m[2][1] + m[3][1];
+        const float z = ox * m[0][2] + oy * m[1][2] + oz * m[2][2] + m[3][2];
+        const float w = ox * m[0][3] + oy * m[1][3] + oz * m[2][3] + m[3][3];
+        x = gfx->mFbActive ? x : x * aspect_scale;
+        const bool out = p == 0 ? x > w : p == 1 ? x < -w : p == 2 ? y < -w : p == 3 ? y > w : z > w;
+        misses += out ? 0 : 1;
+    }
+    return misses;
+}
+
+extern "C" uint64_t FastGetAndResetFalseCull(void) {
+    const uint64_t n = sPerfFalseCull;
+    sPerfFalseCull = 0;
+    return n;
+}
+
 static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
     static std::unordered_map<const F3DGfx*, SubDlInfo> cache;
     static uint32_t generation = 0xFFFFFFFFu;
     static uint32_t cvarCountdown = 0;
-    static bool enabled = true;
+    static int mode = 1;
 
     if (cvarCountdown-- == 0) {
-        enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.SubDlCull", 1) != 0;
+        mode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.SubDlCull", 1);
         cvarCountdown = 4096;
     }
-    if (!enabled || dl == nullptr) {
+    if (mode == 0 || dl == nullptr) {
         return false;
     }
     const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
@@ -3469,12 +3501,23 @@ static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
 
     const int p = SphereOutsideClipPlane(gfx, s.c, s.r);
     if (p >= 0) {
-        // Leave the slots it would have loaded rejected by the same plane, not stale.
+        if (mode == 2) {
+            uint32_t misses = 0;
+            for (const auto& rg : s.ranges) {
+                misses += CountClipMisses(gfx, rg.first, rg.second, p);
+            }
+            if (misses != 0) {
+                ++sPerfFalseCull;
+                return false;
+            }
+        }
+        // Leave the slots it would have loaded rejected by the same plane (and marked stale).
         for (uint32_t i = 0; i < MAX_VERTICES; i++) {
             if ((s.slots >> i) & 1) {
                 gfx->mRsp->loaded_vertices[i].clip_rej = kClipPlaneBits[p];
             }
         }
+        sStaleSlots |= s.slots;
         ++sPerfSubDlCulled;
         return true;
     }
@@ -3492,6 +3535,8 @@ struct VtxBatchInfo {
     float c[3];
     float r;
     uint64_t slots;
+    const F3DVtx* vtx; // for verify mode
+    uint32_t count;
 };
 
 static uint64_t sPerfBatchTested = 0;
@@ -3546,7 +3591,7 @@ static bool DecodeVtxCmd(const F3DGfx* cmd, uint32_t* start, uint32_t* count, co
 }
 
 static VtxBatchInfo AnalyseVtxBatch(const F3DGfx* cmd) {
-    VtxBatchInfo info = { false, { 0, 0, 0 }, 0, 0 };
+    VtxBatchInfo info = { false, { 0, 0, 0 }, 0, 0, nullptr, 0 };
     uint32_t start, count;
     const F3DVtx* vtx;
     if (!DecodeVtxCmd(cmd, &start, &count, &vtx) || vtx == nullptr || count == 0 || start + count > 64) {
@@ -3617,6 +3662,8 @@ static VtxBatchInfo AnalyseVtxBatch(const F3DGfx* cmd) {
     info.r = sqrtf(r2) * 1.001f + 1.0f;
     info.slots = slots;
     info.indep = true;
+    info.vtx = vtx;
+    info.count = count;
     return info;
 }
 
@@ -3625,13 +3672,13 @@ static bool VtxBatchCulled(Interpreter* gfx, const F3DGfx* cmd) {
     static std::unordered_map<const F3DGfx*, VtxBatchInfo> cache;
     static uint32_t generation = 0xFFFFFFFFu;
     static uint32_t cvarCountdown = 0;
-    static bool enabled = true;
+    static int mode = 1;
 
     if (cvarCountdown-- == 0) {
-        enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.VtxBatchCull", 1) != 0;
+        mode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.VtxBatchCull", 1);
         cvarCountdown = 8192;
     }
-    if (!enabled) {
+    if (mode == 0) {
         return false;
     }
     const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
@@ -3650,6 +3697,10 @@ static bool VtxBatchCulled(Interpreter* gfx, const F3DGfx* cmd) {
     ++sPerfBatchTested;
     const int p = SphereOutsideClipPlane(gfx, b.c, b.r);
     if (p < 0) {
+        return false;
+    }
+    if (mode == 2 && CountClipMisses(gfx, b.vtx, b.count, p) != 0) {
+        ++sPerfFalseCull;
         return false;
     }
     for (uint32_t i = 0; i < 64; i++) {
