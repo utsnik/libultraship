@@ -3201,6 +3201,102 @@ static std::shared_ptr<Fast::Texture> CachedTextureByPath(const char* path) {
     return texture;
 }
 
+// Largest distance from (cx, cy, cz) to any vertex the display list loads, following DL calls, branches
+// and both sides of depth branches. Segmented G_DLs (per-scene material lists) are not followed. Returns
+// -1 if the list moves the matrix or loads vertices that cannot be resolved, so callers must then not
+// rely on the result. Reads the list only; it does not execute or patch it.
+static float DisplayListVertexRadius(const F3DGfx* cmd, float cx, float cy, float cz, int depth) {
+    if (cmd == nullptr || depth > 8) {
+        return -1.0f;
+    }
+    float maxSq = 0.0f;
+    for (int n = 0; n < 100000; n++, cmd++) {
+        const int8_t op = (int8_t)(cmd->words.w0 >> 24);
+        if (op == F3DEX2_G_ENDDL) {
+            return sqrtf(maxSq);
+        }
+        const F3DGfx* sub = nullptr;
+        bool isBranch = false;
+        if (op == OTR_G_VTX_OTR_HASH) {
+            const uint32_t count = C0(12, 8);
+            const uintptr_t offset = cmd->words.w1;
+            const uint64_t hash = ((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1;
+            const F3DVtx* vtx;
+            if (offset > 0xFFFFF) { // already patched to a pointer by gfx_vtx_hash_handler_custom
+                vtx = (const F3DVtx*)offset;
+            } else {
+                const char* base = (const char*)CachedRawPointer(hash);
+                if (base == nullptr) {
+                    return -1.0f;
+                }
+                vtx = (const F3DVtx*)(base + offset);
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                const float dx = vtx[i].v.ob[0] - cx, dy = vtx[i].v.ob[1] - cy, dz = vtx[i].v.ob[2] - cz;
+                maxSq = std::max(maxSq, dx * dx + dy * dy + dz * dz);
+            }
+        } else if (op == OTR_G_DL_OTR_HASH || op == OTR_G_BRANCH_Z_OTR) {
+            sub = (const F3DGfx*)CachedRawPointer(((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1);
+            isBranch = op == OTR_G_DL_OTR_HASH && C0(16, 1) != 0;
+            if (sub == nullptr) {
+                return -1.0f;
+            }
+        } else if (op == OTR_G_DL_OTR_FILEPATH) {
+            sub = (const F3DGfx*)CachedRawPointer((const char*)cmd->words.w1);
+            isBranch = C0(16, 1) != 0;
+            if (sub == nullptr) {
+                return -1.0f;
+            }
+        } else if (op == F3DEX2_G_VTX || op == OTR_G_VTX_OTR_FILEPATH || op == OTR_G_MTX_OTR ||
+                   op == OTR_G_MTX_OTR_FILEPATH || op == F3DEX2_G_MTX || op == F3DEX2_G_POPMTX) {
+            return -1.0f;
+        }
+        if (sub != nullptr) {
+            const float r = DisplayListVertexRadius(sub, cx, cy, cz, depth + 1);
+            if (r < 0.0f) {
+                return -1.0f;
+            }
+            maxSq = std::max(maxSq, r * r);
+            if (isBranch) {
+                return sqrtf(maxSq);
+            }
+        }
+        // 128-bit commands take two Gfx slots (DisplayListFactory.cpp).
+        if (op == OTR_G_SETTIMG_OTR_HASH || op == OTR_G_DL_OTR_HASH || op == OTR_G_VTX_OTR_HASH ||
+            op == OTR_G_BRANCH_Z_OTR || op == OTR_G_MARKER || op == OTR_G_MTX_OTR || op == OTR_G_MOVEMEM_HASH) {
+            cmd++;
+        }
+    }
+    return -1.0f;
+}
+
+// Cached per path pointer (the long-lived c_str a room mesh entry holds) and centre; cleared with the
+// resource cache generation like CachedRawPointer.
+extern "C" float FastDisplayListVertexRadius(const char* path, float cx, float cy, float cz) {
+    struct Entry {
+        float cx, cy, cz, radius;
+    };
+    static std::unordered_map<const void*, Entry> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+
+    if (path == nullptr) {
+        return -1.0f;
+    }
+    const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+    auto it = cache.find(path);
+    if (it != cache.end() && it->second.cx == cx && it->second.cy == cy && it->second.cz == cz) {
+        return it->second.radius;
+    }
+    const char* name = strncmp(path, "__OTR__", 7) == 0 ? path + 7 : path;
+    const float radius = DisplayListVertexRadius((const F3DGfx*)CachedRawPointer(name), cx, cy, cz, 0);
+    cache[path] = Entry{ cx, cy, cz, radius };
+    return radius;
+}
+
 bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
