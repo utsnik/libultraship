@@ -3235,6 +3235,16 @@ static float DisplayListVertexRadius(const F3DGfx* cmd, float cx, float cy, floa
                 const float dx = vtx[i].v.ob[0] - cx, dy = vtx[i].v.ob[1] - cy, dz = vtx[i].v.ob[2] - cz;
                 maxSq = std::max(maxSq, dx * dx + dy * dy + dz * dz);
             }
+        } else if (op == OTR_G_VTX_OTR_FILEPATH) { // XML (alt/mod) lists; layout as gfx_vtx_otr_filepath_handler_custom
+            const F3DVtx* vtx = (const F3DVtx*)CachedRawPointer((const char*)cmd->words.w1);
+            if (vtx == nullptr) {
+                return -1.0f;
+            }
+            vtx += cmd[1].words.w1 & 0xFFFF;
+            for (uint32_t i = 0; i < cmd[1].words.w0; i++) {
+                const float dx = vtx[i].v.ob[0] - cx, dy = vtx[i].v.ob[1] - cy, dz = vtx[i].v.ob[2] - cz;
+                maxSq = std::max(maxSq, dx * dx + dy * dy + dz * dz);
+            }
         } else if (op == OTR_G_DL_OTR_HASH || op == OTR_G_BRANCH_Z_OTR) {
             sub = (const F3DGfx*)CachedRawPointer(((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1);
             isBranch = op == OTR_G_DL_OTR_HASH && C0(16, 1) != 0;
@@ -3247,7 +3257,7 @@ static float DisplayListVertexRadius(const F3DGfx* cmd, float cx, float cy, floa
             if (sub == nullptr) {
                 return -1.0f;
             }
-        } else if (op == F3DEX2_G_VTX || op == OTR_G_VTX_OTR_FILEPATH || op == OTR_G_MTX_OTR ||
+        } else if (op == F3DEX2_G_VTX || op == OTR_G_MTX_OTR ||
                    op == OTR_G_MTX_OTR_FILEPATH || op == F3DEX2_G_MTX || op == F3DEX2_G_POPMTX) {
             return -1.0f;
         }
@@ -3263,7 +3273,8 @@ static float DisplayListVertexRadius(const F3DGfx* cmd, float cx, float cy, floa
         }
         // 128-bit commands take two Gfx slots (DisplayListFactory.cpp).
         if (op == OTR_G_SETTIMG_OTR_HASH || op == OTR_G_DL_OTR_HASH || op == OTR_G_VTX_OTR_HASH ||
-            op == OTR_G_BRANCH_Z_OTR || op == OTR_G_MARKER || op == OTR_G_MTX_OTR || op == OTR_G_MOVEMEM_HASH) {
+            op == OTR_G_BRANCH_Z_OTR || op == OTR_G_MARKER || op == OTR_G_MTX_OTR || op == OTR_G_MOVEMEM_HASH ||
+            op == OTR_G_VTX_OTR_FILEPATH) {
             cmd++;
         }
     }
