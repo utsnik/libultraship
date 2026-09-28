@@ -1941,17 +1941,21 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
+    const bool uv_half_offset = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT && !is_rect;
 
+    // Write through a local pointer: storing to mBufVboLen after every float (it cannot stay in a register
+    // across the float stores, which may alias it) cost a store per component.
+    float* out = mBufVbo + mBufVboLen;
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (clip_parameters.z_is_from_0_to_1) {
             z = (z + w) / 2.0f;
         }
 
-        mBufVbo[mBufVboLen++] = v_arr[i]->x;
-        mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
-        mBufVbo[mBufVboLen++] = z;
-        mBufVbo[mBufVboLen++] = w;
+        *out++ = v_arr[i]->x;
+        *out++ = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
+        *out++ = z;
+        *out++ = w;
 
         for (int t = 0; t < 2; t++) {
             if (!usedTextures[t]) {
@@ -1966,41 +1970,39 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             u -= uls_div4[t];
             v -= ult_div4[t];
 
-            if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
+            if (uv_half_offset) {
                 // Linear filter adds 0.5f to the coordinates
-                if (!is_rect) {
-                    u += 0.5f;
-                    v += 0.5f;
-                }
+                u += 0.5f;
+                v += 0.5f;
             }
 
-            mBufVbo[mBufVboLen++] = u * tex_width_inv[t];
-            mBufVbo[mBufVboLen++] = v * tex_height_inv[t];
+            *out++ = u * tex_width_inv[t];
+            *out++ = v * tex_height_inv[t];
 
             bool clampS = tm & (1 << 2 * t);
             bool clampT = tm & (1 << 2 * t + 1);
 
             if (clampS) {
-                mBufVbo[mBufVboLen++] = clamp_s[t];
+                *out++ = clamp_s[t];
             }
 
             if (clampT) {
-                mBufVbo[mBufVboLen++] = clamp_t[t];
+                *out++ = clamp_t[t];
             }
         }
 
         if (use_fog) {
-            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->fog_color.r];
-            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->fog_color.g];
-            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->fog_color.b];
-            mBufVbo[mBufVboLen++] = byte_to_unit[v_arr[i]->color.a]; // fog factor (not alpha)
+            *out++ = byte_to_unit[mRdp->fog_color.r];
+            *out++ = byte_to_unit[mRdp->fog_color.g];
+            *out++ = byte_to_unit[mRdp->fog_color.b];
+            *out++ = byte_to_unit[v_arr[i]->color.a]; // fog factor (not alpha)
         }
 
         if (use_grayscale) {
-            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.r];
-            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.g];
-            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.b];
-            mBufVbo[mBufVboLen++] = byte_to_unit[mRdp->grayscale_color.a]; // lerp interpolation factor (not alpha)
+            *out++ = byte_to_unit[mRdp->grayscale_color.r];
+            *out++ = byte_to_unit[mRdp->grayscale_color.g];
+            *out++ = byte_to_unit[mRdp->grayscale_color.b];
+            *out++ = byte_to_unit[mRdp->grayscale_color.a]; // lerp interpolation factor (not alpha)
         }
 
         for (int j = 0; j < numInputs; j++) {
@@ -2061,26 +2063,21 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                 }
                 if (k == 0) {
-                    mBufVbo[mBufVboLen++] = byte_to_unit[color->r];
-                    mBufVbo[mBufVboLen++] = byte_to_unit[color->g];
-                    mBufVbo[mBufVboLen++] = byte_to_unit[color->b];
+                    *out++ = byte_to_unit[color->r];
+                    *out++ = byte_to_unit[color->g];
+                    *out++ = byte_to_unit[color->b];
                 } else {
                     if (use_fog && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for fog
-                        mBufVbo[mBufVboLen++] = 1.0f;
+                        *out++ = 1.0f;
                     } else {
-                        mBufVbo[mBufVboLen++] = byte_to_unit[color->a];
+                        *out++ = byte_to_unit[color->a];
                     }
                 }
             }
         }
-
-        // struct RGBA *color = &v_arr[i]->color;
-        // mBufVbo[mBufVboLen++] = color->r / 255.0f;
-        // mBufVbo[mBufVboLen++] = color->g / 255.0f;
-        // mBufVbo[mBufVboLen++] = color->b / 255.0f;
-        // mBufVbo[mBufVboLen++] = color->a / 255.0f;
     }
+    mBufVboLen = (size_t)(out - mBufVbo);
 
     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
         // if (++mBufVbo_num_tris == 1) {
