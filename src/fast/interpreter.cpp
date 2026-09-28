@@ -3281,6 +3281,181 @@ static float DisplayListVertexRadius(const F3DGfx* cmd, float cx, float cy, floa
     return -1.0f;
 }
 
+// Sub-display-list culling. A called list that only loads vertices and draws triangles from them (as mod
+// packs' XML "tri_N" lists do, e.g. Djipi's Hyrule Field, whose terrain lists each span the whole field) is
+// skipped when its bounding sphere lies wholly outside one of the planes GfxSpVertex's clip_rej uses: then
+// every vertex it loads would carry that bit and GfxSpTri1 would reject every triangle anyway. Lists that
+// change any state, call other lists, or draw with vertices they did not load are never skipped.
+// Off switch: gWiiU.SubDlCull 0.
+struct SubDlInfo {
+    bool pure;
+    float c[3];
+    float r;
+    uint64_t slots;
+};
+
+static uint64_t sPerfSubDlTested = 0;
+static uint64_t sPerfSubDlCulled = 0;
+
+extern "C" void FastGetAndResetSubDlPerf(uint64_t* tested, uint64_t* culled) {
+    *tested = sPerfSubDlTested;
+    *culled = sPerfSubDlCulled;
+    sPerfSubDlTested = 0;
+    sPerfSubDlCulled = 0;
+}
+
+static SubDlInfo AnalyseSubDl(const F3DGfx* cmd) {
+    SubDlInfo info = { false, { 0, 0, 0 }, 0, 0 };
+    struct Range {
+        const F3DVtx* v;
+        uint32_t n;
+    };
+    std::vector<Range> ranges;
+    uint64_t loaded = 0;
+    auto uses = [&loaded](uint32_t a, uint32_t b, uint32_t c) {
+        return a < MAX_VERTICES && b < MAX_VERTICES && c < MAX_VERTICES && ((loaded >> a) & 1) &&
+               ((loaded >> b) & 1) && ((loaded >> c) & 1);
+    };
+    for (int n = 0; n < 4096; n++, cmd++) {
+        const int8_t op = (int8_t)(cmd->words.w0 >> 24);
+        if (op == F3DEX2_G_ENDDL) {
+            break;
+        }
+        uint32_t start, count;
+        const F3DVtx* vtx;
+        if (op == OTR_G_VTX_OTR_HASH) {
+            count = C0(12, 8);
+            start = C0(1, 7) - count;
+            const uintptr_t offset = cmd->words.w1;
+            if (offset > 0xFFFFF) {
+                vtx = (const F3DVtx*)offset;
+            } else {
+                const char* base = (const char*)CachedRawPointer(((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1);
+                vtx = base ? (const F3DVtx*)(base + offset) : nullptr;
+            }
+            cmd++;
+        } else if (op == OTR_G_VTX_OTR_FILEPATH) {
+            count = cmd[1].words.w0;
+            start = cmd[1].words.w1 >> 16;
+            vtx = (const F3DVtx*)CachedRawPointer((const char*)cmd->words.w1);
+            if (vtx != nullptr) {
+                vtx += cmd[1].words.w1 & 0xFFFF;
+            }
+            cmd++;
+        } else if (op == F3DEX2_G_TRI1) {
+            if (!uses(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2)) {
+                return info;
+            }
+            continue;
+        } else if (op == F3DEX2_G_TRI2 || op == F3DEX2_G_QUAD) {
+            if (!uses(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2) ||
+                !uses(C1(16, 8) / 2, C1(8, 8) / 2, C1(0, 8) / 2)) {
+                return info;
+            }
+            continue;
+        } else if (op == OTR_G_TRI1_OTR) {
+            if (!uses(cmd->words.w0 & 0xFF, (cmd->words.w1 >> 16) & 0xFF, cmd->words.w1 & 0xFF)) {
+                return info;
+            }
+            continue;
+        } else if (op == F3DEX2_G_NOOP || op == F3DEX2_G_SPNOOP || op == F3DEX2_G_CULLDL) {
+            continue;
+        } else {
+            return info; // any state change, call or unknown command
+        }
+        if (vtx == nullptr || count == 0 || start + count > MAX_VERTICES) {
+            return info;
+        }
+        loaded |= (count == 64 ? ~0ULL : ((1ULL << count) - 1)) << start;
+        ranges.push_back({ vtx, count });
+    }
+    if (ranges.empty()) {
+        return info;
+    }
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (const Range& rg : ranges) {
+        for (uint32_t i = 0; i < rg.n; i++) {
+            for (int k = 0; k < 3; k++) {
+                mn[k] = std::min(mn[k], (float)rg.v[i].v.ob[k]);
+                mx[k] = std::max(mx[k], (float)rg.v[i].v.ob[k]);
+            }
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        info.c[k] = (mn[k] + mx[k]) * 0.5f;
+    }
+    float r2 = 0.0f;
+    for (const Range& rg : ranges) {
+        for (uint32_t i = 0; i < rg.n; i++) {
+            const float dx = rg.v[i].v.ob[0] - info.c[0], dy = rg.v[i].v.ob[1] - info.c[1],
+                        dz = rg.v[i].v.ob[2] - info.c[2];
+            r2 = std::max(r2, dx * dx + dy * dy + dz * dz);
+        }
+    }
+    info.r = sqrtf(r2) * 1.001f + 1.0f;
+    info.slots = loaded;
+    info.pure = true;
+    return info;
+}
+
+static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
+    static std::unordered_map<const F3DGfx*, SubDlInfo> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+    static uint32_t cvarCountdown = 0;
+    static bool enabled = true;
+
+    if (cvarCountdown-- == 0) {
+        enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.SubDlCull", 1) != 0;
+        cvarCountdown = 4096;
+    }
+    if (!enabled || dl == nullptr) {
+        return false;
+    }
+    const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+    auto it = cache.find(dl);
+    if (it == cache.end()) {
+        it = cache.emplace(dl, AnalyseSubDl(dl)).first;
+    }
+    const SubDlInfo& s = it->second;
+    if (!s.pure) {
+        return false;
+    }
+    ++sPerfSubDlTested;
+
+    const float(*m)[4] = gfx->mRsp->MP_matrix;
+    const float sx =
+        gfx->mFbActive ? 1.0f : (4.0f / 3.0f) / ((float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height);
+    // clip_rej planes as f = a.(x,y,z,w) > 0, with x already scaled by sx: right, left, bottom, top, far.
+    static const float kPlanes[5][4] = {
+        { 1, 0, 0, -1 }, { -1, 0, 0, -1 }, { 0, -1, 0, -1 }, { 0, 1, 0, -1 }, { 0, 0, 1, -1 }
+    };
+    static const uint8_t kBits[5] = { 2, 1, 4, 8, 32 };
+    for (int p = 0; p < 5; p++) {
+        const float a[4] = { kPlanes[p][0] * sx, kPlanes[p][1], kPlanes[p][2], kPlanes[p][3] };
+        float g[3], h = 0.0f;
+        for (int j = 0; j < 3; j++) {
+            g[j] = a[0] * m[j][0] + a[1] * m[j][1] + a[2] * m[j][2] + a[3] * m[j][3];
+        }
+        h = a[0] * m[3][0] + a[1] * m[3][1] + a[2] * m[3][2] + a[3] * m[3][3];
+        const float f = g[0] * s.c[0] + g[1] * s.c[1] + g[2] * s.c[2] + h;
+        if (f - s.r * sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) > 0.0f) {
+            // Leave the slots it would have loaded rejected by the same plane, not stale.
+            for (uint32_t i = 0; i < MAX_VERTICES; i++) {
+                if ((s.slots >> i) & 1) {
+                    gfx->mRsp->loaded_vertices[i].clip_rej = kBits[p];
+                }
+            }
+            ++sPerfSubDlCulled;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Cached per path pointer (the long-lived c_str a room mesh entry holds) and centre; cleared with the
 // resource cache generation like CachedRawPointer.
 extern "C" float FastDisplayListVertexRadius(const char* path, float cx, float cy, float cz) {
@@ -3598,6 +3773,9 @@ bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
         (F3DGfx*)CachedRawPointer((const char*)fileName);
 
     if (C0(16, 1) == 0 && nDL != nullptr) {
+        if (SubDlCulled(mInstance.lock().get(), nDL)) {
+            return false;
+        }
         g_exec_stack.call(*cmd0, nDL);
     } else {
         if (nDL != nullptr) {
@@ -3650,7 +3828,7 @@ bool gfx_dl_otr_hash_handler_custom(F3DGfx** cmd0) {
 
         F3DGfx* gfx = (F3DGfx*)CachedRawPointer(hash);
 
-        if (gfx != 0) {
+        if (gfx != 0 && !SubDlCulled(mInstance.lock().get(), gfx)) {
             g_exec_stack.call(cmd, gfx);
         }
     } else {
