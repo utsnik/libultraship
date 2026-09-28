@@ -507,9 +507,9 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     return false;
 }
 
-std::string Interpreter::GetBaseTexturePath(const std::string& path) {
+std::string_view Interpreter::GetBaseTexturePath(const std::string& path) {
     if (path.starts_with(Ship::IResource::gAltAssetPrefix)) {
-        return path.substr(Ship::IResource::gAltAssetPrefix.length());
+        return std::string_view(path).substr(Ship::IResource::gAltAssetPrefix.length());
     }
 
     return path;
