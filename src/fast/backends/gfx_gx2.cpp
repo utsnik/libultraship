@@ -1081,7 +1081,7 @@ static void gfx_gx2_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t b
     static uint32_t dcbzCountdown = 0;
     static bool dcbzCopy = true;
     if (dcbzCountdown-- == 0) {
-        dcbzCopy = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.ArenaDcbzCopy", 1) != 0;
+        dcbzCopy = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.ArenaDcbzCopy", 1) != 0;
         dcbzCountdown = 1024;
     }
     uint64_t tick = OSGetSystemTick();

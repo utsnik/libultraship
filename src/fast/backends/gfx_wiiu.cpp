@@ -492,7 +492,7 @@ static void gfx_wiiu_init(const char* game_name, const char* gfx_api_name, bool 
     window_impl.Gx2.Width = WIIU_DEFAULT_FB_WIDTH;
     window_impl.Gx2.Height = WIIU_DEFAULT_FB_HEIGHT;
     window_impl.Backend = Fast::FAST3D_WIIU_GX2;
-    std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
+    std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui())
         ->Init(window_impl);
     SPDLOG_INFO("gfx_wiiu_init: Gui::Init ok");
 
@@ -658,7 +658,7 @@ static void gfx_wiiu_handle_events(void) {
     // growing over a session. Drop everything except the device events that handler still needs, as
     // GfxWindowBackendSDL2::HandleEvents does by consuming them.
     // Off switch for A/B runs: gWiiU.FlushSDLEvents 0.
-    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.FlushSDLEvents", 1)) {
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.FlushSDLEvents", 1)) {
         SDL_FlushEvents(SDL_FIRSTEVENT, SDL_CONTROLLERDEVICEADDED - 1);
         SDL_FlushEvents(SDL_CONTROLLERDEVICEREMOVED + 1, SDL_LASTEVENT);
     }

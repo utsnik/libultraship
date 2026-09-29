@@ -8,7 +8,7 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__WIIU__)
 #include <dlfcn.h>
 #endif
 
@@ -548,7 +548,7 @@ void Interpreter::ShaderCacheClear() {
 }
 
 const char* Interpreter::ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::Texture>& texture) {
-    auto resourceManager = Ship::Context::GetInstance()->GetResourceManager();
+    auto resourceManager = Ship::Context::GetRawInstance()->GetResourceManager();
     const uint32_t currentResourceCacheGeneration = resourceManager->GetCacheGeneration();
 
     if (mOtrTextureCacheResourceManager != resourceManager.get() ||
@@ -3590,7 +3590,7 @@ extern "C" void FastGetAndResetCullDlPerf(uint64_t* tested, uint64_t* rejected) 
 // Off switch: gWiiU.CullDisplayLists 0 (in case a replacement model outgrows its original bounding box).
 bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
     Interpreter* gfx = mInstance.lock().get();
-    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.CullDisplayLists", 1) == 0) {
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.CullDisplayLists", 1) == 0) {
         return false;
     }
 
@@ -3678,7 +3678,7 @@ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
 static Ship::ResourceManager* RawPointerCacheResourceManager() {
     static Ship::ResourceManager* resourceManager = nullptr;
     if (resourceManager == nullptr) {
-        resourceManager = Ship::Context::GetInstance()->GetResourceManager().get();
+        resourceManager = Ship::Context::GetRawInstance()->GetResourceManager().get();
     }
     return resourceManager;
 }
@@ -4037,7 +4037,7 @@ static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
     static int mode = 1;
 
     if (cvarCountdown-- == 0) {
-        mode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.SubDlCull", 1);
+        mode = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.SubDlCull", 1);
         cvarCountdown = 4096;
     }
     if (mode == 0 || dl == nullptr) {
@@ -4237,7 +4237,7 @@ static bool VtxBatchCulled(Interpreter* gfx, const F3DGfx* cmd) {
     static int mode = 1;
 
     if (cvarCountdown-- == 0) {
-        mode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.VtxBatchCull", 1);
+        mode = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.VtxBatchCull", 1);
         cvarCountdown = 8192;
     }
     if (mode == 0) {
@@ -4922,6 +4922,11 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
     HMODULE module = nullptr;
     return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                               reinterpret_cast<LPCSTR>(addr), &module) != 0;
+#elif defined(__WIIU__)
+    // No dynamic loader to ask on Wii U (Cafe RPL modules are not visible to dladdr); keep the pre-merge
+    // behaviour of accepting the address.
+    (void)addr;
+    return true;
 #else
     // For non-Windows platforms, check whether the address belongs to a loaded object.
     Dl_info info;
