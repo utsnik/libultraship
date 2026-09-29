@@ -12,6 +12,10 @@
 #include "fast/backends/gfx_direct3d_common.h"
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
+#ifdef ENABLE_GX2
+#include "fast/backends/gfx_gx2.h"
+#include "fast/backends/gfx_window_backend_wiiu.h"
+#endif
 
 #include "fast/Fast3dGui.h"
 
@@ -36,7 +40,11 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
         AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_METAL);
     }
 #endif
-    AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#ifdef ENABLE_GX2
+        AddAvailableWindowBackend(WindowBackend::FAST3D_WIIU_GX2);
+#else
+        AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
+#endif
 }
 
 Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui)
@@ -136,7 +144,7 @@ uint16_t Fast3dWindow::GetPixelDepth(float x, float y) {
 void Fast3dWindow::InitWindowManager() {
     SetWindowBackend(GetSavedWindowBackend());
 
-    switch (GetWindowBackend()) {
+    switch (static_cast<WindowBackend>(GetWindowBackend())) {
 #ifdef ENABLE_DX11
         case WindowBackend::FAST3D_DXGI_DX11:
             mWindowManagerApi = new GfxWindowBackendDXGI();
@@ -153,6 +161,15 @@ void Fast3dWindow::InitWindowManager() {
         case WindowBackend::FAST3D_SDL_METAL:
             mRenderingApi = new GfxRenderingAPIMetal();
             mWindowManagerApi = new GfxWindowBackendSDL2();
+            break;
+#endif
+#ifdef ENABLE_GX2
+        case WindowBackend::FAST3D_WIIU_GX2:
+            // The Wii U has no window manager and no SDL video path: the window
+            // backend only wraps ProcUI plus the GX2 scan-out buffers.
+            mWindowManagerApi = new GfxWindowBackendWiiU();
+            mRenderingApi = new GfxRenderingAPIGX2(Ship::Context::GetInstance()->GetConsoleVariables(),
+                                                   Ship::Context::GetInstance()->GetResourceManager());
             break;
 #endif
         default:
@@ -303,7 +320,7 @@ bool Fast3dWindow::SupportsWindowedFullscreen() {
     return false;
 #endif
 
-    if (GetWindowBackend() == WindowBackend::FAST3D_SDL_OPENGL) {
+    if (GetWindowBackend() == static_cast<int32_t>(WindowBackend::FAST3D_SDL_OPENGL)) {
         return true;
     }
 
@@ -394,13 +411,15 @@ std::weak_ptr<Interpreter> Fast3dWindow::GetInterpreterWeak() const {
 }
 
 std::string Fast3dWindow::GetWindowBackendName() {
-    switch (GetWindowBackend()) {
+    switch (static_cast<WindowBackend>(GetWindowBackend())) {
         case WindowBackend::FAST3D_DXGI_DX11:
             return "DirectX 11";
         case WindowBackend::FAST3D_SDL_OPENGL:
             return "OpenGL";
         case WindowBackend::FAST3D_SDL_METAL:
             return "Metal";
+        case WindowBackend::FAST3D_WIIU_GX2:
+            return "GX2";
         default:
             return "";
     }

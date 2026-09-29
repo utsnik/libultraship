@@ -201,6 +201,32 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
         )
     endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    # Wii U (devkitPPC/wut): GPU7 via GX2, no OpenGL and no SDL video backend.
+    target_compile_definitions(libultraship PRIVATE
+        ENABLE_GX2
+        __WIIU__
+        $<$<CONFIG:Debug>:_DEBUG>
+        $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+        SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
+        $<$<BOOL:${GFX_DEBUG_DISASSEMBLER}>:GFX_DEBUG_DISASSEMBLER>
+    )
+    # Keep these on the library target so every final executable which consumes
+    # libultraship gets the wrappers.  PRIVATE link options on this STATIC target
+    # would never reach the Soh link step.
+    target_link_options(libultraship PUBLIC
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=memalign"
+        "-Wl,--wrap=posix_memalign"
+        "-Wl,--wrap=aligned_alloc"
+        "-Wl,--wrap=_Znwm"
+        "-Wl,--wrap=_Znam"
+        "-Wl,--wrap=_Znwj"
+        "-Wl,--wrap=_Znaj"
+    )
 else()
     target_compile_definitions(libultraship PRIVATE
         ENABLE_OPENGL
@@ -258,4 +284,3 @@ if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU|Clang")
     )
     endif()
 endif()
-

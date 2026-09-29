@@ -1,5 +1,6 @@
 #define NOMINMAX
 
+#include <unordered_set>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -37,6 +38,7 @@
 #include "ship/utils/Utils.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 #include "libultraship/libultra/os.h"
 
@@ -74,6 +76,14 @@ std::stack<std::string> currentDir;
 namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
+
+static const std::array<float, 256> byte_to_unit = [] {
+    std::array<float, 256> table{};
+    for (int i = 0; i < 256; i++) {
+        table[i] = (float)i / 255.0f;
+    }
+    return table;
+}();
 
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
@@ -113,6 +123,36 @@ static std::string GetPathWithoutFileName(char* filePath) {
 
 constexpr size_t MAX_TRI_BUFFER = 256;
 
+enum class PerfFlushReason : size_t {
+    Texture,
+    Sampler,
+    Shader,
+    DepthZmode,
+    ViewportScissor,
+    Alpha,
+    TriangleBufferCap,
+    Explicit,
+    Count,
+};
+
+static uint64_t sPerfGfxSpVertexCount = 0;
+// Vertex-batch culling (see VtxBatchCulled): slots whose last load was skipped as wholly off one clip plane.
+// They carry that plane's clip_rej bit but no transformed data; a triangle that reaches them without being
+// trivially rejected is dropped and counted (sPerfStaleTris) instead of drawn from stale values.
+static uint64_t sStaleSlots = 0;
+static uint64_t sStaleFromSubDl = 0; // subset of sStaleSlots set by sub-DL culling
+static uint64_t sPerfStaleTris = 0;
+static uint64_t sPerfStaleTrisSubDl = 0;
+static uint64_t sPerfFlushCounts[static_cast<size_t>(PerfFlushReason::Count)] = {};
+
+// The reason is only counted if the following Flush() actually submits triangles: most state
+// changes arrive with an empty batch and cost nothing. Unlabelled Flush() calls count as Explicit.
+static PerfFlushReason sPendingFlushReason = PerfFlushReason::Explicit;
+
+static inline void RecordPerfFlush(PerfFlushReason reason) {
+    sPendingFlushReason = reason;
+}
+
 Interpreter::Interpreter() {
     mRsp = new RSP();
     mRdp = new RDP();
@@ -131,16 +171,27 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
 }
 
+extern "C" void FastGetAndResetInterpreterPerf(uint64_t* vertices, uint64_t flushCounts[]) {
+    *vertices = sPerfGfxSpVertexCount;
+    sPerfGfxSpVertexCount = 0;
+    for (size_t i = 0; i < static_cast<size_t>(PerfFlushReason::Count); ++i) {
+        flushCounts[i] = sPerfFlushCounts[i];
+        sPerfFlushCounts[i] = 0;
+    }
+}
+
 // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+        ++sPerfFlushCounts[static_cast<size_t>(sPendingFlushReason)];
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
+    sPendingFlushReason = PerfFlushReason::Explicit;
 }
 
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
@@ -438,6 +489,7 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
     if (mPrevCombiner != mColorCombinerPool.end()) {
         return &mPrevCombiner->second;
     }
+    RecordPerfFlush(PerfFlushReason::Shader);
     Flush();
     mPrevCombiner = mColorCombinerPool.insert(std::make_pair(key, ColorCombiner())).first;
     GenerateCC(&mPrevCombiner->second, key);
@@ -475,6 +527,8 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveResourceCached(const char* 
 }
 
 void Interpreter::TextureCacheClear() {
+    mOtrTextureCache.clear();
+    WDOG_OTR_TEXTURE_CACHE_SIZE(mOtrTextureCache.size());
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
     }
@@ -486,10 +540,52 @@ void Interpreter::TextureCacheClear() {
     mTextureCache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
     // Null rendering-state pointers — they pointed into map nodes that are now freed.
     std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
+    WDOG_TEXTURE_CACHE_SIZES(mTextureCache.map.size(), mTextureCache.free_texture_ids.size());
 }
 
 void Interpreter::ShaderCacheClear() {
     mRapi->ClearShaderCache();
+}
+
+const char* Interpreter::ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::Texture>& texture) {
+    auto resourceManager = Ship::Context::GetInstance()->GetResourceManager();
+    const uint32_t currentResourceCacheGeneration = resourceManager->GetCacheGeneration();
+
+    if (mOtrTextureCacheResourceManager != resourceManager.get() ||
+        mOtrTextureCacheGeneration != currentResourceCacheGeneration) {
+        mOtrTextureCache.clear();
+        WDOG_OTR_TEXTURE_CACHE_SIZE(mOtrTextureCache.size());
+        mOtrTextureCacheResourceManager = resourceManager.get();
+        mOtrTextureCacheGeneration = currentResourceCacheGeneration;
+    }
+
+    auto cachedTexture = mOtrTextureCache.find(hash);
+    if (cachedTexture != mOtrTextureCache.end()) {
+        if (cachedTexture->second.texture != nullptr && cachedTexture->second.texture->IsDirty()) {
+            mOtrTextureCache.erase(cachedTexture);
+        } else {
+            WDOG_OTR_CACHE_HIT();
+            texture = cachedTexture->second.texture;
+            return cachedTexture->second.fileName.empty() ? nullptr : cachedTexture->second.fileName.c_str();
+        }
+    }
+
+    WDOG_OTR_CACHE_MISS();
+    const char* fileName = resourceManager->GetArchiveManager()->HashToCString(hash);
+    if (fileName == nullptr) {
+        texture = nullptr;
+        return nullptr;
+    }
+
+    WDOG_OTR_RM_LOOKUP();
+    texture = std::static_pointer_cast<Fast::Texture>(resourceManager->LoadResourceProcess(fileName));
+    auto [cacheEntry, inserted] = mOtrTextureCache.emplace(hash, OtrTextureCacheEntry{ fileName, texture });
+    if (!inserted) {
+        cacheEntry->second.fileName = fileName;
+        cacheEntry->second.texture = texture;
+    }
+    WDOG_OTR_TEXTURE_CACHE_SIZE(mOtrTextureCache.size());
+    return cacheEntry->second.fileName.c_str();
 }
 
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
@@ -532,12 +628,13 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     mRapi->SelectTexture(i, texture_id);
     mRapi->SetSamplerParameters(i, false, 0, 0);
     *n = node;
+    WDOG_TEXTURE_CACHE_SIZES(mTextureCache.map.size(), mTextureCache.free_texture_ids.size());
     return false;
 }
 
 std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
     if (path.starts_with(Ship::IResource::gAltAssetPrefix)) {
-        return path.substr(Ship::IResource::gAltAssetPrefix.length());
+        return std::string_view(path).substr(Ship::IResource::gAltAssetPrefix.length());
     }
 
     return path;
@@ -565,6 +662,35 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
             break;
         }
     }
+    WDOG_TEXTURE_CACHE_SIZES(mTextureCache.map.size(), mTextureCache.free_texture_ids.size());
+}
+
+bool Interpreter::EnsureTexUploadBuffer(size_t requiredBytes) {
+    constexpr size_t kInitialSize = 4 * 1024 * 1024;
+    if (mTexUploadBuffer != nullptr && requiredBytes <= mTexUploadBufferSize) {
+        return true;
+    }
+
+    size_t newSize = mTexUploadBufferSize == 0 ? kInitialSize : mTexUploadBufferSize;
+    while (newSize < requiredBytes) {
+        if (newSize > SIZE_MAX / 2) {
+            newSize = requiredBytes;
+            break;
+        }
+        newSize *= 2;
+    }
+
+    free(mTexUploadBuffer);
+    mTexUploadBuffer = nullptr;
+    mTexUploadBufferSize = 0;
+    mTexUploadBuffer = static_cast<uint8_t*>(malloc(newSize));
+    if (mTexUploadBuffer == nullptr) {
+        SPDLOG_ERROR("Interpreter: failed to allocate texture upload buffer ({} bytes)", newSize);
+        return false;
+    }
+
+    mTexUploadBufferSize = newSize;
+    return true;
 }
 
 // Pick the per-line byte width for texture decode. Prefer the DRAM stride from
@@ -648,6 +774,10 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width * 2;
+    }
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
     }
 
     uint32_t i = 0;
@@ -766,6 +896,10 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
         fullImageLineSizeBytes = widthBytes;
     }
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
+    }
+
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -810,6 +944,10 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
         fullImageLineSizeBytes = width;
     }
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
+    }
+
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -852,6 +990,10 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (full_image_line_size_bytes == size_bytes) {
         full_image_line_size_bytes = width * 2;
+    }
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
     }
 
     uint32_t i = 0;
@@ -904,6 +1046,10 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
         fullImageLineSizeBytes = width / 2;
     }
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
+    }
+
     uint32_t i = 0;
 
     for (uint32_t y = 0; y < height; y++) {
@@ -952,6 +1098,10 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
 
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width;
+    }
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
     }
 
     uint32_t i = 0;
@@ -1034,6 +1184,10 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
 
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = resultLineSizeBytes;
+    }
+
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
     }
 
     uint32_t i = 0;
@@ -1132,6 +1286,10 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         height = tile_h;
     }
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
+    }
+
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1203,6 +1361,12 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     uint32_t fullImageLineSizeBytes =
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t line_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
+
+    const size_t requiredBytes = std::max(static_cast<size_t>(numLoadedBytes) + line_size_bytes,
+                                          static_cast<size_t>(resultNewLineSize) * resultNewHeight);
+    if (!EnsureTexUploadBuffer(requiredBytes)) {
+        return;
+    }
 
     // Get the resource's true image size
     uint32_t resourceImageSizeBytes = resource->ImageDataSize;
@@ -1433,6 +1597,10 @@ void Interpreter::ImportTextureMask(int i, int tile) {
             break;
     }
 
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
+    }
+
     for (uint32_t texIndex = 0; texIndex < width * height; texIndex++) {
         uint8_t masked = orig_addr[texIndex];
         if (masked) {
@@ -1578,7 +1746,52 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    sPerfGfxSpVertexCount += n_vertices;
+    if (sStaleSlots != 0) {
+        for (size_t i = dest_index; i < dest_index + n_vertices && i < 64; i++) {
+            sStaleSlots &= ~(1ULL << i);
+            sStaleFromSubDl &= ~(1ULL << i);
+        }
+    }
+    const float(*MP_matrix)[4] = mRsp->MP_matrix;
+    const uint32_t geometry_mode = mRsp->geometry_mode;
+    const uint16_t texture_scale_s = mRsp->texture_scaling_factor.s;
+    const uint16_t texture_scale_t = mRsp->texture_scaling_factor.t;
+    const float fog_mul = (float)mRsp->fog_mul;
+    const float fog_offset = (float)mRsp->fog_offset;
+    const float aspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
+    const float aspect_scale = (4.0f / 3.0f) / aspect;
+    float light_colors[MAX_LIGHTS][3];
+    float ambient_color[3];
+
+    if (geometry_mode & G_LIGHTING) {
+        if (mRsp->lights_changed) {
+            for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+                CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
+            }
+            /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
+            static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
+            CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
+            CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+            mRsp->lights_changed = false;
+        }
+
+        for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+            light_colors[i][0] = (float)mRsp->current_lights[i].l.col[0];
+            light_colors[i][1] = (float)mRsp->current_lights[i].l.col[1];
+            light_colors[i][2] = (float)mRsp->current_lights[i].l.col[2];
+        }
+        const int ambient_light = mRsp->current_num_lights - 1;
+        ambient_color[0] = (float)mRsp->current_lights[ambient_light].l.col[0];
+        ambient_color[1] = (float)mRsp->current_lights[ambient_light].l.col[1];
+        ambient_color[2] = (float)mRsp->current_lights[ambient_light].l.col[2];
+    }
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
+        if ((i & 1) == 0 && i + 4 < n_vertices) {
+            __builtin_prefetch(&vertices[i + 4]);
+        }
+
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
         struct LoadedVertex* d = &mRsp->loaded_vertices[dest_index];
@@ -1587,47 +1800,34 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             return;
         }
 
-        float x = v->ob[0] * mRsp->MP_matrix[0][0] + v->ob[1] * mRsp->MP_matrix[1][0] +
-                  v->ob[2] * mRsp->MP_matrix[2][0] + mRsp->MP_matrix[3][0];
-        float y = v->ob[0] * mRsp->MP_matrix[0][1] + v->ob[1] * mRsp->MP_matrix[1][1] +
-                  v->ob[2] * mRsp->MP_matrix[2][1] + mRsp->MP_matrix[3][1];
-        float z = v->ob[0] * mRsp->MP_matrix[0][2] + v->ob[1] * mRsp->MP_matrix[1][2] +
-                  v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
-        float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
-                  v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+        const float normal[3] = { (float)vn->n[0], (float)vn->n[1], (float)vn->n[2] };
+
+        float x = v->ob[0] * MP_matrix[0][0] + v->ob[1] * MP_matrix[1][0] + v->ob[2] * MP_matrix[2][0] + MP_matrix[3][0];
+        float y = v->ob[0] * MP_matrix[0][1] + v->ob[1] * MP_matrix[1][1] + v->ob[2] * MP_matrix[2][1] + MP_matrix[3][1];
+        float z = v->ob[0] * MP_matrix[0][2] + v->ob[1] * MP_matrix[1][2] + v->ob[2] * MP_matrix[2][2] + MP_matrix[3][2];
+        float w = v->ob[0] * MP_matrix[0][3] + v->ob[1] * MP_matrix[1][3] + v->ob[2] * MP_matrix[2][3] + MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
-        if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
+        if (geometry_mode & G_LIGHTING_POSITIONAL) {
             float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
 
-        x = AdjXForAspectRatio(x);
+        x = mFbActive ? x : x * aspect_scale;
 
-        short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
-        short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
+        short U = v->tc[0] * texture_scale_s >> 16;
+        short V = v->tc[1] * texture_scale_t >> 16;
 
-        if (mRsp->geometry_mode & G_LIGHTING) {
-            if (mRsp->lights_changed) {
-                for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
-                    CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
-                }
-                /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
-                static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
-                CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
-                CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
-                mRsp->lights_changed = false;
-            }
-
-            int r = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[0];
-            int g = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[1];
-            int b = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[2];
+        if (geometry_mode & G_LIGHTING) {
+            float r = ambient_color[0];
+            float g = ambient_color[1];
+            float b = ambient_color[2];
 
             for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
                 float intensity = 0;
-                if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
+                if ((geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
                     // Calculate distance from the light to the vertex
                     float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - world_pos[0],
                                           mRsp->current_lights[i].p.pos[1] - world_pos[1],
@@ -1650,8 +1850,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     }
 
                     // Adjust intensity based on surface normal and sum up total
-                    float total_intensity =
-                        light_intensity[0] * vn->n[0] + light_intensity[1] * vn->n[1] + light_intensity[2] * vn->n[2];
+                    float total_intensity = light_intensity[0] * normal[0] + light_intensity[1] * normal[1] +
+                                            light_intensity[2] * normal[2];
                     total_intensity = std::clamp(total_intensity, -1.0f, 1.0f);
 
                     // Attenuate intensity based on attenuation values.
@@ -1665,38 +1865,43 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                                         1.0f;
                     intensity = total_intensity / attenuation;
                 } else {
-                    intensity += vn->n[0] * mRsp->current_lights_coeffs[i][0];
-                    intensity += vn->n[1] * mRsp->current_lights_coeffs[i][1];
-                    intensity += vn->n[2] * mRsp->current_lights_coeffs[i][2];
-                    intensity /= 127.0f;
+                    intensity += normal[0] * mRsp->current_lights_coeffs[i][0];
+                    intensity += normal[1] * mRsp->current_lights_coeffs[i][1];
+                    intensity += normal[2] * mRsp->current_lights_coeffs[i][2];
+                    intensity *= (1.0f / 127.0f);
                 }
                 if (intensity > 0.0f) {
-                    r += intensity * mRsp->current_lights[i].l.col[0];
-                    g += intensity * mRsp->current_lights[i].l.col[1];
-                    b += intensity * mRsp->current_lights[i].l.col[2];
+                    r += intensity * light_colors[i][0];
+                    g += intensity * light_colors[i][1];
+                    b += intensity * light_colors[i][2];
                 }
             }
 
-            d->color.r = r > 255 ? 255 : r;
-            d->color.g = g > 255 ? 255 : g;
-            d->color.b = b > 255 ? 255 : b;
+            const int r_int = (int)r;
+            const int g_int = (int)g;
+            const int b_int = (int)b;
+            d->color.r = r_int > 255 ? 255 : r_int;
+            d->color.g = g_int > 255 ? 255 : g_int;
+            d->color.b = b_int > 255 ? 255 : b_int;
 
-            if (mRsp->geometry_mode & G_TEXTURE_GEN) {
+            if (geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
-                dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
-                dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
-                dotx += vn->n[2] * mRsp->current_lookat_coeffs[0][2];
-                doty += vn->n[0] * mRsp->current_lookat_coeffs[1][0];
-                doty += vn->n[1] * mRsp->current_lookat_coeffs[1][1];
-                doty += vn->n[2] * mRsp->current_lookat_coeffs[1][2];
+                dotx += normal[0] * mRsp->current_lookat_coeffs[0][0];
+                dotx += normal[1] * mRsp->current_lookat_coeffs[0][1];
+                dotx += normal[2] * mRsp->current_lookat_coeffs[0][2];
+                doty += normal[0] * mRsp->current_lookat_coeffs[1][0];
+                doty += normal[1] * mRsp->current_lookat_coeffs[1][1];
+                doty += normal[2] * mRsp->current_lookat_coeffs[1][2];
 
-                dotx /= 127.0f;
-                doty /= 127.0f;
+                dotx *= (1.0f / 127.0f);
+                doty *= (1.0f / 127.0f);
 
-                dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
-                doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
+                dotx = dotx < -1.0f ? -1.0f : dotx;
+                dotx = dotx > 1.0f ? 1.0f : dotx;
+                doty = doty < -1.0f ? -1.0f : doty;
+                doty = doty > 1.0f ? 1.0f : doty;
 
-                if (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) {
+                if (geometry_mode & G_TEXTURE_GEN_LINEAR) {
                     // Not sure exactly what formula we should use to get accurate values
                     /*dotx = (2.906921f * dotx * dotx + 1.36114f) * dotx;
                     doty = (2.906921f * doty * doty + 1.36114f) * doty;
@@ -1709,8 +1914,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     doty = (doty + 1.0f) / 4.0f;
                 }
 
-                U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
-                V = (int32_t)(doty * mRsp->texture_scaling_factor.t);
+                U = (int32_t)(dotx * texture_scale_s);
+                V = (int32_t)(doty * texture_scale_t);
             }
         } else {
             d->color.r = v->cn[0];
@@ -1745,19 +1950,26 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         d->z = z;
         d->w = w;
 
-        if (mRsp->geometry_mode & G_FOG) {
+        if (geometry_mode & G_FOG) {
             if (fabsf(w) < 0.001f) {
                 // To avoid division by zero
                 w = 0.001f;
             }
 
-            float winv = 1.0f / w;
+            float winv;
+#ifdef __WIIU__
+            __asm__ volatile("fres %0, %1" : "=f"(winv) : "f"(w));
+            winv = winv * (2.0f - w * winv);
+#else
+            winv = 1.0f / w;
+#endif
             if (winv < 0.0f) {
                 winv = std::numeric_limits<int16_t>::max();
             }
 
-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
-            fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
+            float fog_z = z * winv * fog_mul + fog_offset;
+            fog_z = fog_z < 0.0f ? 0.0f : fog_z;
+            fog_z = fog_z > 255.0f ? 255.0f : fog_z;
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {
             d->color.a = v->cn[3];
@@ -1788,22 +2000,41 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // The whole triangle lies outside the visible area
         return;
     }
+    // (Rectangles use slots MAX_VERTICES..+3, which are never stale.)
+    if (sStaleSlots != 0 && ((vtx1_idx < 64 && ((sStaleSlots >> vtx1_idx) & 1)) ||
+                             (vtx2_idx < 64 && ((sStaleSlots >> vtx2_idx) & 1)) ||
+                             (vtx3_idx < 64 && ((sStaleSlots >> vtx3_idx) & 1)))) {
+        ++sPerfStaleTris;
+        const uint64_t tri = (vtx1_idx < 64 ? 1ULL << vtx1_idx : 0) | (vtx2_idx < 64 ? 1ULL << vtx2_idx : 0) |
+                             (vtx3_idx < 64 ? 1ULL << vtx3_idx : 0);
+        if (tri & sStaleFromSubDl) {
+            ++sPerfStaleTrisSubDl;
+        }
+        return;
+    }
 
     const uint32_t cull_both = get_attr(CULL_BOTH);
     const uint32_t cull_front = get_attr(CULL_FRONT);
     const uint32_t cull_back = get_attr(CULL_BACK);
 
     if ((mRsp->geometry_mode & cull_both) != 0) {
-        float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
-        float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
-        float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
-        float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
-        float cross = dx1 * dy2 - dy1 * dx2;
+        float cross;
+        if (v1->w != 0.0f && v2->w != 0.0f && v3->w != 0.0f) {
+            cross = -(v1->x * (v2->y * v3->w - v2->w * v3->y) -
+                      v1->y * (v2->x * v3->w - v2->w * v3->x) +
+                      v1->w * (v2->x * v3->y - v2->y * v3->x));
+        } else {
+            float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
+            float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
+            float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
+            float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
+            cross = dx1 * dy2 - dy1 * dx2;
 
-        if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
-            // If one vertex lies behind the eye, negating cross will give the correct result.
-            // If all vertices lie behind the eye, the triangle will be rejected anyway.
-            cross = -cross;
+            if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
+                // If one vertex lies behind the eye, negating cross will give the correct result.
+                // If all vertices lie behind the eye, the triangle will be rejected anyway.
+                cross = -cross;
+            }
         }
 
         // G_EX_INVERT_CULLING is a LUS extension, not tied to a specific ucode,
@@ -1836,6 +2067,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
+        RecordPerfFlush(PerfFlushReason::DepthZmode);
         Flush();
         mRapi->SetDepthTestAndMask(depth_test, depth_mask);
         mRenderingState.depth_test_and_mask = depth_test_and_mask;
@@ -1843,6 +2075,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
     if (zmode_decal != mRenderingState.decal_mode) {
+        RecordPerfFlush(PerfFlushReason::DepthZmode);
         Flush();
         mRapi->SetZmodeDecal(zmode_decal);
         mRenderingState.decal_mode = zmode_decal;
@@ -1850,11 +2083,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     if (mRdp->viewport_or_scissor_changed) {
         if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
+            RecordPerfFlush(PerfFlushReason::ViewportScissor);
             Flush();
             mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
             mRenderingState.viewport = mRdp->viewport;
         }
         if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
+            RecordPerfFlush(PerfFlushReason::ViewportScissor);
             Flush();
             mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
             mRenderingState.scissor = mRdp->scissor;
@@ -1956,6 +2191,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
         if (comb->usedTextures[i]) {
             if (mRdp->textures_changed[i]) {
+                RecordPerfFlush(PerfFlushReason::Texture);
                 Flush();
                 ImportTexture(i, tile, false);
                 if (mRdp->loaded_texture[i].masked) {
@@ -2052,6 +2288,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             bool linear_filter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
             if (linear_filter != mRenderingState.mTextures[i]->second.linear_filter ||
                 cms != mRenderingState.mTextures[i]->second.cms || cmt != mRenderingState.mTextures[i]->second.cmt) {
+                RecordPerfFlush(PerfFlushReason::Sampler);
                 Flush();
 
                 // Set the same sampler params on the blended texture. Needed for opengl.
@@ -2073,12 +2310,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
     }
     if (prg != mRenderingState.mShaderProgram) {
+        RecordPerfFlush(PerfFlushReason::Shader);
         Flush();
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
         mRapi->LoadShader(prg);
         mRenderingState.mShaderProgram = prg;
     }
     if (use_alpha != mRenderingState.alpha_blend) {
+        RecordPerfFlush(PerfFlushReason::Alpha);
         Flush();
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
@@ -2088,18 +2327,65 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
 
-    struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
+    float tex_width_inv[2], tex_height_inv[2];
+    float texture_scale_s[2], texture_scale_t[2];
+    float uls_div4[2], ult_div4[2];
+    float clamp_s[2], clamp_t[2];
+    static bool tex_cache_valid[2] = {};
+    static float tex_cache_width[2], tex_cache_height[2];
+    static float tex_cache_width2[2], tex_cache_height2[2];
+    static float tex_cache_width_inv[2], tex_cache_height_inv[2];
+    static float tex_cache_clamp_s[2], tex_cache_clamp_t[2];
+    for (int t = 0; t < 2; t++) {
+        if (!usedTextures[t]) {
+            continue;
+        }
 
+        const float width = tex_width[t];
+        const float height = tex_height[t];
+        const float width2 = tex_width2[t];
+        const float height2 = tex_height2[t];
+        if (!tex_cache_valid[t] || tex_cache_width[t] != width || tex_cache_height[t] != height ||
+            tex_cache_width2[t] != width2 || tex_cache_height2[t] != height2) {
+            tex_cache_valid[t] = true;
+            tex_cache_width[t] = width;
+            tex_cache_height[t] = height;
+            tex_cache_width2[t] = width2;
+            tex_cache_height2[t] = height2;
+            tex_cache_width_inv[t] = 1.0f / width;
+            tex_cache_height_inv[t] = 1.0f / height;
+            tex_cache_clamp_s[t] = (width2 - 0.5f) / width;
+            tex_cache_clamp_t[t] = (height2 - 0.5f) / height;
+        }
+        tex_width_inv[t] = tex_cache_width_inv[t];
+        tex_height_inv[t] = tex_cache_height_inv[t];
+
+        int shifts = mRdp->texture_tile[mRdp->first_tile_index + t].shifts;
+        int shiftt = mRdp->texture_tile[mRdp->first_tile_index + t].shiftt;
+        texture_scale_s[t] = shifts == 0 ? 1.0f : shifts <= 10 ? 1.0f / (1 << shifts) : (float)(1 << (16 - shifts));
+        texture_scale_t[t] = shiftt == 0 ? 1.0f : shiftt <= 10 ? 1.0f / (1 << shiftt) : (float)(1 << (16 - shiftt));
+        uls_div4[t] = mRdp->texture_tile[mRdp->first_tile_index + t].uls / 4.0f;
+        ult_div4[t] = mRdp->texture_tile[mRdp->first_tile_index + t].ult / 4.0f;
+        clamp_s[t] = tex_cache_clamp_s[t];
+        clamp_t[t] = tex_cache_clamp_t[t];
+    }
+
+    struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
+    const bool uv_half_offset = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT && !is_rect;
+
+    // Write through a local pointer: storing to mBufVboLen after every float (it cannot stay in a register
+    // across the float stores, which may alias it) cost a store per component.
+    float* out = mBufVbo + mBufVboLen;
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (clip_parameters.z_is_from_0_to_1) {
             z = (z + w) / 2.0f;
         }
 
-        mBufVbo[mBufVboLen++] = v_arr[i]->x;
-        mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
-        mBufVbo[mBufVboLen++] = z;
-        mBufVbo[mBufVboLen++] = w;
+        *out++ = v_arr[i]->x;
+        *out++ = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
+        *out++ = z;
+        *out++ = w;
 
         for (int t = 0; t < 2; t++) {
             if (!usedTextures[t]) {
@@ -2108,70 +2394,53 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             float u = v_arr[i]->u / 32.0f;
             float v = v_arr[i]->v / 32.0f;
 
-            uint32_t uv_tile = effective_tile[t];
-            int shifts = mRdp->texture_tile[uv_tile].shifts;
-            int shiftt = mRdp->texture_tile[uv_tile].shiftt;
-            if (shifts != 0) {
-                if (shifts <= 10) {
-                    u /= 1 << shifts;
-                } else {
-                    u *= 1 << (16 - shifts);
-                }
-            }
-            if (shiftt != 0) {
-                if (shiftt <= 10) {
-                    v /= 1 << shiftt;
-                } else {
-                    v *= 1 << (16 - shiftt);
-                }
-            }
+            u *= texture_scale_s[t];
+            v *= texture_scale_t[t];
 
-            u -= mRdp->texture_tile[uv_tile].uls / 4.0f;
-            v -= mRdp->texture_tile[uv_tile].ult / 4.0f;
+            u -= uls_div4[t];
+            v -= ult_div4[t];
 
-            if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
+            if (uv_half_offset) {
                 // Linear filter adds 0.5f to the coordinates
-                if (!is_rect) {
-                    u += 0.5f;
-                    v += 0.5f;
-                }
+                u += 0.5f;
+                v += 0.5f;
             }
 
-            mBufVbo[mBufVboLen++] = u / tex_width[t];
-            mBufVbo[mBufVboLen++] = v / tex_height[t];
+            *out++ = u * tex_width_inv[t];
+            *out++ = v * tex_height_inv[t];
 
             bool clampS = tm & (1 << 2 * t);
             bool clampT = tm & (1 << 2 * t + 1);
 
             if (clampS) {
-                mBufVbo[mBufVboLen++] = (tex_width2[t] - 0.5f) / tex_width[t];
+                *out++ = clamp_s[t];
             }
 
             if (clampT) {
-                mBufVbo[mBufVboLen++] = (tex_height2[t] - 0.5f) / tex_height[t];
+                *out++ = clamp_t[t];
             }
         }
 
         if (use_fog) {
             if (use_blend_color) {
-                // Shroud/blend mode: blend toward blend_color using fog alpha as factor
-                mBufVbo[mBufVboLen++] = mRdp->blend_color.r / 255.0f;
-                mBufVbo[mBufVboLen++] = mRdp->blend_color.g / 255.0f;
-                mBufVbo[mBufVboLen++] = mRdp->blend_color.b / 255.0f;
-                mBufVbo[mBufVboLen++] = mRdp->fog_color.a / 255.0f;
+                // Shroud/blend mode: blend toward blend_color using fog alpha as factor.
+                *out++ = byte_to_unit[mRdp->blend_color.r];
+                *out++ = byte_to_unit[mRdp->blend_color.g];
+                *out++ = byte_to_unit[mRdp->blend_color.b];
+                *out++ = byte_to_unit[mRdp->fog_color.a];
             } else {
-                mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
-                mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
-                mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
-                mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+                *out++ = byte_to_unit[mRdp->fog_color.r];
+                *out++ = byte_to_unit[mRdp->fog_color.g];
+                *out++ = byte_to_unit[mRdp->fog_color.b];
+                *out++ = byte_to_unit[v_arr[i]->color.a]; // fog factor (not alpha)
             }
         }
 
         if (use_grayscale) {
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.r / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.g / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.b / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.a / 255.0f; // lerp interpolation factor (not alpha)
+            *out++ = byte_to_unit[mRdp->grayscale_color.r];
+            *out++ = byte_to_unit[mRdp->grayscale_color.g];
+            *out++ = byte_to_unit[mRdp->grayscale_color.b];
+            *out++ = byte_to_unit[mRdp->grayscale_color.a]; // lerp interpolation factor (not alpha)
         }
 
         for (int j = 0; j < numInputs; j++) {
@@ -2248,30 +2517,26 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                 }
                 if (k == 0) {
-                    mBufVbo[mBufVboLen++] = color->r / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->g / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->b / 255.0f;
+                    *out++ = byte_to_unit[color->r];
+                    *out++ = byte_to_unit[color->g];
+                    *out++ = byte_to_unit[color->b];
                 } else {
                     if (use_fog && !use_blend_color && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for standard fog, blend color mode preserves
-                        // it since fog alpha is the blend factor
-                        mBufVbo[mBufVboLen++] = 1.0f;
+                        // it since fog alpha is the blend factor.
+                        *out++ = 1.0f;
                     } else {
-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
+                        *out++ = byte_to_unit[color->a];
                     }
                 }
             }
         }
-
-        // struct RGBA *color = &v_arr[i]->color;
-        // mBufVbo[mBufVboLen++] = color->r / 255.0f;
-        // mBufVbo[mBufVboLen++] = color->g / 255.0f;
-        // mBufVbo[mBufVboLen++] = color->b / 255.0f;
-        // mBufVbo[mBufVboLen++] = color->a / 255.0f;
     }
+    mBufVboLen = (size_t)(out - mBufVbo);
 
     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
         // if (++mBufVbo_num_tris == 1) {
+        RecordPerfFlush(PerfFlushReason::TriangleBufferCap);
         Flush();
     }
 }
@@ -3092,6 +3357,8 @@ void Interpreter::GfxDpSetOtherMode(uint32_t h, uint32_t l) {
     mRdp->other_mode_l = l;
 }
 
+static std::shared_ptr<Fast::Texture> CachedTextureByPath(const char* path);
+
 void Interpreter::Gfxs2dexBgCopy(F3DuObjBg* bg) {
     /*
     bg->b.imageX = 0;
@@ -3114,8 +3381,7 @@ void Interpreter::Gfxs2dexBgCopy(F3DuObjBg* bg) {
     RawTexMetadata rawTexMetadata = {};
 
     if ((bool)gfx_check_image_signature((char*)data)) {
-        std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-            Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess((char*)data));
+        std::shared_ptr<Fast::Texture> tex = CachedTextureByPath((char*)data);
         texFlags = tex->Flags;
         rawTexMetadata.width = tex->Width;
         rawTexMetadata.height = tex->Height;
@@ -3151,8 +3417,7 @@ void Interpreter::Gfxs2dexBg1cyc(F3DuObjBg* bg) {
     RawTexMetadata rawTexMetadata = {};
 
     if ((bool)gfx_check_image_signature((char*)data)) {
-        std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-            Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess((char*)data));
+        std::shared_ptr<Fast::Texture> tex = CachedTextureByPath((char*)data);
         texFlags = tex->Flags;
         rawTexMetadata.width = tex->Width;
         rawTexMetadata.height = tex->Height;
@@ -3306,9 +3571,46 @@ bool gfx_load_ucode_handler_f3dex2(F3DGfx** cmd) {
     return false;
 }
 
+bool gfx_end_dl_handler_common(F3DGfx** cmd0);
+
+static uint64_t sPerfCullDlTested = 0;
+static uint64_t sPerfCullDlRejected = 0;
+
+extern "C" void FastGetAndResetCullDlPerf(uint64_t* tested, uint64_t* rejected) {
+    *tested = sPerfCullDlTested;
+    *rejected = sPerfCullDlRejected;
+    sPerfCullDlTested = 0;
+    sPerfCullDlRejected = 0;
+}
+
+// gSPCullDisplayList(vstart, vend): the display list's bounding-box vertices were just loaded; if they are
+// all outside the same clip plane, the rest of the list is skipped, as the RSP does. Every triangle inside
+// the box would fail GfxSpTri1's `v1->clip_rej & v2->clip_rej & v3->clip_rej` test anyway, and the flags
+// already include the widescreen aspect scaling, so this only drops work whose output is discarded.
+// Off switch: gWiiU.CullDisplayLists 0 (in case a replacement model outgrows its original bounding box).
 bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
-    // TODO:
-    return false;
+    Interpreter* gfx = mInstance.lock().get();
+    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.CullDisplayLists", 1) == 0) {
+        return false;
+    }
+
+    const uint32_t vstart = ((*cmd)->words.w0 & 0xFFFF) / 2;
+    const uint32_t vend = ((*cmd)->words.w1 & 0xFFFF) / 2;
+    if (vstart > vend || vend >= MAX_VERTICES) {
+        return false;
+    }
+
+    ++sPerfCullDlTested;
+    uint8_t rejected = 0xFF;
+    for (uint32_t i = vstart; i <= vend && rejected != 0; i++) {
+        rejected &= gfx->mRsp->loaded_vertices[i].clip_rej;
+    }
+    if (rejected == 0) {
+        return false;
+    }
+
+    ++sPerfCullDlRejected;
+    return gfx_end_dl_handler_common(cmd);
 }
 
 bool gfx_marker_handler_otr(F3DGfx** cmd0) {
@@ -3366,11 +3668,646 @@ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
     return false;
 }
 
+// Every path/hash lookup below used to call ResourceManager::GetResourceRawPointer, which
+// goes LoadResource -> LoadResourceAsync (std::string, hash, promise/future, condvar, heap
+// lock) EVEN ON A CACHE HIT. Profiled on Wii U with a model-replacing texture pack, that
+// machinery was ~40% of title-screen CPU (malloc lock + future teardown). The results are
+// cached here; the ResourceManager cache generation, bumped on every clear/unload,
+// invalidates both maps. Paths are keyed by pointer: the string lives inside the display
+// list resource, which cannot be replaced without an unload (and so a generation bump).
+static Ship::ResourceManager* RawPointerCacheResourceManager() {
+    static Ship::ResourceManager* resourceManager = nullptr;
+    if (resourceManager == nullptr) {
+        resourceManager = Ship::Context::GetInstance()->GetResourceManager().get();
+    }
+    return resourceManager;
+}
+
+static void RawPointerCacheValidate(Ship::ResourceManager* resourceManager,
+                                    std::unordered_map<const void*, void*>& byPath,
+                                    std::unordered_map<uint64_t, void*>& byHash) {
+    static uint32_t generation = 0xFFFFFFFFu;
+    const uint32_t current = resourceManager->GetCacheGeneration();
+    if (current != generation) {
+        byPath.clear();
+        byHash.clear();
+        generation = current;
+        WDOG_RAW_POINTER_CACHE_SIZES(byPath.size(), byHash.size());
+    }
+}
+
+static std::unordered_map<const void*, void*> sRawPointerByPath;
+static std::unordered_map<uint64_t, void*> sRawPointerByHash;
+
+static void* CachedRawPointer(const char* path) {
+    Ship::ResourceManager* resourceManager = RawPointerCacheResourceManager();
+    RawPointerCacheValidate(resourceManager, sRawPointerByPath, sRawPointerByHash);
+    auto it = sRawPointerByPath.find(path);
+    if (it != sRawPointerByPath.end()) {
+        return it->second;
+    }
+    void* pointer = resourceManager->GetResourceRawPointer(path);
+    sRawPointerByPath.emplace(path, pointer);
+    WDOG_RAW_POINTER_CACHE_SIZES(sRawPointerByPath.size(), sRawPointerByHash.size());
+    return pointer;
+}
+
+static void* CachedRawPointer(uint64_t hash) {
+    Ship::ResourceManager* resourceManager = RawPointerCacheResourceManager();
+    RawPointerCacheValidate(resourceManager, sRawPointerByPath, sRawPointerByHash);
+    auto it = sRawPointerByHash.find(hash);
+    if (it != sRawPointerByHash.end()) {
+        return it->second;
+    }
+    void* pointer = resourceManager->GetResourceRawPointer(hash);
+    sRawPointerByHash.emplace(hash, pointer);
+    WDOG_RAW_POINTER_CACHE_SIZES(sRawPointerByPath.size(), sRawPointerByHash.size());
+    return pointer;
+}
+
+// Texture lookups by path, cached like CachedRawPointer above. Each entry keeps its own copy of
+// the path and a hit must strcmp-match it: a caller that formats paths into a reused buffer then
+// misses and reloads instead of getting the previous path's texture. strcmp allocates nothing,
+// unlike the std::string + ResourceIdentifier that LoadResourceProcess builds per call.
+struct CachedTextureEntry {
+    std::string path;
+    std::shared_ptr<Fast::Texture> texture;
+};
+
+static std::shared_ptr<Fast::Texture> CachedTextureByPath(const char* path) {
+    static std::unordered_map<const void*, CachedTextureEntry> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+
+    Ship::ResourceManager* resourceManager = RawPointerCacheResourceManager();
+    const uint32_t current = resourceManager->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+
+    auto it = cache.find(path);
+    if (it != cache.end() && strcmp(it->second.path.c_str(), path) == 0) {
+        return it->second.texture;
+    }
+
+    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
+        resourceManager->LoadResourceProcess(path));
+    if (texture != nullptr) {
+        cache[path] = CachedTextureEntry{ path, texture };
+    }
+    return texture;
+}
+
+// Largest distance from (cx, cy, cz) to any vertex the display list loads, following DL calls, branches
+// and both sides of depth branches. Segmented G_DLs (per-scene material lists) are not followed. Returns
+// -1 if the list moves the matrix or loads vertices that cannot be resolved, so callers must then not
+// rely on the result. Reads the list only; it does not execute or patch it.
+static float DisplayListVertexRadius(const F3DGfx* cmd, float cx, float cy, float cz, int depth) {
+    if (cmd == nullptr || depth > 8) {
+        return -1.0f;
+    }
+    float maxSq = 0.0f;
+    for (int n = 0; n < 100000; n++, cmd++) {
+        const int8_t op = (int8_t)(cmd->words.w0 >> 24);
+        if (op == F3DEX2_G_ENDDL) {
+            return sqrtf(maxSq);
+        }
+        const F3DGfx* sub = nullptr;
+        bool isBranch = false;
+        if (op == OTR_G_VTX_OTR_HASH) {
+            const uint32_t count = C0(12, 8);
+            const uintptr_t offset = cmd->words.w1;
+            const uint64_t hash = ((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1;
+            const F3DVtx* vtx;
+            if (offset > 0xFFFFF) { // already patched to a pointer by gfx_vtx_hash_handler_custom
+                vtx = (const F3DVtx*)offset;
+            } else {
+                const char* base = (const char*)CachedRawPointer(hash);
+                if (base == nullptr) {
+                    return -1.0f;
+                }
+                vtx = (const F3DVtx*)(base + offset);
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                const float dx = vtx[i].v.ob[0] - cx, dy = vtx[i].v.ob[1] - cy, dz = vtx[i].v.ob[2] - cz;
+                maxSq = std::max(maxSq, dx * dx + dy * dy + dz * dz);
+            }
+        } else if (op == OTR_G_VTX_OTR_FILEPATH) { // XML (alt/mod) lists; layout as gfx_vtx_otr_filepath_handler_custom
+            const F3DVtx* vtx = (const F3DVtx*)CachedRawPointer((const char*)cmd->words.w1);
+            if (vtx == nullptr) {
+                return -1.0f;
+            }
+            vtx += cmd[1].words.w1 & 0xFFFF;
+            for (uint32_t i = 0; i < cmd[1].words.w0; i++) {
+                const float dx = vtx[i].v.ob[0] - cx, dy = vtx[i].v.ob[1] - cy, dz = vtx[i].v.ob[2] - cz;
+                maxSq = std::max(maxSq, dx * dx + dy * dy + dz * dz);
+            }
+        } else if (op == OTR_G_DL_OTR_HASH || op == OTR_G_BRANCH_Z_OTR) {
+            sub = (const F3DGfx*)CachedRawPointer(((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1);
+            isBranch = op == OTR_G_DL_OTR_HASH && C0(16, 1) != 0;
+            if (sub == nullptr) {
+                return -1.0f;
+            }
+        } else if (op == OTR_G_DL_OTR_FILEPATH) {
+            sub = (const F3DGfx*)CachedRawPointer((const char*)cmd->words.w1);
+            isBranch = C0(16, 1) != 0;
+            if (sub == nullptr) {
+                return -1.0f;
+            }
+        } else if (op == F3DEX2_G_VTX || op == OTR_G_MTX_OTR ||
+                   op == OTR_G_MTX_OTR_FILEPATH || op == F3DEX2_G_MTX || op == F3DEX2_G_POPMTX) {
+            return -1.0f;
+        }
+        if (sub != nullptr) {
+            const float r = DisplayListVertexRadius(sub, cx, cy, cz, depth + 1);
+            if (r < 0.0f) {
+                return -1.0f;
+            }
+            maxSq = std::max(maxSq, r * r);
+            if (isBranch) {
+                return sqrtf(maxSq);
+            }
+        }
+        // 128-bit commands take two Gfx slots (DisplayListFactory.cpp).
+        if (op == OTR_G_SETTIMG_OTR_HASH || op == OTR_G_DL_OTR_HASH || op == OTR_G_VTX_OTR_HASH ||
+            op == OTR_G_BRANCH_Z_OTR || op == OTR_G_MARKER || op == OTR_G_MTX_OTR || op == OTR_G_MOVEMEM_HASH ||
+            op == OTR_G_VTX_OTR_FILEPATH) {
+            cmd++;
+        }
+    }
+    return -1.0f;
+}
+
+// Sub-display-list culling. A called list that only loads vertices and draws triangles from them (as mod
+// packs' XML "tri_N" lists do, e.g. Djipi's Hyrule Field, whose terrain lists each span the whole field) is
+// skipped when its bounding sphere lies wholly outside one of the planes GfxSpVertex's clip_rej uses: then
+// every vertex it loads would carry that bit and GfxSpTri1 would reject every triangle anyway. Lists that
+// change any state, call other lists, or draw with vertices they did not load are never skipped.
+// Off switch: gWiiU.SubDlCull 0.
+struct SubDlInfo {
+    bool pure;
+    float c[3];
+    float r;
+    uint64_t slots;
+    std::vector<std::pair<const F3DVtx*, uint32_t>> ranges; // for verify mode
+};
+
+static uint64_t sPerfSubDlTested = 0;
+static uint64_t sPerfSubDlCulled = 0;
+
+extern "C" void FastGetAndResetSubDlPerf(uint64_t* tested, uint64_t* culled) {
+    *tested = sPerfSubDlTested;
+    *culled = sPerfSubDlCulled;
+    sPerfSubDlTested = 0;
+    sPerfSubDlCulled = 0;
+}
+
+static SubDlInfo AnalyseSubDl(const F3DGfx* cmd) {
+    SubDlInfo info = { false, { 0, 0, 0 }, 0, 0, {} };
+    struct Range {
+        const F3DVtx* v;
+        uint32_t n;
+    };
+    std::vector<Range> ranges;
+    uint64_t loaded = 0;
+    auto uses = [&loaded](uint32_t a, uint32_t b, uint32_t c) {
+        return a < MAX_VERTICES && b < MAX_VERTICES && c < MAX_VERTICES && ((loaded >> a) & 1) &&
+               ((loaded >> b) & 1) && ((loaded >> c) & 1);
+    };
+    for (int n = 0; n < 4096; n++, cmd++) {
+        const int8_t op = (int8_t)(cmd->words.w0 >> 24);
+        if (op == F3DEX2_G_ENDDL) {
+            break;
+        }
+        uint32_t start, count;
+        const F3DVtx* vtx;
+        if (op == OTR_G_VTX_OTR_HASH) {
+            count = C0(12, 8);
+            start = C0(1, 7) - count;
+            const uintptr_t offset = cmd->words.w1;
+            if (offset > 0xFFFFF) {
+                vtx = (const F3DVtx*)offset;
+            } else {
+                const char* base = (const char*)CachedRawPointer(((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1);
+                vtx = base ? (const F3DVtx*)(base + offset) : nullptr;
+            }
+            cmd++;
+        } else if (op == OTR_G_VTX_OTR_FILEPATH) {
+            count = cmd[1].words.w0;
+            start = cmd[1].words.w1 >> 16;
+            vtx = (const F3DVtx*)CachedRawPointer((const char*)cmd->words.w1);
+            if (vtx != nullptr) {
+                vtx += cmd[1].words.w1 & 0xFFFF;
+            }
+            cmd++;
+        } else if (op == F3DEX2_G_TRI1) {
+            if (!uses(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2)) {
+                return info;
+            }
+            continue;
+        } else if (op == F3DEX2_G_TRI2 || op == F3DEX2_G_QUAD) {
+            if (!uses(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2) ||
+                !uses(C1(16, 8) / 2, C1(8, 8) / 2, C1(0, 8) / 2)) {
+                return info;
+            }
+            continue;
+        } else if (op == OTR_G_TRI1_OTR) {
+            if (!uses(cmd->words.w0 & 0xFF, (cmd->words.w1 >> 16) & 0xFF, cmd->words.w1 & 0xFF)) {
+                return info;
+            }
+            continue;
+        } else if (op == F3DEX2_G_NOOP || op == F3DEX2_G_SPNOOP || op == F3DEX2_G_CULLDL) {
+            continue;
+        } else {
+            return info; // any state change, call or unknown command
+        }
+        if (vtx == nullptr || count == 0 || start + count > MAX_VERTICES) {
+            return info;
+        }
+        loaded |= (count == 64 ? ~0ULL : ((1ULL << count) - 1)) << start;
+        ranges.push_back({ vtx, count });
+    }
+    if (ranges.empty()) {
+        return info;
+    }
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (const Range& rg : ranges) {
+        for (uint32_t i = 0; i < rg.n; i++) {
+            for (int k = 0; k < 3; k++) {
+                mn[k] = std::min(mn[k], (float)rg.v[i].v.ob[k]);
+                mx[k] = std::max(mx[k], (float)rg.v[i].v.ob[k]);
+            }
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        info.c[k] = (mn[k] + mx[k]) * 0.5f;
+    }
+    float r2 = 0.0f;
+    for (const Range& rg : ranges) {
+        for (uint32_t i = 0; i < rg.n; i++) {
+            const float dx = rg.v[i].v.ob[0] - info.c[0], dy = rg.v[i].v.ob[1] - info.c[1],
+                        dz = rg.v[i].v.ob[2] - info.c[2];
+            r2 = std::max(r2, dx * dx + dy * dy + dz * dz);
+        }
+    }
+    info.r = sqrtf(r2) * 1.001f + 1.0f;
+    info.slots = loaded;
+    info.pure = true;
+    for (const Range& rg : ranges) {
+        info.ranges.emplace_back(rg.v, rg.n);
+    }
+    return info;
+}
+
+// Index of a clip_rej plane (right, left, bottom, top, far) the sphere lies wholly outside of under the
+// current MP matrix, or -1. f = a.(x', y, z, w) > 0 with x' = x * aspect scale, exactly as GfxSpVertex sets
+// the bits, and min over the sphere of the (linear) f is f(c) - r * |grad f|.
+static const uint8_t kClipPlaneBits[5] = { 2, 1, 4, 8, 32 };
+
+static int SphereOutsideClipPlane(Interpreter* gfx, const float c[3], float r) {
+    // Plane gradients depend only on MP and the aspect scale, which change far less often than this is
+    // called (sqrtf is a libm call on Espresso), so rebuild them only when either changes.
+    static float lastM[4][4];
+    static float lastSx = -1.0f;
+    static float g[5][3], h[5], norm[5];
+    const float(*m)[4] = gfx->mRsp->MP_matrix;
+    const float sx =
+        gfx->mFbActive ? 1.0f : (4.0f / 3.0f) / ((float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height);
+    if (sx != lastSx || memcmp(lastM, m, sizeof(lastM)) != 0) {
+        static const float kPlanes[5][4] = {
+            { 1, 0, 0, -1 }, { -1, 0, 0, -1 }, { 0, -1, 0, -1 }, { 0, 1, 0, -1 }, { 0, 0, 1, -1 }
+        };
+        for (int p = 0; p < 5; p++) {
+            const float a[4] = { kPlanes[p][0] * sx, kPlanes[p][1], kPlanes[p][2], kPlanes[p][3] };
+            for (int j = 0; j < 3; j++) {
+                g[p][j] = a[0] * m[j][0] + a[1] * m[j][1] + a[2] * m[j][2] + a[3] * m[j][3];
+            }
+            h[p] = a[0] * m[3][0] + a[1] * m[3][1] + a[2] * m[3][2] + a[3] * m[3][3];
+            norm[p] = sqrtf(g[p][0] * g[p][0] + g[p][1] * g[p][1] + g[p][2] * g[p][2]);
+        }
+        memcpy(lastM, m, sizeof(lastM));
+        lastSx = sx;
+    }
+    for (int p = 0; p < 5; p++) {
+        if (g[p][0] * c[0] + g[p][1] * c[1] + g[p][2] * c[2] + h[p] - r * norm[p] > 0.0f) {
+            return p;
+        }
+    }
+    return -1;
+}
+
+static uint64_t sPerfFalseCull = 0;
+
+// Verify mode (culling CVar = 2): recompute each vertex's clip_rej bit for plane p exactly as GfxSpVertex
+// does and return how many vertices lack it (i.e. the sphere test was wrong).
+static uint32_t CountClipMisses(Interpreter* gfx, const F3DVtx* v, uint32_t n, int p) {
+    const float(*m)[4] = gfx->mRsp->MP_matrix;
+    const float aspect_scale =
+        (4.0f / 3.0f) / ((float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height);
+    uint32_t misses = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float ox = v[i].v.ob[0], oy = v[i].v.ob[1], oz = v[i].v.ob[2];
+        float x = ox * m[0][0] + oy * m[1][0] + oz * m[2][0] + m[3][0];
+        const float y = ox * m[0][1] + oy * m[1][1] + oz * m[2][1] + m[3][1];
+        const float z = ox * m[0][2] + oy * m[1][2] + oz * m[2][2] + m[3][2];
+        const float w = ox * m[0][3] + oy * m[1][3] + oz * m[2][3] + m[3][3];
+        x = gfx->mFbActive ? x : x * aspect_scale;
+        const bool out = p == 0 ? x > w : p == 1 ? x < -w : p == 2 ? y < -w : p == 3 ? y > w : z > w;
+        misses += out ? 0 : 1;
+    }
+    return misses;
+}
+
+extern "C" uint64_t FastGetAndResetFalseCull(void) {
+    const uint64_t n = sPerfFalseCull;
+    sPerfFalseCull = 0;
+    return n;
+}
+
+extern "C" uint64_t FastGetAndResetStaleTrisSubDl(void) {
+    const uint64_t n = sPerfStaleTrisSubDl;
+    sPerfStaleTrisSubDl = 0;
+    return n;
+}
+
+static bool SubDlCulled(Interpreter* gfx, const F3DGfx* dl) {
+    static std::unordered_map<const F3DGfx*, SubDlInfo> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+    static uint32_t cvarCountdown = 0;
+    static int mode = 1;
+
+    if (cvarCountdown-- == 0) {
+        mode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.SubDlCull", 1);
+        cvarCountdown = 4096;
+    }
+    if (mode == 0 || dl == nullptr) {
+        return false;
+    }
+    const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+    auto it = cache.find(dl);
+    if (it == cache.end()) {
+        it = cache.emplace(dl, AnalyseSubDl(dl)).first;
+    }
+    const SubDlInfo& s = it->second;
+    if (!s.pure) {
+        return false;
+    }
+    ++sPerfSubDlTested;
+
+    const int p = SphereOutsideClipPlane(gfx, s.c, s.r);
+    if (p >= 0) {
+        if (mode == 2) {
+            uint32_t misses = 0;
+            for (const auto& rg : s.ranges) {
+                misses += CountClipMisses(gfx, rg.first, rg.second, p);
+            }
+            if (misses != 0) {
+                ++sPerfFalseCull;
+                return false;
+            }
+        }
+        // Leave the slots it would have loaded rejected by the same plane (and marked stale).
+        for (uint32_t i = 0; i < MAX_VERTICES; i++) {
+            if ((s.slots >> i) & 1) {
+                gfx->mRsp->loaded_vertices[i].clip_rej = kClipPlaneBits[p];
+            }
+        }
+        sStaleSlots |= s.slots;
+        sStaleFromSubDl |= s.slots;
+        ++sPerfSubDlCulled;
+        return true;
+    }
+    return false;
+}
+
+// Vertex-batch culling. For an OTR vertex load in a resource display list (G_VTX_OTR_HASH/FILEPATH; the
+// game's per-frame lists use raw G_VTX), look ahead once: if every triangle that uses its slots uses only
+// its slots until they are all overwritten (or the list ends), and nothing else reads them (depth branch,
+// modify-vertex, calls), then when its bounding sphere is wholly outside a clip plane the load is skipped
+// and the slots just get that plane's clip_rej bit - the triangles are rejected exactly as they would be.
+// sStaleSlots/sPerfStaleTris catch any use the analysis missed. Off switch: gWiiU.VtxBatchCull 0.
+struct VtxBatchInfo {
+    bool indep;
+    float c[3];
+    float r;
+    uint64_t slots;
+    const F3DVtx* vtx; // for verify mode
+    uint32_t count;
+};
+
+static uint64_t sPerfBatchTested = 0;
+static uint64_t sPerfBatchCulled = 0;
+
+extern "C" void FastGetAndResetVtxBatchPerf(uint64_t* tested, uint64_t* culled, uint64_t* staleTris) {
+    *tested = sPerfBatchTested;
+    *culled = sPerfBatchCulled;
+    *staleTris = sPerfStaleTris;
+    sPerfBatchTested = 0;
+    sPerfBatchCulled = 0;
+    sPerfStaleTris = 0;
+}
+
+static uint64_t SlotRange(uint32_t start, uint32_t count) {
+    if (count == 0 || start >= 64) {
+        return 0;
+    }
+    const uint32_t n = std::min<uint32_t>(count, 64 - start);
+    return (n == 64 ? ~0ULL : ((1ULL << n) - 1)) << start;
+}
+
+// Slots a vertex command loads; for the OTR forms also the vertex data (nullptr if unresolvable).
+static bool DecodeVtxCmd(const F3DGfx* cmd, uint32_t* start, uint32_t* count, const F3DVtx** vtx) {
+    const int8_t op = (int8_t)(cmd->words.w0 >> 24);
+    if (op == OTR_G_VTX_OTR_HASH) {
+        *count = C0(12, 8);
+        *start = C0(1, 7) - *count;
+        const uintptr_t offset = cmd->words.w1;
+        if (offset > 0xFFFFF) {
+            *vtx = (const F3DVtx*)offset;
+        } else {
+            const char* base = (const char*)CachedRawPointer(((uint64_t)cmd[1].words.w0 << 32) + cmd[1].words.w1);
+            *vtx = base ? (const F3DVtx*)(base + offset) : nullptr;
+        }
+        return true;
+    }
+    if (op == OTR_G_VTX_OTR_FILEPATH) {
+        *count = cmd[1].words.w0;
+        *start = cmd[1].words.w1 >> 16;
+        const F3DVtx* base = (const F3DVtx*)CachedRawPointer((const char*)cmd->words.w1);
+        *vtx = base ? base + (cmd[1].words.w1 & 0xFFFF) : nullptr;
+        return true;
+    }
+    if (op == F3DEX2_G_VTX) {
+        *count = C0(12, 8);
+        *start = C0(1, 7) - *count;
+        *vtx = nullptr;
+        return true;
+    }
+    return false;
+}
+
+static VtxBatchInfo AnalyseVtxBatch(const F3DGfx* cmd) {
+    VtxBatchInfo info = { false, { 0, 0, 0 }, 0, 0, nullptr, 0 };
+    uint32_t start, count;
+    const F3DVtx* vtx;
+    if (!DecodeVtxCmd(cmd, &start, &count, &vtx) || vtx == nullptr || count == 0 || start + count > 64) {
+        return info;
+    }
+    const uint64_t slots = SlotRange(start, count);
+    uint64_t owned = slots;
+    auto triOk = [&owned](uint32_t a, uint32_t b, uint32_t c) {
+        if (a >= 64 || b >= 64 || c >= 64) {
+            return false;
+        }
+        const uint64_t m = (1ULL << a) | (1ULL << b) | (1ULL << c);
+        return (m & owned) == 0 || (m & ~owned) == 0;
+    };
+    const F3DGfx* p = cmd + 2;
+    bool done = false;
+    for (int n = 0; n < 2048 && !done; n++, p++) {
+        const int8_t op = (int8_t)(p->words.w0 >> 24);
+        const F3DGfx* const cmd = p; // for C0/C1
+        uint32_t s2, n2;
+        const F3DVtx* v2;
+        if (op == F3DEX2_G_ENDDL) {
+            // Slots still live at the end may be used after the return (skinned limbs join to the previous
+            // limb's vertices this way), so only loads that are fully overwritten inside the list qualify.
+            return info;
+        } else if (DecodeVtxCmd(p, &s2, &n2, &v2)) {
+            owned &= ~SlotRange(s2, n2);
+            done = owned == 0;
+        } else if (op == F3DEX2_G_TRI1) {
+            if (!triOk(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2)) {
+                return info;
+            }
+        } else if (op == F3DEX2_G_TRI2 || op == F3DEX2_G_QUAD) {
+            if (!triOk(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2) || !triOk(C1(16, 8) / 2, C1(8, 8) / 2, C1(0, 8) / 2)) {
+                return info;
+            }
+        } else if (op == OTR_G_TRI1_OTR) {
+            if (!triOk(cmd->words.w0 & 0xFF, (cmd->words.w1 >> 16) & 0xFF, cmd->words.w1 & 0xFF)) {
+                return info;
+            }
+        } else if (op == F3DEX2_G_MODIFYVTX || op == F3DEX2_G_BRANCH_Z || op == OTR_G_BRANCH_Z_OTR ||
+                   op == F3DEX2_G_LINE3D || op == F3DEX2_G_DL || op == OTR_G_DL_OTR_HASH ||
+                   op == OTR_G_DL_OTR_FILEPATH || op == OTR_G_DL_INDEX) {
+            return info; // may read the slots in ways this scan cannot follow
+        }
+        if (op == OTR_G_SETTIMG_OTR_HASH || op == OTR_G_DL_OTR_HASH || op == OTR_G_VTX_OTR_HASH ||
+            op == OTR_G_BRANCH_Z_OTR || op == OTR_G_MARKER || op == OTR_G_MTX_OTR || op == OTR_G_MOVEMEM_HASH ||
+            op == OTR_G_VTX_OTR_FILEPATH) {
+            p++;
+        }
+    }
+    if (!done) {
+        return info;
+    }
+    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t i = 0; i < count; i++) {
+        for (int k = 0; k < 3; k++) {
+            mn[k] = std::min(mn[k], (float)vtx[i].v.ob[k]);
+            mx[k] = std::max(mx[k], (float)vtx[i].v.ob[k]);
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        info.c[k] = (mn[k] + mx[k]) * 0.5f;
+    }
+    float r2 = 0.0f;
+    for (uint32_t i = 0; i < count; i++) {
+        const float dx = vtx[i].v.ob[0] - info.c[0], dy = vtx[i].v.ob[1] - info.c[1], dz = vtx[i].v.ob[2] - info.c[2];
+        r2 = std::max(r2, dx * dx + dy * dy + dz * dz);
+    }
+    info.r = sqrtf(r2) * 1.001f + 1.0f;
+    info.slots = slots;
+    info.indep = true;
+    info.vtx = vtx;
+    info.count = count;
+    return info;
+}
+
+// True if the vertex command at cmd was skipped (slots marked rejected and stale).
+static bool VtxBatchCulled(Interpreter* gfx, const F3DGfx* cmd) {
+    static std::unordered_map<const F3DGfx*, VtxBatchInfo> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+    static uint32_t cvarCountdown = 0;
+    static int mode = 1;
+
+    if (cvarCountdown-- == 0) {
+        mode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.VtxBatchCull", 1);
+        cvarCountdown = 8192;
+    }
+    if (mode == 0) {
+        return false;
+    }
+    const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+    auto it = cache.find(cmd);
+    if (it == cache.end()) {
+        it = cache.emplace(cmd, AnalyseVtxBatch(cmd)).first;
+    }
+    const VtxBatchInfo& b = it->second;
+    if (!b.indep) {
+        return false;
+    }
+    ++sPerfBatchTested;
+    const int p = SphereOutsideClipPlane(gfx, b.c, b.r);
+    if (p < 0) {
+        return false;
+    }
+    if (mode == 2 && CountClipMisses(gfx, b.vtx, b.count, p) != 0) {
+        ++sPerfFalseCull;
+        return false;
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        if ((b.slots >> i) & 1) {
+            gfx->mRsp->loaded_vertices[i].clip_rej = kClipPlaneBits[p];
+        }
+    }
+    sStaleSlots |= b.slots;
+    sStaleFromSubDl &= ~b.slots;
+    ++sPerfBatchCulled;
+    return true;
+}
+
+// Cached per path pointer (the long-lived c_str a room mesh entry holds) and centre; cleared with the
+// resource cache generation like CachedRawPointer.
+extern "C" float FastDisplayListVertexRadius(const char* path, float cx, float cy, float cz) {
+    struct Entry {
+        float cx, cy, cz, radius;
+    };
+    static std::unordered_map<const void*, Entry> cache;
+    static uint32_t generation = 0xFFFFFFFFu;
+
+    if (path == nullptr) {
+        return -1.0f;
+    }
+    const uint32_t current = RawPointerCacheResourceManager()->GetCacheGeneration();
+    if (current != generation) {
+        cache.clear();
+        generation = current;
+    }
+    auto it = cache.find(path);
+    if (it != cache.end() && it->second.cx == cx && it->second.cy == cy && it->second.cz == cz) {
+        return it->second.radius;
+    }
+    const char* name = strncmp(path, "__OTR__", 7) == 0 ? path + 7 : path;
+    const float radius = DisplayListVertexRadius((const F3DGfx*)CachedRawPointer(name), cx, cy, cz, 0);
+    cache[path] = Entry{ cx, cy, cz, radius };
+    return radius;
+}
+
 bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     const char* fileName = (const char*)cmd->words.w1;
-    const int32_t* mtx = (const int32_t*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(
+    const int32_t* mtx = (const int32_t*)CachedRawPointer(
         (const char*)fileName);
 
     if (mtx != NULL) {
@@ -3384,7 +4321,7 @@ bool gfx_mtx_otr_filepath_handler_custom_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     const char* fileName = (const char*)cmd->words.w1;
-    const int32_t* mtx = (const int32_t*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(
+    const int32_t* mtx = (const int32_t*)CachedRawPointer(
         (const char*)fileName);
 
     if (mtx != NULL) {
@@ -3408,7 +4345,7 @@ bool gfx_mtx_otr_handler_custom_f3dex2(F3DGfx** cmd0) {
 
     const uint64_t hash = ((uint64_t)cmd->words.w0 << 32) + cmd->words.w1;
     const int32_t* mtx =
-        (const int32_t*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        (const int32_t*)CachedRawPointer(hash);
 
     if (mtx != NULL) {
         Interpreter* gfx = mInstance.lock().get();
@@ -3427,7 +4364,7 @@ bool gfx_mtx_otr_handler_custom_f3d(F3DGfx** cmd0) {
 
     const uint64_t hash = ((uint64_t)cmd->words.w0 << 32) + cmd->words.w1;
     const int32_t* mtx =
-        (const int32_t*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        (const int32_t*)CachedRawPointer(hash);
     if (mtx != nullptr) {
         cmd--;
         gfx->GfxSpMatrix(C0(16, 8), mtx);
@@ -3494,10 +4431,9 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
 
     if (ucode_handler_index == ucode_f3dex2) {
         gfx->GfxSpMovememF3dex2(index, offset,
-                                Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash));
+                                CachedRawPointer(hash));
     } else {
-        auto light =
-            (Fast::LightEntry*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        auto light = (Fast::LightEntry*)CachedRawPointer(hash);
         uintptr_t data = (uintptr_t)&light->Ambient;
         gfx->GfxSpMovememF3d(index, offset, (void*)(data + (hasOffset == 1 ? 0x8 : 0)));
     }
@@ -3632,13 +4568,16 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
 
     // We need to know if the offset is a cached pointer or not. An offset greater than one million is not a
     // real offset, so it must be a real pointer
+    if (VtxBatchCulled(gfx, *cmd0 - 1)) {
+        return false;
+    }
     if (offset > 0xFFFFF) {
         (*cmd0)--;
         F3DGfx* cmd = *cmd0;
         gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (F3DVtx*)offset);
         (*cmd0)++;
     } else {
-        F3DVtx* vtx = (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        F3DVtx* vtx = (F3DVtx*)CachedRawPointer(hash);
 
         if (vtx != NULL) {
             vtx = (F3DVtx*)((char*)vtx + offset);
@@ -3660,13 +4599,17 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     char* fileName = (char*)cmd->words.w1;
+    if (VtxBatchCulled(gfx, cmd)) {
+        (*cmd0)++;
+        return false;
+    }
     (*cmd0)++;
     cmd = *cmd0;
     size_t vtxCnt = cmd->words.w0;
     size_t vtxIdxOff = cmd->words.w1 >> 16;
     size_t vtxDataOff = cmd->words.w1 & 0xFFFF;
     F3DVtx* vtx =
-        (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
+        (F3DVtx*)CachedRawPointer((const char*)fileName);
     vtx += vtxDataOff;
 
     gfx->GfxSpVertex(vtxCnt, vtxIdxOff, vtx);
@@ -3677,9 +4620,12 @@ bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     char* fileName = (char*)cmd->words.w1;
     F3DGfx* nDL =
-        (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
+        (F3DGfx*)CachedRawPointer((const char*)fileName);
 
     if (C0(16, 1) == 0 && nDL != nullptr) {
+        if (SubDlCulled(mInstance.lock().get(), nDL)) {
+            return false;
+        }
         g_exec_stack.call(*cmd0, nDL);
     } else {
         if (nDL != nullptr) {
@@ -3730,9 +4676,9 @@ bool gfx_dl_otr_hash_handler_custom(F3DGfx** cmd0) {
 
         uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (*cmd0)->words.w1;
 
-        F3DGfx* gfx = (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        F3DGfx* gfx = (F3DGfx*)CachedRawPointer(hash);
 
-        if (gfx != 0) {
+        if (gfx != 0 && !SubDlCulled(mInstance.lock().get(), gfx)) {
             g_exec_stack.call(cmd, gfx);
         }
     } else {
@@ -3788,7 +4734,7 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
         (gfx->mRsp->extra_geometry_mode & G_EX_ALWAYS_EXECUTE_BRANCH) != 0) {
         uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (*cmd0)->words.w1;
 
-        F3DGfx* gfx = (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
+        F3DGfx* gfx = (F3DGfx*)CachedRawPointer(hash);
 
         if (gfx != 0) {
             (*cmd0) = gfx;
@@ -3998,8 +4944,7 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
-            std::shared_ptr<Fast::Texture> tex =
-                std::static_pointer_cast<Fast::Texture>(gfx->ResolveResourceCached(imgData));
+            std::shared_ptr<Fast::Texture> tex = CachedTextureByPath(imgData);
 
             if (tex == nullptr) {
                 (*cmd0)++;
@@ -4027,23 +4972,21 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 }
 
 bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
     uintptr_t addr = (*cmd0)->words.w1;
     (*cmd0)++;
     uint64_t hash = ((uint64_t)(*cmd0)->words.w0 << 32) + (uint64_t)(*cmd0)->words.w1;
 
-    const char* fileName =
-        Ship::Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash);
+    std::shared_ptr<Fast::Texture> texture;
+    const char* fileName = gfx->ResolveOtrTexture(hash, texture);
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
-    if (fileName == nullptr) {
+    if (fileName == nullptr && texture == nullptr) {
         (*cmd0)++;
         return false;
     }
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(
-            Ship::Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash)));
     if (texture != nullptr) {
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
@@ -4052,10 +4995,6 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.v_pixel_scale = texture->VPixelScale;
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
-
-        // OTRTODO: We have disabled caching for now to fix a texture corruption issue with HD texture
-        // support. In doing so, there is a potential performance hit since we are not caching lookups. We
-        // need to do proper profiling to see whether or not it is worth it to keep the caching system.
 
         char* tex = reinterpret_cast<char*>(texture->ImageData);
 
@@ -4097,8 +5036,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(fileName));
+    std::shared_ptr<Fast::Texture> texture = CachedTextureByPath(fileName);
     if (texture != nullptr) {
         Interpreter* gfx = mInstance.lock().get();
         texFlags = texture->Flags;
@@ -4116,7 +5054,16 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         gfx->GfxDpSetTextureImage(fmt, size, width, fileName, texFlags, rawTexMetadata,
                                   reinterpret_cast<char*>(texture->ImageData));
     } else {
+#ifdef __WIIU__
+        // A missing texture is looked up on every draw that uses it; logging each one costs a blocking
+        // UDP send (dev) or an SD flush (release) per draw. Report each path once.
+        static std::unordered_set<std::string> reported;
+        if (reported.size() < 256 && reported.insert(fileName ? fileName : "(null)").second) {
+            SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null: {}", fileName ? fileName : "(null)");
+        }
+#else
         SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null");
+#endif
     }
     return false;
 }
@@ -4124,6 +5071,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
 bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     Interpreter* gfx = mInstance.lock().get();
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
 
     if (cmd->words.w1) {
@@ -4140,6 +5088,7 @@ bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
 
 bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->mFbActive = false;
     gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
@@ -4158,6 +5107,7 @@ bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     bool* hasCopiedPtr = (bool*)cmd->words.w1;
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->CopyFrameBuffer(C0(11, 11), C0(0, 11), (bool)C0(22, 1), hasCopiedPtr);
     return false;
@@ -4180,6 +5130,7 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
     width = C1(0, 16);
     height = C1(16, 16);
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->mRapi->ReadFramebufferToCPU(fbId, width, height, rgba16Buffer);
 
@@ -4200,6 +5151,7 @@ bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     // Flush incase we are replacing a previous blended texture that hasn't been finialized to the GPU
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
 
     char* timg = (char*)cmd->words.w1;
@@ -4230,6 +5182,7 @@ bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     gfx->Flush();
     gfx->mRapi->SelectTextureFb((uint32_t)cmd->words.w1);
     gfx->mRdp->textures_changed[0] = false;
@@ -4958,6 +5911,7 @@ void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX
 
 void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi, const char* game_name,
                        bool start_in_fullscreen, uint32_t width, uint32_t height, uint32_t posX, uint32_t posY) {
+    WDOG_HEAPMARK("before Interpreter::Init");
     mWapi = wapi;
     mRapi = rapi;
     mWapi->Init(game_name, rapi->GetName(), start_in_fullscreen, width, height, posX, posY);
@@ -4980,21 +5934,17 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
         mSegmentPointers[i] = 0;
     }
 
-    if (mTexUploadBuffer == nullptr) {
-        // We cap texture max to 8k, because why would you need more?
-        int max_tex_size = std::min(8192, mRapi->GetMaxTextureSize());
-        mTexUploadBuffer = (uint8_t*)malloc(max_tex_size * max_tex_size * 4);
-    }
-
     ucode_handler_index = UcodeHandlers::ucode_f3dex2;
-
     // Pre-allocate texture cache buckets to prevent rehash-induced iterator invalidation.
     mTextureCache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
+    WDOG_HEAPMARK("after Interpreter::Init");
 }
 
 void Interpreter::Destroy() {
     // TODO: should also destroy rapi, and any other resources acquired in fast3d
     free(mTexUploadBuffer);
+    mTexUploadBuffer = nullptr;
+    mTexUploadBufferSize = 0;
     mWapi->Destroy();
 
     // Texture cache and loaded textures store references to Resources which need to be unreferenced.
@@ -5105,6 +6055,7 @@ void Interpreter::RunGuiOnly() {
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     Flush();
     mGfxFrameBuffer = 0;
 
@@ -5169,6 +6120,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         gfx_step();
     }
 
+    RecordPerfFlush(PerfFlushReason::Explicit);
     Flush();
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();

@@ -52,7 +52,7 @@ typedef struct {
  *
  * Overrides the virtual ImGui backend methods defined by Ship::Gui with
  * implementations that dispatch to the appropriate platform/renderer backend
- * (SDL+OpenGL, SDL+Metal, or DXGI+DX11) based on the active WindowBackend.
+ * (SDL+OpenGL, SDL+Metal, DXGI+DX11, or Wii U GX2) based on the active WindowBackend.
  *
  * Also owns the Fast3D-specific rendering resources: texture cache and the
  * Interpreter weak reference used for viewport and resolution calculations.

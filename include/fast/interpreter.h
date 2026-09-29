@@ -21,6 +21,10 @@
 #include "fast/resource/type/Texture.h"
 #include "ship/resource/Resource.h"
 
+namespace Ship {
+class ResourceManager;
+}
+
 // TODO figure out why changing these to 640x480 makes the game only render in a quarter of the window
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
@@ -340,6 +344,13 @@ struct GfxTextureCache {
     std::vector<uint32_t> free_texture_ids;
 };
 
+struct OtrTextureCacheEntry {
+    std::string fileName;
+    std::shared_ptr<Fast::Texture> texture;
+};
+
+using OtrTextureCacheMap = std::unordered_map<uint64_t, OtrTextureCacheEntry>;
+
 struct ColorCombiner {
     uint64_t shader_id0;
     uint64_t shader_id1;
@@ -421,6 +432,7 @@ class Interpreter {
     void ShaderCacheClear();
     void TextureCacheClear();
     std::shared_ptr<Ship::IResource> ResolveResourceCached(const char* path);
+    const char* ResolveOtrTexture(uint64_t hash, std::shared_ptr<Fast::Texture>& texture);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void ImportTextureRgba16(int tile, bool importReplacement);
@@ -436,6 +448,7 @@ class Interpreter {
     void ImportTextureImg(int tile, bool importReplacement);
     void ImportTexture(int i, int tile, bool importReplacement);
     void ImportTextureMask(int i, int tile);
+    bool EnsureTexUploadBuffer(size_t requiredBytes);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
     // pointer and dropped with the texture cache. Safe for ports whose display
@@ -509,9 +522,13 @@ class Interpreter {
     GfxTextureCache mTextureCache{};
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
     bool mResolvedResourceCacheEnabled = false;
+    OtrTextureCacheMap mOtrTextureCache{};
+    uint64_t mOtrTextureCacheGeneration = 0;
+    const Ship::ResourceManager* mOtrTextureCacheResourceManager = nullptr;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
     uint8_t* mTexUploadBuffer = nullptr;
+    size_t mTexUploadBufferSize = 0;
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;
     int32_t mCurWindowPosX{};

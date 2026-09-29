@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -332,12 +333,12 @@ class ResourceManager {
      * @param isEnabled true to enable, false to disable.
      */
     void SetAltAssetsEnabled(bool isEnabled);
-
     /**
      * @brief Loads raw file bytes from the archive, bypassing resource deserialization.
      * @param identifier Exact resource identifier.
      * @return Loaded File with raw buffer, or nullptr on failure.
      */
+    uint32_t GetCacheGeneration() const;
     std::shared_ptr<File> LoadFileProcess(const ResourceIdentifier& identifier);
 
     /**
@@ -425,6 +426,7 @@ class ResourceManager {
     std::shared_ptr<ArchiveManager> mArchiveManager;
     std::shared_ptr<BS::thread_pool> mThreadPool;
     std::mutex mMutex;
+    std::atomic<uint32_t> mCacheGeneration = 0;
     bool mAltAssetsEnabled = false;
     // Private information for which owner and archive are default.
     uintptr_t mDefaultCacheOwner = 0;

@@ -11,7 +11,6 @@
 #include "ship/controller/controldevice/controller/mapping/keyboard/KeyboardScancodes.h"
 
 namespace Ship {
-
 /** @brief Identifies the graphics/windowing backend in use.
  *
  * Window backend IDs use the following convention:

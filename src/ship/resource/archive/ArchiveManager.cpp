@@ -12,6 +12,7 @@
 #include "ship/utils/StringHelper.h"
 #include "ship/utils/glob.h"
 #include "ship/utils/StrHash64.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 namespace Ship {
 ArchiveManager::ArchiveManager() {
@@ -269,14 +270,17 @@ std::shared_ptr<Archive> ArchiveManager::AddArchive(const std::string& archivePa
 }
 
 std::shared_ptr<Archive> ArchiveManager::AddArchive(std::shared_ptr<Archive> archive) {
+    WDOG_HEAPMARK("before ArchiveManager::AddArchive");
     if (!archive->IsLoaded()) {
         SPDLOG_WARN("Attempting to add unloaded Archive at {} to Archive Manager", archive->GetPath());
+        WDOG_HEAPMARK("after ArchiveManager::AddArchive");
         return nullptr;
     }
 
     if (!mValidGameVersions.empty() && !mValidGameVersions.contains(archive->GetGameVersion())) {
         SPDLOG_WARN("Attempting to add Archive at {} with invalid Game Version {} to Archive Manager",
                     archive->GetPath(), archive->GetGameVersion());
+        WDOG_HEAPMARK("after ArchiveManager::AddArchive");
         return nullptr;
     }
 
@@ -299,6 +303,7 @@ std::shared_ptr<Archive> ArchiveManager::AddArchive(std::shared_ptr<Archive> arc
             mDirectories.insert(dir);
         }
     }
+    WDOG_HEAPMARK("after ArchiveManager::AddArchive");
     return archive;
 }
 

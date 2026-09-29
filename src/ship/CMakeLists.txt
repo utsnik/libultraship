@@ -98,6 +98,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(Source_Files__Port
         ${CMAKE_CURRENT_SOURCE_DIR}/port/mobile/MobileImpl.cpp
     )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+    set(Source_Files__Port
+        ${CMAKE_CURRENT_SOURCE_DIR}/../port/wiiu/WiiUImpl.cpp
+        # Diagnostic scaffolding for the pre-main() hang. Remove once it is found.
+        ${CMAKE_CURRENT_SOURCE_DIR}/../port/wiiu/WiiUEarlyProbe.cpp
+    )
 endif()
 
 source_group("port" FILES ${Source_Files__Port})

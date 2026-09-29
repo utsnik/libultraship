@@ -15,6 +15,7 @@
 #include "ship/window/gui/Fonts.h"
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/window/gui/resource/GuiTexture.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 namespace Ship {
 #define TOGGLE_BTN ImGuiKey_F1
@@ -285,10 +286,18 @@ void Gui::HandleMouseCapture() {
 }
 
 void Gui::StartFrame() {
+    static bool firstFrame = true;
+    if (firstFrame) {
+        WDOG_HEAPMARK("before first frame");
+    }
     HandleMouseCapture();
     ImGuiBackendNewFrame();
     ImGuiWMNewFrame();
     ImGui::NewFrame();
+    if (firstFrame) {
+        WDOG_HEAPMARK("after first frame");
+        firstFrame = false;
+    }
 }
 
 void Gui::EndFrame() {

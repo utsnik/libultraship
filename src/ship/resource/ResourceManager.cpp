@@ -8,6 +8,7 @@
 #include "ship/utils/Utils.h"
 #include "ship/config/ConsoleVariable.h"
 #include "ship/Context.h"
+#include "port/wiiu/WiiUWatchdog.h"
 
 namespace Ship {
 
@@ -155,7 +156,11 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     auto file = LoadFileProcess(identifier.Path);
     if (file == nullptr && !mArchiveManager->HasFile(identifier.Path + ".meta")) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
-        mResourceCache[identifier] = ResourceLoadError::NotFound;
+        {
+            const std::lock_guard<std::mutex> lock(mMutex);
+            mResourceCache[identifier] = ResourceLoadError::NotFound;
+            WDOG_RESOURCE_CACHE_SIZE(mResourceCache.size());
+        }
         return nullptr;
     }
 
@@ -181,6 +186,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
         } else {
             mResourceCache[identifier] = ResourceLoadError::NotFound;
         }
+        WDOG_RESOURCE_CACHE_SIZE(mResourceCache.size());
     }
 
     if (resource != nullptr) {
@@ -229,7 +235,22 @@ ResourceManager::LoadResourceAsync(const std::string& filePath, bool loadExact, 
 
 std::shared_ptr<IResource> ResourceManager::LoadResource(const ResourceIdentifier& identifier, bool loadExact,
                                                          std::shared_ptr<ResourceInitData> initData) {
+#ifdef __WIIU__
+    // Synchronous path without a promise or the thread pool. Going through LoadResourceAsync made
+    // a std::promise per call - hundreds per second, mostly cache hits - and on wut every
+    // std::mutex that is locked lazily allocates an OS mutex that ~mutex never frees: that was the
+    // whole ~3.5 MB/min leak (soh923m5 tracker). It also cost a thread handoff and condvar wait per
+    // load, which the profiler showed as ~10% of the game thread.
+    if (OtrSignatureCheck(identifier.Path.c_str())) {
+        return LoadResource({ identifier.Path.substr(7), identifier.Owner, identifier.Parent }, loadExact, initData);
+    }
+    auto resource = GetCachedResource(identifier, loadExact);
+    if (resource == nullptr) {
+        resource = LoadResourceProcess(identifier, loadExact, initData);
+    }
+#else
     auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
+#endif
     if (resource == nullptr) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
     }
@@ -349,7 +370,10 @@ std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadRe
 }
 
 std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadResources(const ResourceFilter& filter) {
-    return LoadResourcesAsync(filter, BS::pr::highest).get();
+    WDOG_HEAPMARK("before ResourceManager::LoadResources");
+    auto resources = LoadResourcesAsync(filter, BS::pr::highest).get();
+    WDOG_HEAPMARK("after ResourceManager::LoadResources");
+    return resources;
 }
 
 void ResourceManager::DirtyResources(const ResourceFilter& filter) {
@@ -419,7 +443,10 @@ size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
     // We can only erase the resource if we have any resources for that owner.
     if (mResourceCache.contains(identifier)) {
         const std::lock_guard<std::mutex> lock(mMutex);
-        mResourceCache.erase(identifier);
+        if (mResourceCache.erase(identifier) != 0) {
+            mCacheGeneration.fetch_add(1, std::memory_order_relaxed);
+            WDOG_RESOURCE_CACHE_SIZE(mResourceCache.size());
+        }
     }
 
     return ret;
@@ -467,7 +494,14 @@ bool ResourceManager::IsAltAssetsEnabled() {
 }
 
 void ResourceManager::SetAltAssetsEnabled(bool isEnabled) {
+    if (mAltAssetsEnabled != isEnabled) {
+        mCacheGeneration.fetch_add(1, std::memory_order_relaxed);
+    }
     mAltAssetsEnabled = isEnabled;
+}
+
+uint32_t ResourceManager::GetCacheGeneration() const {
+    return mCacheGeneration.load(std::memory_order_relaxed);
 }
 
 size_t ResourceManager::GetResourceSize(std::shared_ptr<IResource> resource) {

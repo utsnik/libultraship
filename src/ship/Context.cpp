@@ -166,8 +166,14 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
 #endif
 
         auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetName() + ".log"));
-        auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
-        sinks.push_back(fileSink);
+        try {
+            auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
+            sinks.push_back(fileSink);
+        } catch (const spdlog::spdlog_ex& ex) {
+            // The log file can be unopenable (on Wii U: held open by an FTP client -> EBUSY). Keep a logger
+            // without it: returning here left GetLogger() null and the caller's set_pattern crashed (DSI).
+            std::cout << "Log file unavailable, continuing without it: " << ex.what() << std::endl;
+        }
 #ifdef _DEBUG
         mLogger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
         GetLogger()->set_level(debugBuildLogLevel);

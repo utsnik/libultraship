@@ -26,7 +26,8 @@ std::shared_ptr<CVar> ConsoleVariable::Get(const char* name) {
 }
 
 int32_t ConsoleVariable::GetInteger(const char* name, int32_t defaultValue) {
-    auto variable = Get(name);
+    auto it = mVariables.find(name);
+    auto* variable = it != mVariables.end() ? it->second.get() : nullptr;
 
     if (variable != nullptr && variable->Type == ConsoleVariableType::Integer) {
         return variable->Integer;
@@ -36,7 +37,8 @@ int32_t ConsoleVariable::GetInteger(const char* name, int32_t defaultValue) {
 }
 
 float ConsoleVariable::GetFloat(const char* name, float defaultValue) {
-    auto variable = Get(name);
+    auto it = mVariables.find(name);
+    auto* variable = it != mVariables.end() ? it->second.get() : nullptr;
 
     if (variable != nullptr && variable->Type == ConsoleVariableType::Float) {
         return variable->Float;
@@ -46,7 +48,8 @@ float ConsoleVariable::GetFloat(const char* name, float defaultValue) {
 }
 
 const char* ConsoleVariable::GetString(const char* name, const char* defaultValue) {
-    auto variable = Get(name);
+    auto it = mVariables.find(name);
+    auto* variable = it != mVariables.end() ? it->second.get() : nullptr;
 
     if (variable != nullptr && variable->Type == ConsoleVariableType::String) {
         return variable->String;
@@ -56,7 +59,8 @@ const char* ConsoleVariable::GetString(const char* name, const char* defaultValu
 }
 
 Color_RGBA8 ConsoleVariable::GetColor(const char* name, Color_RGBA8 defaultValue) {
-    auto variable = Get(name);
+    auto it = mVariables.find(name);
+    auto* variable = it != mVariables.end() ? it->second.get() : nullptr;
 
     if (variable != nullptr && variable->Type == ConsoleVariableType::Color) {
         return variable->Color;
@@ -73,7 +77,8 @@ Color_RGBA8 ConsoleVariable::GetColor(const char* name, Color_RGBA8 defaultValue
 }
 
 Color_RGB8 ConsoleVariable::GetColor24(const char* name, Color_RGB8 defaultValue) {
-    auto variable = Get(name);
+    auto it = mVariables.find(name);
+    auto* variable = it != mVariables.end() ? it->second.get() : nullptr;
 
     if (variable != nullptr && variable->Type == ConsoleVariableType::Color24) {
         return variable->Color24;
