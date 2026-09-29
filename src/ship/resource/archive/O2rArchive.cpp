@@ -215,6 +215,21 @@ O2rArchive::~O2rArchive() {
 }
 
 zip_t* O2rArchive::GetZipHandle() {
+#ifdef __WIIU__
+    // Wii U: exactly one file descriptor per archive. The upstream pool opened a fresh, unbuffered zip_open() for
+    // every concurrent load (the pool starts empty, so even the first load did) and never closed them. With a full
+    // texture pack (~35 archives) that passes newlib's OPEN_MAX of 64 and every later open() fails - SoH develop's
+    // saves read as empty and its json parse_error terminated the game (2026-09-29). The unbuffered open also
+    // parses the central directory one FSA read per entry (oot.o2r ~23 s vs 0.7 s buffered). So lend out the
+    // buffered handle Open() created and make concurrent loaders wait for it; a zip_t is not thread-safe anyway.
+    std::unique_lock<std::mutex> lock(mPoolMutex);
+    mHandleCv.wait(lock, [this] { return !mHandleBusy || mZipArchive == nullptr; });
+    if (mZipArchive == nullptr) {
+        return nullptr;
+    }
+    mHandleBusy = true;
+    return mZipArchive;
+#else
     std::lock_guard<std::mutex> lock(mPoolMutex);
     if (!mZipArchivePool.empty()) {
         zip_t* handle = mZipArchivePool.back();
@@ -222,12 +237,21 @@ zip_t* O2rArchive::GetZipHandle() {
         return handle;
     }
     return zip_open(GetPath().c_str(), ZIP_RDONLY, nullptr);
+#endif
 }
 
 void O2rArchive::ReleaseZipHandle(zip_t* handle) {
     if (handle == nullptr) {
         return;
     }
+#ifdef __WIIU__
+    {
+        std::lock_guard<std::mutex> lock(mPoolMutex);
+        mHandleBusy = false;
+    }
+    mHandleCv.notify_one();
+    return;
+#endif
 
     std::lock_guard<std::mutex> lock(mPoolMutex);
     mZipArchivePool.push_back(handle);

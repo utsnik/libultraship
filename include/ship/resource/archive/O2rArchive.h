@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <string>
 #include <mutex>
+#ifdef __WIIU__
+#include <condition_variable>
+#endif
 #include <vector>
 
 #include "zip.h"
@@ -82,5 +85,10 @@ class O2rArchive final : virtual public Archive {
     zip_t* mZipArchive;
     std::mutex mPoolMutex;
     std::vector<zip_t*> mZipArchivePool;
+#ifdef __WIIU__
+    /** @brief Wii U: the single buffered handle from Open() is lent out; concurrent loaders wait for it. */
+    std::condition_variable mHandleCv;
+    bool mHandleBusy = false;
+#endif
 };
 } // namespace Ship
