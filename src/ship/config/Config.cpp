@@ -232,6 +232,16 @@ void Config::Save() {
         }
     }
     fs::rename(tempPath, configPath, ec);
+#ifdef __WIIU__
+    // The SD card's FAT devoptab will not rename over an existing file (EEXIST), so every save after the
+    // first failed and settings never persisted. Drop the old file and retry; the .tmp is complete by now.
+    if (ec == std::errc::file_exists) {
+        std::error_code removeEc;
+        fs::remove(configPath, removeEc);
+        ec.clear();
+        fs::rename(tempPath, configPath, ec);
+    }
+#endif
     if (ec) {
         SPDLOG_ERROR("Could not replace config \"{}\": {}", mPath, ec.message());
         std::error_code removeEc;
