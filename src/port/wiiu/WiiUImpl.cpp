@@ -1888,16 +1888,41 @@ static inline bool ProfileIsGameText(uint32_t address) {
     return address >= sGameTextStart && address < sGameTextEnd;
 }
 
-static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp) {
+// Stack bounds of the thread being walked. The walkers run inside an alarm interrupt, where a fault is a
+// console wedge, so every frame pointer must lie inside the thread's own stack before it is dereferenced.
+// A range check against 0x50000000 alone was not enough: a stale frame slot holding ASCII ("O2R:",
+// 0x4F32523A) passed it and the read faulted (DSI in ProfileAlarmCallback, SoH develop, 2026-09-29).
+struct ProfileStack {
+    uint32_t lo; // OSThread::stackEnd (lowest address)
+    uint32_t hi; // OSThread::stackStart (one past the highest address)
+};
+
+static ProfileStack ProfileStackOf(const OSThread* thread) {
+    if (thread == nullptr) {
+        return { 0, 0 };
+    }
+    const uint32_t lo = (uint32_t)(uintptr_t)thread->stackEnd;
+    const uint32_t hi = (uint32_t)(uintptr_t)thread->stackStart;
+    if (lo < 0x10000000u || hi > 0x50000000u || lo >= hi) {
+        return { 0, 0 };
+    }
+    return { lo, hi };
+}
+
+static bool ProfileFrameOk(uint32_t sp, const ProfileStack& stack) {
+    return stack.hi != 0 && (sp & 7u) == 0 && sp >= stack.lo && sp + 8u <= stack.hi;
+}
+
+static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp, const ProfileStack& stack) {
     if (ProfileIsGameText(lr)) {
         return lr;
     }
     for (int depth = 0; depth < 24; ++depth) {
-        if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
+        if (!ProfileFrameOk(sp, stack)) {
             return 0;
         }
         const uint32_t next = *(const volatile uint32_t*)sp;
-        if (next <= sp || next >= 0x50000000u) {
+        if (next <= sp || !ProfileFrameOk(next, stack)) {
             return 0;
         }
         const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
@@ -1912,7 +1937,7 @@ static uint32_t ProfileFirstGameReturn(uint32_t lr, uint32_t sp) {
 // Allocator caller: the first game return above a __wrap_* frame. Everything below the wrapper
 // (newlib, heap locks) is allocator internals, so no other allocator symbol is needed.
 // Returns 0 when the sample is not inside an allocation at all.
-static uint32_t ProfileAllocatorCaller(uint32_t pc, uint32_t lr, uint32_t sp) {
+static uint32_t ProfileAllocatorCaller(uint32_t pc, uint32_t lr, uint32_t sp, const ProfileStack& stack) {
     bool aboveWrapper = ProfileIsAllocator(pc);
     if (ProfileIsGameText(lr)) {
         if (ProfileIsAllocator(lr)) {
@@ -1922,11 +1947,11 @@ static uint32_t ProfileAllocatorCaller(uint32_t pc, uint32_t lr, uint32_t sp) {
         }
     }
     for (int depth = 0; depth < 24; ++depth) {
-        if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 7u) != 0) {
+        if (!ProfileFrameOk(sp, stack)) {
             break;
         }
         const uint32_t next = *(const volatile uint32_t*)sp;
-        if (next <= sp || next >= 0x50000000u) {
+        if (next <= sp || !ProfileFrameOk(next, stack)) {
             break;
         }
         const uint32_t savedLr = *(const volatile uint32_t*)(next + 4);
@@ -1961,17 +1986,22 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     ProfileAdd(sPcProfile[set], context->srr0);
     ProfileAdd(sLrProfile[set], context->lr & ~0xFu);
     const uint32_t pc = context->srr0;
-    const uint32_t allocatorCaller = ProfileAllocatorCaller(pc, context->lr, context->gpr[1]);
+    // The OSContext is the first member of its OSThread, so a validated thread gives the stack bounds;
+    // with no identifiable thread the walkers see an empty stack and record "unknown" instead of reading.
+    const ProfileStack stack =
+        thread != 0xFFFFFFF1u ? ProfileStackOf((const OSThread*)(uintptr_t)thread) : ProfileStack{ 0, 0 };
+    const uint32_t allocatorCaller = ProfileAllocatorCaller(pc, context->lr, context->gpr[1], stack);
     if (allocatorCaller != 0) {
         ProfileAdd(sAcProfile[set], allocatorCaller & ~0xFu);
     }
     if (!ProfileIsGameText(pc)) {
-        const uint32_t caller = ProfileFirstGameReturn(context->lr, context->gpr[1]);
+        const uint32_t caller = ProfileFirstGameReturn(context->lr, context->gpr[1], stack);
         ProfileAdd(sGcProfile[set], caller != 0 ? (caller & ~0xFu) : 0xFFFFFFF0u);
     }
     if (sSampleThread != nullptr && context != &sSampleThread->context) {
         const uint32_t blocked =
-            ProfileFirstGameReturn(sSampleThread->context.lr, sSampleThread->context.gpr[1]);
+            ProfileFirstGameReturn(sSampleThread->context.lr, sSampleThread->context.gpr[1],
+                                   ProfileStackOf(sSampleThread));
         ProfileAdd(sBkProfile[set], blocked != 0 ? (blocked & ~0xFu) : 0xFFFFFFF0u);
     }
     ++sProfileCount[set];
