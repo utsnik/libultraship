@@ -600,6 +600,14 @@ static int32_t O2rPreloadCVar(const char* name, int32_t defaultValue) {
     return context->GetConsoleVariables()->GetInteger(name, defaultValue);
 }
 
+// The version probe opens and closes every archive before the console variables exist; preloading
+// then reads each small archive into RAM only to free it again (and gWiiU.O2rPreloadBudgetMB 0
+// cannot turn that off), so preload only once the console variables are up.
+static bool O2rPreloadCVarsReady() {
+    auto context = Context::GetInstance();
+    return context != nullptr && context->GetConsoleVariables() != nullptr;
+}
+
 bool O2rArchive::Open() {
 #ifdef __WIIU__
     bool preloaded = false;
@@ -640,7 +648,9 @@ bool O2rArchive::Open() {
                                                   : 0;
             const uint64_t budgetBytes = budgetMB > 0 ? static_cast<uint64_t>(budgetMB) * 1024 * 1024 : 0;
 
-            if (budgetMB <= 0) {
+            if (!O2rPreloadCVarsReady()) {
+                preloadSkipReason = "pre-init";
+            } else if (budgetMB <= 0) {
                 preloadSkipReason = "disabled";
             } else if (archiveSize64 == 0) {
                 preloadSkipReason = "empty";
