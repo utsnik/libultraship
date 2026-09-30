@@ -534,6 +534,16 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     return fileToLoad;
 }
 
+// Archives are opened before Context::InitConsoleVariables (SoH's OTR version probe), so the
+// console variables may not exist yet: fall back to the default then instead of dereferencing null.
+static int32_t O2rPreloadCVar(const char* name, int32_t defaultValue) {
+    auto context = Context::GetInstance();
+    if (context == nullptr || context->GetConsoleVariables() == nullptr) {
+        return defaultValue;
+    }
+    return context->GetConsoleVariables()->GetInteger(name, defaultValue);
+}
+
 bool O2rArchive::Open() {
 #ifdef __WIIU__
     bool preloaded = false;
@@ -566,9 +576,9 @@ bool O2rArchive::Open() {
         } else {
             const size_t archiveSize = static_cast<size_t>(archiveSize64);
             const int32_t maxArchiveMB =
-                Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.O2rPreloadMaxArchiveMB", 16);
+                O2rPreloadCVar("gWiiU.O2rPreloadMaxArchiveMB", 16);
             const int32_t budgetMB =
-                Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.O2rPreloadBudgetMB", 64);
+                O2rPreloadCVar("gWiiU.O2rPreloadBudgetMB", 64);
             const uint64_t maxArchiveBytes = maxArchiveMB > 0
                                                   ? static_cast<uint64_t>(maxArchiveMB) * 1024 * 1024
                                                   : 0;
