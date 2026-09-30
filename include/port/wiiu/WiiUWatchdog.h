@@ -157,6 +157,10 @@ extern volatile uint32_t gFrameTimingWaitUs;
 void RecordGX2Wait(uint32_t microseconds);
 void RecordGX2SlotWait(uint32_t microseconds);
 void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds);
+void RecordResourceFactory(uint32_t microseconds);
+void RecordTextureUpload(uint32_t microseconds);
+void RecordShaderProgramCreated();
+void ReportHitchFrame(uint32_t microseconds, int32_t scene);
 
 // Raw UDP diagnostic output shared with GX2 callbacks. This must remain allocation-free.
 void Emit(const char* fmt, ...);
@@ -385,6 +389,18 @@ inline void RecordGX2SlotWait(uint32_t) {
 }
 
 inline void RecordFrameTiming(uint32_t, uint32_t) {
+}
+
+inline void RecordResourceFactory(uint32_t) {
+}
+
+inline void RecordTextureUpload(uint32_t) {
+}
+
+inline void RecordShaderProgramCreated() {
+}
+
+inline void ReportHitchFrame(uint32_t, int32_t) {
 }
 
 inline void Emit(const char*, ...) {

@@ -8,6 +8,12 @@
 #include "ship/utils/binarytools/BinaryReader.h"
 #include "ship/resource/factory/JsonFactory.h"
 #include "ship/resource/factory/ShaderFactory.h"
+#ifdef __WIIU__
+#include "port/wiiu/WiiUWatchdog.h"
+#if WIIU_DIAGNOSTICS
+#include <coreinit/time.h>
+#endif
+#endif
 #include <spdlog/spdlog.h>
 #include <tinyxml2.h>
 #include "nlohmann/json.hpp"
@@ -210,6 +216,9 @@ std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, st
         return nullptr;
     }
 
+#if defined(__WIIU__) && WIIU_DIAGNOSTICS
+    const OSTime resourceStart = OSGetSystemTime();
+#endif
     switch (initData->Format) {
         case RESOURCE_FORMAT_BINARY:
             fileToLoad->Reader = CreateBinaryReader(fileToLoad, initData);
@@ -227,7 +236,12 @@ std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, st
         return nullptr;
     }
 
-    return factory->ReadResource(fileToLoad, initData);
+    auto resource = factory->ReadResource(fileToLoad, initData);
+#if defined(__WIIU__) && WIIU_DIAGNOSTICS
+    Ship::WiiU::Watchdog::RecordResourceFactory(
+        static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - resourceStart)));
+#endif
+    return resource;
 }
 
 uint32_t ResourceLoader::GetResourceType(const std::string& type) {

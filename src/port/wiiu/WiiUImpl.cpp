@@ -44,6 +44,7 @@
 #include <nsysnet/_socket.h>
 #endif
 #include <cstdlib>
+#include <atomic>
 #include <errno.h>
 #include <new>
 #include <stdint.h>
@@ -1564,6 +1565,63 @@ void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds) {
     __sync_fetch_and_add(&gFrameTimingCpuUs, cpuMicroseconds);
     __sync_synchronize();
     __sync_fetch_and_add(&gFrameTimingCount, 1);
+}
+
+static std::atomic<uint32_t> sHitchResourceFactoryMicroseconds{ 0 };
+static std::atomic<uint32_t> sHitchTextureUploadMicroseconds{ 0 };
+static std::atomic<uint32_t> sHitchTextureUploadCount{ 0 };
+static std::atomic<uint32_t> sHitchShaderProgramCount{ 0 };
+static uint32_t sHitchBurstLines = 0;
+
+void RecordResourceFactory(uint32_t microseconds) {
+    sHitchResourceFactoryMicroseconds.fetch_add(microseconds, std::memory_order_relaxed);
+}
+
+void RecordTextureUpload(uint32_t microseconds) {
+    sHitchTextureUploadMicroseconds.fetch_add(microseconds, std::memory_order_relaxed);
+    sHitchTextureUploadCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordShaderProgramCreated() {
+    sHitchShaderProgramCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+// renderMicroseconds covers gfx start..end frame only; scene loads run in game logic before the
+// render starts, so the hitch test uses the full interval since the previous end of frame.
+void ReportHitchFrame(uint32_t renderMicroseconds, int32_t scene) {
+    static OSTime sLastEndOfFrame = 0;
+    const OSTime now = OSGetSystemTime();
+    const uint32_t microseconds =
+        sLastEndOfFrame != 0 ? static_cast<uint32_t>(OSTicksToMicroseconds(now - sLastEndOfFrame)) : 0;
+    sLastEndOfFrame = now;
+    const O2rArchive::HitchStats o2r = O2rArchive::GetHitchStats();
+    const uint32_t resourceMilliseconds =
+        static_cast<uint32_t>(sHitchResourceFactoryMicroseconds.exchange(0, std::memory_order_relaxed) / 1000);
+    const uint32_t textureMilliseconds =
+        static_cast<uint32_t>(sHitchTextureUploadMicroseconds.exchange(0, std::memory_order_relaxed) / 1000);
+    const uint32_t textureUploads = sHitchTextureUploadCount.exchange(0, std::memory_order_relaxed);
+    const uint32_t shaderPrograms = sHitchShaderProgramCount.exchange(0, std::memory_order_relaxed);
+
+    if (microseconds <= 100000) {
+        sHitchBurstLines = 0;
+        return;
+    }
+    if (sHitchBurstLines >= 3) {
+        return;
+    }
+    ++sHitchBurstLines;
+
+    Emit("HITCH: frameMs=%u renderMs=%u scene=0x%08X o2rLoads=%u o2rKB=%u o2rReadMs=%u "
+         "topReadMs=%s:%u,%s:%u,%s:%u resourceMs=%u texUploads=%u texMs=%u shaders=%u\n",
+         (microseconds + 500) / 1000, (renderMicroseconds + 500) / 1000, static_cast<uint32_t>(scene), o2r.loads,
+         static_cast<uint32_t>(o2r.compressedBytes / 1024), static_cast<uint32_t>(o2r.readMicroseconds / 1000),
+         o2r.topArchives[0].name[0] ? o2r.topArchives[0].name : "-",
+         static_cast<uint32_t>(o2r.topArchives[0].readMicroseconds / 1000),
+         o2r.topArchives[1].name[0] ? o2r.topArchives[1].name : "-",
+         static_cast<uint32_t>(o2r.topArchives[1].readMicroseconds / 1000),
+         o2r.topArchives[2].name[0] ? o2r.topArchives[2].name : "-",
+         static_cast<uint32_t>(o2r.topArchives[2].readMicroseconds / 1000),
+         resourceMilliseconds, textureUploads, textureMilliseconds, shaderPrograms);
 }
 
 static OSThread sThread;

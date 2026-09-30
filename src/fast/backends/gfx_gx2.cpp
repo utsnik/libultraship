@@ -538,6 +538,9 @@ static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_
         trace_first_shader_creation = false;
         return nullptr;
     }
+#if WIIU_DIAGNOSTICS
+    Ship::WiiU::Watchdog::RecordShaderProgramCreated();
+#endif
     if (trace) {
         SPDLOG_INFO("gfx_gx2: shader creation: GX2 shader compile/generate returned; shader upload/invalidate path ...");
     }
@@ -681,6 +684,9 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
     // whether the wedge was after GX2Invalidate or after this whole function returned.
     WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD_FN, "%ux%u path=%s", (unsigned int)width,
                    (unsigned int)height, WDOG_TEXTURE_DETAIL());
+#if WIIU_DIAGNOSTICS
+    const OSTime uploadStart = OSGetSystemTime();
+#endif
     static bool trace_first_texture_upload = true;
     const bool trace = trace_first_texture_upload;
     struct GX2TextureEntry* tex = current_texture;
@@ -798,6 +804,10 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
     ++perf_texture_uploads;
+#if WIIU_DIAGNOSTICS
+    Ship::WiiU::Watchdog::RecordTextureUpload(
+        static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - uploadStart)));
+#endif
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame texture: GX2Invalidate complete");
     }
@@ -1591,6 +1601,10 @@ static void gfx_gx2_end_frame(void) {
         SPDLOG_INFO("gfx_gx2: first frame: GX2CopyColorBufferToScanBuffer(DRC) complete");
         gfx_gx2_trace_first_frame = false;
     }
+#if WIIU_DIAGNOSTICS
+    Ship::WiiU::Watchdog::ReportHitchFrame(gfx_gx2_elapsed_microseconds(frame_start_time, OSGetSystemTime()),
+                                           wiiu_perf_scene ? wiiu_perf_scene() : -1);
+#endif
 }
 
 static void gfx_gx2_finish_render(void) {
