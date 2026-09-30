@@ -252,13 +252,17 @@ static void O2rEmitArchiveStats() {
 
     char line[400];
     size_t length = static_cast<size_t>(std::snprintf(line, sizeof(line), "O2RARCH:"));
-    for (size_t i = 0; i < topCount; ++i) {
+    for (size_t i = 0; i < topCount && length < sizeof(line) - 2; ++i) {
         length += static_cast<size_t>(std::snprintf(
             line + length, sizeof(line) - length, " %.*s=%u/%u", kArchiveNameLength, top[i].name->c_str(),
             top[i].stats.loads, static_cast<uint32_t>(top[i].stats.microseconds / 1000)));
     }
     OSFastMutex_Unlock(&sO2rArchiveStatsMutex);
 
+    // snprintf returns the untruncated length; keep room for the newline and terminator.
+    if (length > sizeof(line) - 2) {
+        length = sizeof(line) - 2;
+    }
     line[length++] = '\n';
     line[length] = '\0';
     Ship::WiiU::Watchdog::Emit("%s", line);
