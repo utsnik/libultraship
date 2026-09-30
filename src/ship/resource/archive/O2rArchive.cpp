@@ -10,6 +10,7 @@
 #include "port/wiiu/WiiUWatchdog.h"
 #include <coreinit/fastmutex.h>
 #if WIIU_DIAGNOSTICS
+#include <atomic>
 #include <coreinit/time.h>
 #endif
 #include <cstdio>
@@ -29,15 +30,18 @@ namespace Ship {
 #ifdef __WIIU__
 namespace {
 #if WIIU_DIAGNOSTICS
-static uint32_t sO2rLoadCount = 0;
-static uint32_t sO2rRepeatLoads = 0;
-static uint64_t sO2rCompressedBytes = 0;
-static uint64_t sO2rLoadMicroseconds = 0;
-static uint64_t sO2rLocateMicroseconds = 0;
-static uint64_t sO2rOpenMicroseconds = 0;
-static uint64_t sO2rReadMicroseconds = 0;
-static uint64_t sO2rInflateMicroseconds = 0;
-static uint64_t sO2rRepeatCompressedBytes = 0;
+static std::atomic<uint32_t> sO2rLoadCount{ 0 };
+static std::atomic<uint32_t> sO2rRepeatLoads{ 0 };
+static std::atomic<uint32_t> sO2rCompressedBytes{ 0 };
+static std::atomic<uint32_t> sO2rLoadMicroseconds{ 0 };
+static std::atomic<uint32_t> sO2rLocateMicroseconds{ 0 };
+static std::atomic<uint32_t> sO2rOpenMicroseconds{ 0 };
+static std::atomic<uint32_t> sO2rReadMicroseconds{ 0 };
+static std::atomic<uint32_t> sO2rInflateMicroseconds{ 0 };
+static std::atomic<uint32_t> sO2rRepeatCompressedBytes{ 0 };
+static std::atomic<uint32_t> sO2rHitchLoadCount{ 0 };
+static std::atomic<uint32_t> sO2rHitchCompressedBytes{ 0 };
+static std::atomic<uint32_t> sO2rHitchReadMicroseconds{ 0 };
 static std::unordered_set<std::string> sO2rLoadedPaths;
 static OSFastMutex sO2rLoadedPathsMutex;
 
@@ -45,6 +49,7 @@ struct O2rArchiveStats {
     uint32_t loads = 0;
     uint32_t cacheHits = 0;
     uint64_t microseconds = 0;
+    uint64_t hitchReadMicroseconds = 0;
 };
 
 static std::unordered_map<std::string, O2rArchiveStats> sO2rArchiveStats;
@@ -216,7 +221,7 @@ class O2rLoadTimer {
 
     void Record() {
         const OSTime now = OSGetSystemTime();
-        sO2rLoadMicroseconds += OSTicksToMicroseconds(now - mStart);
+        sO2rLoadMicroseconds.fetch_add(OSTicksToMicroseconds(now - mStart), std::memory_order_relaxed);
         mStart = now;
     }
 
@@ -286,20 +291,69 @@ static void O2rEmitArchiveStats() {
     line[length] = '\0';
     Ship::WiiU::Watchdog::Emit("%s", line);
 }
+
+struct O2rHitchArchiveEntry {
+    const std::string* name;
+    uint64_t readMicroseconds;
+};
+
+static bool O2rHitchArchiveEntryComesFirst(const std::pair<const std::string, O2rArchiveStats>& archive,
+                                           const O2rHitchArchiveEntry& entry) {
+    return archive.second.hitchReadMicroseconds > entry.readMicroseconds ||
+           (archive.second.hitchReadMicroseconds == entry.readMicroseconds && archive.first < *entry.name);
+}
 #endif
 } // namespace
 
 void O2rArchive::GetStats(uint32_t& loads, uint64_t& compressedBytes, uint64_t& microseconds) {
 #if WIIU_DIAGNOSTICS
-    loads = sO2rLoadCount;
-    compressedBytes = sO2rCompressedBytes;
-    microseconds = sO2rLoadMicroseconds;
+    loads = sO2rLoadCount.load(std::memory_order_relaxed);
+    compressedBytes = sO2rCompressedBytes.load(std::memory_order_relaxed);
+    microseconds = sO2rLoadMicroseconds.load(std::memory_order_relaxed);
 #else
     loads = 0;
     compressedBytes = 0;
     microseconds = 0;
 #endif
 }
+
+#if WIIU_DIAGNOSTICS
+O2rArchive::HitchStats O2rArchive::GetHitchStats() {
+    HitchStats stats;
+    O2rHitchArchiveEntry top[3]{};
+
+    OSFastMutex_Lock(&sO2rArchiveStatsMutex);
+    stats.loads = sO2rHitchLoadCount.exchange(0, std::memory_order_relaxed);
+    stats.compressedBytes = sO2rHitchCompressedBytes.exchange(0, std::memory_order_relaxed);
+    stats.readMicroseconds = sO2rHitchReadMicroseconds.exchange(0, std::memory_order_relaxed);
+
+    for (auto& archive : sO2rArchiveStats) {
+        if (archive.second.hitchReadMicroseconds != 0) {
+            size_t position = stats.archiveCount;
+            while (position > 0 && O2rHitchArchiveEntryComesFirst(archive, top[position - 1])) {
+                --position;
+            }
+            if (position < std::size(top)) {
+                if (stats.archiveCount < std::size(top)) {
+                    ++stats.archiveCount;
+                }
+                for (size_t i = stats.archiveCount - 1; i > position; --i) {
+                    top[i] = top[i - 1];
+                }
+                top[position] = { &archive.first, archive.second.hitchReadMicroseconds };
+            }
+        }
+        archive.second.hitchReadMicroseconds = 0;
+    }
+
+    for (size_t i = 0; i < stats.archiveCount; ++i) {
+        std::snprintf(stats.topArchives[i].name, sizeof(stats.topArchives[i].name), "%s", top[i].name->c_str());
+        stats.topArchives[i].readMicroseconds = top[i].readMicroseconds;
+    }
+    OSFastMutex_Unlock(&sO2rArchiveStatsMutex);
+    return stats;
+}
+#endif
 #endif
 
 O2rArchive::O2rArchive(const std::string& archivePath) : Archive(archivePath) {
@@ -364,6 +418,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
 #if WIIU_DIAGNOSTICS
     O2rLoadTimer loadTimer;
+    uint64_t hitchReadMicroseconds = 0;
 #endif
 #endif
 
@@ -394,7 +449,8 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     }
 #ifdef __WIIU__
 #if WIIU_DIAGNOSTICS
-    sO2rLocateMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - locateStart);
+    sO2rLocateMicroseconds.fetch_add(OSTicksToMicroseconds(OSGetSystemTime() - locateStart),
+                                     std::memory_order_relaxed);
 #endif
 #endif
 
@@ -424,7 +480,8 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #endif
         zipEntryFile = zip_fopen_index(zipArchive, zipEntryIndex, readCompressed ? ZIP_FL_COMPRESSED : 0);
 #if WIIU_DIAGNOSTICS
-        sO2rOpenMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - openStart);
+        sO2rOpenMicroseconds.fetch_add(OSTicksToMicroseconds(OSGetSystemTime() - openStart),
+                                       std::memory_order_relaxed);
 #endif
     }
 #else
@@ -464,7 +521,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #endif
             const zip_int64_t bytesRead = zip_fread(zipEntryFile, compressedData.data(), zipEntryStat.comp_size);
 #if WIIU_DIAGNOSTICS
-            sO2rReadMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - readStart);
+            const uint64_t readMicroseconds = OSTicksToMicroseconds(OSGetSystemTime() - readStart);
+            sO2rReadMicroseconds.fetch_add(readMicroseconds, std::memory_order_relaxed);
+            hitchReadMicroseconds += readMicroseconds;
 #endif
             if (bytesRead != static_cast<zip_int64_t>(zipEntryStat.comp_size)) {
                 SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
@@ -501,7 +560,8 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
             }
         }
 #if WIIU_DIAGNOSTICS
-        sO2rInflateMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - inflateStart);
+        sO2rInflateMicroseconds.fetch_add(OSTicksToMicroseconds(OSGetSystemTime() - inflateStart),
+                                          std::memory_order_relaxed);
 #endif
 
         if (outputSize != zipEntryStat.size) {
@@ -522,7 +582,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     }
 #ifdef __WIIU__
 #if WIIU_DIAGNOSTICS
-    sO2rReadMicroseconds += OSTicksToMicroseconds(OSGetSystemTime() - readStart);
+    const uint64_t readMicroseconds = OSTicksToMicroseconds(OSGetSystemTime() - readStart);
+    sO2rReadMicroseconds.fetch_add(readMicroseconds, std::memory_order_relaxed);
+    hitchReadMicroseconds += readMicroseconds;
 #endif
     }
 #endif
@@ -548,26 +610,30 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
 #if WIIU_DIAGNOSTICS
     const uint64_t loadMicroseconds = loadTimer.Elapsed();
-    sO2rLoadCount++;
-    sO2rCompressedBytes += zipEntryStat.comp_size;
+    const uint32_t loadCount = sO2rLoadCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    sO2rCompressedBytes.fetch_add(zipEntryStat.comp_size, std::memory_order_relaxed);
 
     const std::string archiveName = O2rArchiveFileName(*this);
     OSFastMutex_Lock(&sO2rArchiveStatsMutex);
+    sO2rHitchLoadCount.fetch_add(1, std::memory_order_relaxed);
+    sO2rHitchCompressedBytes.fetch_add(zipEntryStat.comp_size, std::memory_order_relaxed);
+    sO2rHitchReadMicroseconds.fetch_add(hitchReadMicroseconds, std::memory_order_relaxed);
     auto& archiveStats = sO2rArchiveStats[archiveName];
     archiveStats.loads++;
     archiveStats.cacheHits += cacheHit ? 1 : 0;
     archiveStats.microseconds += loadMicroseconds;
+    archiveStats.hitchReadMicroseconds += hitchReadMicroseconds;
     OSFastMutex_Unlock(&sO2rArchiveStatsMutex);
 
     OSFastMutex_Lock(&sO2rLoadedPathsMutex);
     const bool repeatLoad = !sO2rLoadedPaths.insert(filePath).second;
     if (repeatLoad) {
-        sO2rRepeatLoads++;
-        sO2rRepeatCompressedBytes += zipEntryStat.comp_size;
+        sO2rRepeatLoads.fetch_add(1, std::memory_order_relaxed);
+        sO2rRepeatCompressedBytes.fetch_add(zipEntryStat.comp_size, std::memory_order_relaxed);
     }
     OSFastMutex_Unlock(&sO2rLoadedPathsMutex);
 
-    if ((sO2rLoadCount % 256) == 0) {
+    if ((loadCount % 256) == 0) {
         uint32_t cacheHits;
         uint64_t cacheHitBytes;
         size_t cacheBytes;
@@ -576,11 +642,14 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         Ship::WiiU::Watchdog::Emit(
             "O2R: loads=%u repeats=%u repeatKB=%u hits=%u hitKB=%u cacheKB=%u locateMs=%u openMs=%u readMs=%u "
             "inflateMs=%u totalMs=%u preloadKB=%u\n",
-            sO2rLoadCount, sO2rRepeatLoads, static_cast<uint32_t>(sO2rRepeatCompressedBytes / 1024), cacheHits,
+            loadCount, sO2rRepeatLoads.load(std::memory_order_relaxed),
+            static_cast<uint32_t>(sO2rRepeatCompressedBytes.load(std::memory_order_relaxed) / 1024), cacheHits,
             static_cast<uint32_t>(cacheHitBytes / 1024), static_cast<uint32_t>(cacheBytes / 1024),
-            static_cast<uint32_t>(sO2rLocateMicroseconds / 1000), static_cast<uint32_t>(sO2rOpenMicroseconds / 1000),
-            static_cast<uint32_t>(sO2rReadMicroseconds / 1000), static_cast<uint32_t>(sO2rInflateMicroseconds / 1000),
-            static_cast<uint32_t>(sO2rLoadMicroseconds / 1000),
+            static_cast<uint32_t>(sO2rLocateMicroseconds.load(std::memory_order_relaxed) / 1000),
+            static_cast<uint32_t>(sO2rOpenMicroseconds.load(std::memory_order_relaxed) / 1000),
+            static_cast<uint32_t>(sO2rReadMicroseconds.load(std::memory_order_relaxed) / 1000),
+            static_cast<uint32_t>(sO2rInflateMicroseconds.load(std::memory_order_relaxed) / 1000),
+            static_cast<uint32_t>(sO2rLoadMicroseconds.load(std::memory_order_relaxed) / 1000),
             static_cast<uint32_t>(O2rGetPreloadedBytes() / 1024));
         O2rEmitArchiveStats();
     }
