@@ -1567,6 +1567,22 @@ static void gfx_gx2_end_frame(void) {
         draw_ptr = draw_buffer;
     }
 
+    // gfx_wiiu_start_frame lets a frame begin with the previous swap still pending, so
+    // without this the copy below can overwrite the scan buffer that swap is about to
+    // show (GamePad tearing). The draws are already flushed, so the GPU keeps working
+    // while we wait. Off switch for A/B runs: gWiiU.CopyAfterFlip 0.
+    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.CopyAfterFlip", 1)) {
+        uint32_t swap_count, flip_count;
+        OSTime last_flip, last_vsync;
+        for (int waits = 0; waits < 10; waits++) {
+            GX2GetSwapStatus(&swap_count, &flip_count, &last_flip, &last_vsync);
+            if (swap_count == flip_count) {
+                break;
+            }
+            GX2WaitForVsync();
+        }
+    }
+
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame: GX2CopyColorBufferToScanBuffer(TV) ...");
     }
