@@ -17,6 +17,7 @@
 #include <list>
 #include <limits>
 #include <malloc.h>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -535,12 +536,6 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 
 bool O2rArchive::Open() {
 #ifdef __WIIU__
-    FILE* archiveFile = std::fopen(GetPath().c_str(), "rb");
-    if (archiveFile == nullptr) {
-        SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
-        return false;
-    }
-
     bool preloaded = false;
     bool preloadReserved = false;
     void* preloadBuffer = nullptr;
@@ -561,16 +556,11 @@ bool O2rArchive::Open() {
         preloadReserved = false;
     };
 
-    long archiveLength = -1;
-    if (std::fseek(archiveFile, 0, SEEK_END) == 0) {
-        archiveLength = std::ftell(archiveFile);
-    }
-    std::rewind(archiveFile);
-
-    if (archiveLength < 0) {
+    struct stat archiveStat;
+    if (stat(GetPath().c_str(), &archiveStat) != 0 || archiveStat.st_size < 0) {
         preloadSkipReason = "size";
     } else {
-        const uint64_t archiveSize64 = static_cast<uint64_t>(archiveLength);
+        const uint64_t archiveSize64 = static_cast<uint64_t>(archiveStat.st_size);
         if (archiveSize64 > std::numeric_limits<size_t>::max()) {
             preloadSkipReason = "size";
         } else {
@@ -610,52 +600,57 @@ bool O2rArchive::Open() {
                         free(preloadBuffer);
                         preloadBuffer = nullptr;
                     } else {
-#if WIIU_DIAGNOSTICS
-                        const OSTime preloadStart = OSGetSystemTime();
-#endif
-                        const size_t bytesRead = std::fread(preloadBuffer, 1, preloadSize, archiveFile);
-#if WIIU_DIAGNOSTICS
-                        preloadMilliseconds = static_cast<uint32_t>(
-                            OSTicksToMicroseconds(OSGetSystemTime() - preloadStart) / 1000);
-#endif
-                        if (bytesRead != preloadSize) {
-                            preloadSkipReason = "read";
+                        FILE* preloadFile = std::fopen(GetPath().c_str(), "rb");
+                        if (preloadFile == nullptr) {
+                            preloadSkipReason = "open";
                             releasePreloadReservation();
                             free(preloadBuffer);
                             preloadBuffer = nullptr;
-                            std::rewind(archiveFile);
                         } else {
-                            zip_error_t zipError;
-                            zip_error_init(&zipError);
-                            zip_source_t* source =
-                                zip_source_buffer_create(preloadBuffer, preloadSize, 0, &zipError);
-                            if (source != nullptr) {
-                                mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipError);
-                                if (mZipArchive != nullptr) {
-                                    zip_error_fini(&zipError);
-                                    std::fclose(archiveFile);
-                                    OSFastMutex_Lock(&sO2rPreloadMutex);
-                                    sO2rPreloadBuffers[this] = { preloadBuffer, preloadSize };
-                                    OSFastMutex_Unlock(&sO2rPreloadMutex);
-                                    preloadBuffer = nullptr;
-                                    preloadReserved = false;
-                                    preloaded = true;
+#if WIIU_DIAGNOSTICS
+                            const OSTime preloadStart = OSGetSystemTime();
+#endif
+                            const size_t bytesRead = std::fread(preloadBuffer, 1, preloadSize, preloadFile);
+                            std::fclose(preloadFile);
+#if WIIU_DIAGNOSTICS
+                            preloadMilliseconds = static_cast<uint32_t>(
+                                OSTicksToMicroseconds(OSGetSystemTime() - preloadStart) / 1000);
+#endif
+                            if (bytesRead != preloadSize) {
+                                preloadSkipReason = "read";
+                                releasePreloadReservation();
+                                free(preloadBuffer);
+                                preloadBuffer = nullptr;
+                            } else {
+                                zip_error_t zipError;
+                                zip_error_init(&zipError);
+                                zip_source_t* source =
+                                    zip_source_buffer_create(preloadBuffer, preloadSize, 0, &zipError);
+                                if (source != nullptr) {
+                                    mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipError);
+                                    if (mZipArchive != nullptr) {
+                                        zip_error_fini(&zipError);
+                                        OSFastMutex_Lock(&sO2rPreloadMutex);
+                                        sO2rPreloadBuffers[this] = { preloadBuffer, preloadSize };
+                                        OSFastMutex_Unlock(&sO2rPreloadMutex);
+                                        preloadBuffer = nullptr;
+                                        preloadReserved = false;
+                                        preloaded = true;
+                                    } else {
+                                        zip_source_free(source);
+                                        zip_error_fini(&zipError);
+                                        preloadSkipReason = "zip-source";
+                                        releasePreloadReservation();
+                                        free(preloadBuffer);
+                                        preloadBuffer = nullptr;
+                                    }
                                 } else {
-                                    zip_source_free(source);
                                     zip_error_fini(&zipError);
                                     preloadSkipReason = "zip-source";
                                     releasePreloadReservation();
                                     free(preloadBuffer);
                                     preloadBuffer = nullptr;
-                                    std::rewind(archiveFile);
                                 }
-                            } else {
-                                zip_error_fini(&zipError);
-                                preloadSkipReason = "zip-source";
-                                releasePreloadReservation();
-                                free(preloadBuffer);
-                                preloadBuffer = nullptr;
-                                std::rewind(archiveFile);
                             }
                         }
                     }
@@ -665,7 +660,11 @@ bool O2rArchive::Open() {
     }
 
     if (!preloaded) {
-        std::rewind(archiveFile);
+        FILE* archiveFile = std::fopen(GetPath().c_str(), "rb");
+        if (archiveFile == nullptr) {
+            SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
+            return false;
+        }
 
         // Unbuffered made zip_open parse the central directory with one FSA read per entry (oot.o2r:
         // ~23 s instead of 0.7 s, soh923p12). 16 KiB lets one read cover a small entry's local header
