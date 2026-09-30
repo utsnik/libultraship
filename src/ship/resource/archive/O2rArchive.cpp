@@ -630,6 +630,10 @@ bool O2rArchive::Open() {
 #if WIIU_DIAGNOSTICS
                             const OSTime preloadStart = OSGetSystemTime();
 #endif
+                            // Unbuffered: newlib then reads straight into preloadBuffer in one call; a buffered
+                            // stream refills its small default buffer chunk by chunk (thousands of FSA reads at
+                            // ~1.5 ms each for a 16 MB archive). _IONBF allocates nothing (no setvbuf/malloc trap).
+                            std::setvbuf(preloadFile, nullptr, _IONBF, 0);
                             const size_t bytesRead = std::fread(preloadBuffer, 1, preloadSize, preloadFile);
                             std::fclose(preloadFile);
 #if WIIU_DIAGNOSTICS
