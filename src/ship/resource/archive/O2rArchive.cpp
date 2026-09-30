@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <zlib.h>
 #endif
 
@@ -36,6 +37,15 @@ static uint64_t sO2rInflateMicroseconds = 0;
 static uint64_t sO2rRepeatCompressedBytes = 0;
 static std::unordered_set<std::string> sO2rLoadedPaths;
 static OSFastMutex sO2rLoadedPathsMutex;
+
+struct O2rArchiveStats {
+    uint32_t loads = 0;
+    uint32_t cacheHits = 0;
+    uint64_t microseconds = 0;
+};
+
+static std::unordered_map<std::string, O2rArchiveStats> sO2rArchiveStats;
+static OSFastMutex sO2rArchiveStatsMutex;
 #endif
 static OSFastMutex sO2rCacheMutex;
 
@@ -79,6 +89,7 @@ struct O2rMutexInitializer {
     O2rMutexInitializer() {
 #if WIIU_DIAGNOSTICS
         OSFastMutex_Init(&sO2rLoadedPathsMutex, "O2rLoadedPaths");
+        OSFastMutex_Init(&sO2rArchiveStatsMutex, "O2rArchiveStats");
 #endif
         OSFastMutex_Init(&sO2rCacheMutex, "O2rCache");
     }
@@ -179,6 +190,10 @@ class O2rLoadTimer {
         Record();
     }
 
+    uint64_t Elapsed() const {
+        return OSTicksToMicroseconds(OSGetSystemTime() - mStart);
+    }
+
     void Record() {
         const OSTime now = OSGetSystemTime();
         sO2rLoadMicroseconds += OSTicksToMicroseconds(now - mStart);
@@ -188,6 +203,65 @@ class O2rLoadTimer {
   private:
     OSTime mStart;
 };
+
+static std::string O2rArchiveFileName(O2rArchive& archive) {
+    const std::string& path = archive.GetPath();
+    const size_t separator = path.find_last_of("/");
+    if (separator == std::string::npos || separator + 1 == path.size()) {
+        return path;
+    }
+    return path.substr(separator + 1);
+}
+
+struct O2rArchiveReportEntry {
+    const std::string* name;
+    O2rArchiveStats stats;
+};
+
+static bool O2rArchiveReportEntryComesFirst(const std::pair<const std::string, O2rArchiveStats>& archive,
+                                            const O2rArchiveReportEntry& entry) {
+    return archive.second.loads > entry.stats.loads ||
+           (archive.second.loads == entry.stats.loads && archive.first < *entry.name);
+}
+
+static void O2rEmitArchiveStats() {
+    constexpr size_t kTopArchiveCount = 8;
+    constexpr int kArchiveNameLength = 24;
+    O2rArchiveReportEntry top[kTopArchiveCount]{};
+    size_t topCount = 0;
+
+    OSFastMutex_Lock(&sO2rArchiveStatsMutex);
+    for (const auto& archive : sO2rArchiveStats) {
+        size_t position = topCount;
+        while (position > 0 && O2rArchiveReportEntryComesFirst(archive, top[position - 1])) {
+            --position;
+        }
+        if (position >= kTopArchiveCount) {
+            continue;
+        }
+
+        if (topCount < kTopArchiveCount) {
+            ++topCount;
+        }
+        for (size_t i = topCount - 1; i > position; --i) {
+            top[i] = top[i - 1];
+        }
+        top[position] = { &archive.first, archive.second };
+    }
+
+    char line[400];
+    size_t length = static_cast<size_t>(std::snprintf(line, sizeof(line), "O2RARCH:"));
+    for (size_t i = 0; i < topCount; ++i) {
+        length += static_cast<size_t>(std::snprintf(
+            line + length, sizeof(line) - length, " %.*s=%u/%u", kArchiveNameLength, top[i].name->c_str(),
+            top[i].stats.loads, static_cast<uint32_t>(top[i].stats.microseconds / 1000)));
+    }
+    OSFastMutex_Unlock(&sO2rArchiveStatsMutex);
+
+    line[length++] = '\n';
+    line[length] = '\0';
+    Ship::WiiU::Watchdog::Emit("%s", line);
+}
 #endif
 } // namespace
 
@@ -394,8 +468,17 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 
 #ifdef __WIIU__
 #if WIIU_DIAGNOSTICS
+    const uint64_t loadMicroseconds = loadTimer.Elapsed();
     sO2rLoadCount++;
     sO2rCompressedBytes += zipEntryStat.comp_size;
+
+    const std::string archiveName = O2rArchiveFileName(*this);
+    OSFastMutex_Lock(&sO2rArchiveStatsMutex);
+    auto& archiveStats = sO2rArchiveStats[archiveName];
+    archiveStats.loads++;
+    archiveStats.cacheHits += cacheHit ? 1 : 0;
+    archiveStats.microseconds += loadMicroseconds;
+    OSFastMutex_Unlock(&sO2rArchiveStatsMutex);
 
     OSFastMutex_Lock(&sO2rLoadedPathsMutex);
     const bool repeatLoad = !sO2rLoadedPaths.insert(filePath).second;
@@ -419,6 +502,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
             static_cast<uint32_t>(sO2rLocateMicroseconds / 1000), static_cast<uint32_t>(sO2rOpenMicroseconds / 1000),
             static_cast<uint32_t>(sO2rReadMicroseconds / 1000), static_cast<uint32_t>(sO2rInflateMicroseconds / 1000),
             static_cast<uint32_t>(sO2rLoadMicroseconds / 1000));
+        O2rEmitArchiveStats();
     }
 #endif
 #endif
