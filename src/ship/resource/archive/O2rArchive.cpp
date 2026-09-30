@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #ifdef __WIIU__
+#include "ship/config/ConsoleVariable.h"
 #include "port/wiiu/WiiUWatchdog.h"
 #include <coreinit/fastmutex.h>
 #if WIIU_DIAGNOSTICS
@@ -49,6 +50,7 @@ static std::unordered_map<std::string, O2rArchiveStats> sO2rArchiveStats;
 static OSFastMutex sO2rArchiveStatsMutex;
 #endif
 static OSFastMutex sO2rCacheMutex;
+static OSFastMutex sO2rPreloadMutex;
 
 constexpr size_t kO2rCacheMaxBytes = 32 * 1024 * 1024;
 constexpr size_t kO2rCacheMaxEntryBytes = 4 * 1024 * 1024;
@@ -93,6 +95,7 @@ struct O2rMutexInitializer {
         OSFastMutex_Init(&sO2rArchiveStatsMutex, "O2rArchiveStats");
 #endif
         OSFastMutex_Init(&sO2rCacheMutex, "O2rCache");
+        OSFastMutex_Init(&sO2rPreloadMutex, "O2rPreload");
     }
 };
 static O2rMutexInitializer sO2rMutexInitializer;
@@ -180,6 +183,21 @@ static void O2rCacheGetStats(uint32_t& hits, uint64_t& hitBytes, size_t& cacheBy
 // FSAReadFile instead of splitting off an unaligned head through its 64-byte bounce buffer.
 constexpr size_t kO2rStdioBufferSize = 16 * 1024;
 static std::unordered_map<const void*, void*> sO2rStdioBuffers;
+
+struct O2rPreloadBuffer {
+    void* data;
+    size_t size;
+};
+
+static std::unordered_map<const void*, O2rPreloadBuffer> sO2rPreloadBuffers;
+static size_t sO2rPreloadedBytes = 0;
+
+static size_t O2rGetPreloadedBytes() {
+    OSFastMutex_Lock(&sO2rPreloadMutex);
+    const size_t bytes = sO2rPreloadedBytes;
+    OSFastMutex_Unlock(&sO2rPreloadMutex);
+    return bytes;
+}
 
 #if WIIU_DIAGNOSTICS
 class O2rLoadTimer {
@@ -556,12 +574,13 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         loadTimer.Record();
         Ship::WiiU::Watchdog::Emit(
             "O2R: loads=%u repeats=%u repeatKB=%u hits=%u hitKB=%u cacheKB=%u locateMs=%u openMs=%u readMs=%u "
-            "inflateMs=%u totalMs=%u\n",
+            "inflateMs=%u totalMs=%u preloadKB=%u\n",
             sO2rLoadCount, sO2rRepeatLoads, static_cast<uint32_t>(sO2rRepeatCompressedBytes / 1024), cacheHits,
             static_cast<uint32_t>(cacheHitBytes / 1024), static_cast<uint32_t>(cacheBytes / 1024),
             static_cast<uint32_t>(sO2rLocateMicroseconds / 1000), static_cast<uint32_t>(sO2rOpenMicroseconds / 1000),
             static_cast<uint32_t>(sO2rReadMicroseconds / 1000), static_cast<uint32_t>(sO2rInflateMicroseconds / 1000),
-            static_cast<uint32_t>(sO2rLoadMicroseconds / 1000));
+            static_cast<uint32_t>(sO2rLoadMicroseconds / 1000),
+            static_cast<uint32_t>(O2rGetPreloadedBytes() / 1024));
         O2rEmitArchiveStats();
     }
 #endif
@@ -578,39 +597,180 @@ bool O2rArchive::Open() {
         return false;
     }
 
-    // Unbuffered made zip_open parse the central directory with one FSA read per entry (oot.o2r:
-    // ~23 s instead of 0.7 s, soh923p12). 16 KiB lets one read cover a small entry's local header
-    // and its data, without paying a large transfer per random-access load.
-    void* stdioBuffer = memalign(0x40, kO2rStdioBufferSize);
-    if (stdioBuffer == nullptr ||
-        std::setvbuf(archiveFile, static_cast<char*>(stdioBuffer), _IOFBF, kO2rStdioBufferSize) != 0) {
-        std::fclose(archiveFile);
-        free(stdioBuffer);
-        SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
-        return false;
+    bool preloaded = false;
+    bool preloadReserved = false;
+    void* preloadBuffer = nullptr;
+    size_t preloadSize = 0;
+    const char* preloadSkipReason = "unknown";
+#if WIIU_DIAGNOSTICS
+    uint32_t preloadMilliseconds = 0;
+#endif
+
+    auto releasePreloadReservation = [&]() {
+        if (!preloadReserved) {
+            return;
+        }
+
+        OSFastMutex_Lock(&sO2rPreloadMutex);
+        sO2rPreloadedBytes -= preloadSize;
+        OSFastMutex_Unlock(&sO2rPreloadMutex);
+        preloadReserved = false;
+    };
+
+    long archiveLength = -1;
+    if (std::fseek(archiveFile, 0, SEEK_END) == 0) {
+        archiveLength = std::ftell(archiveFile);
+    }
+    std::rewind(archiveFile);
+
+    if (archiveLength < 0) {
+        preloadSkipReason = "size";
+    } else {
+        const uint64_t archiveSize64 = static_cast<uint64_t>(archiveLength);
+        if (archiveSize64 > std::numeric_limits<size_t>::max()) {
+            preloadSkipReason = "size";
+        } else {
+            const size_t archiveSize = static_cast<size_t>(archiveSize64);
+            const int32_t maxArchiveMB =
+                Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.O2rPreloadMaxArchiveMB", 16);
+            const int32_t budgetMB =
+                Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.O2rPreloadBudgetMB", 64);
+            const uint64_t maxArchiveBytes = maxArchiveMB > 0
+                                                  ? static_cast<uint64_t>(maxArchiveMB) * 1024 * 1024
+                                                  : 0;
+            const uint64_t budgetBytes = budgetMB > 0 ? static_cast<uint64_t>(budgetMB) * 1024 * 1024 : 0;
+
+            if (budgetMB <= 0) {
+                preloadSkipReason = "disabled";
+            } else if (archiveSize64 == 0) {
+                preloadSkipReason = "empty";
+            } else if (archiveSize64 > maxArchiveBytes) {
+                preloadSkipReason = "too-large";
+            } else {
+                preloadSize = archiveSize;
+                preloadBuffer = memalign(0x40, preloadSize);
+                if (preloadBuffer == nullptr) {
+                    preloadSkipReason = "alloc";
+                } else {
+                    OSFastMutex_Lock(&sO2rPreloadMutex);
+                    const bool withinBudget = static_cast<uint64_t>(sO2rPreloadedBytes) <= budgetBytes &&
+                                              archiveSize64 <= budgetBytes - sO2rPreloadedBytes;
+                    if (withinBudget) {
+                        sO2rPreloadedBytes += preloadSize;
+                        preloadReserved = true;
+                    }
+                    OSFastMutex_Unlock(&sO2rPreloadMutex);
+
+                    if (!withinBudget) {
+                        preloadSkipReason = "budget";
+                        free(preloadBuffer);
+                        preloadBuffer = nullptr;
+                    } else {
+#if WIIU_DIAGNOSTICS
+                        const OSTime preloadStart = OSGetSystemTime();
+#endif
+                        const size_t bytesRead = std::fread(preloadBuffer, 1, preloadSize, archiveFile);
+#if WIIU_DIAGNOSTICS
+                        preloadMilliseconds = static_cast<uint32_t>(
+                            OSTicksToMicroseconds(OSGetSystemTime() - preloadStart) / 1000);
+#endif
+                        if (bytesRead != preloadSize) {
+                            preloadSkipReason = "read";
+                            releasePreloadReservation();
+                            free(preloadBuffer);
+                            preloadBuffer = nullptr;
+                            std::rewind(archiveFile);
+                        } else {
+                            zip_error_t zipError;
+                            zip_error_init(&zipError);
+                            zip_source_t* source =
+                                zip_source_buffer_create(preloadBuffer, preloadSize, 0, &zipError);
+                            if (source != nullptr) {
+                                mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipError);
+                                if (mZipArchive != nullptr) {
+                                    zip_error_fini(&zipError);
+                                    std::fclose(archiveFile);
+                                    OSFastMutex_Lock(&sO2rPreloadMutex);
+                                    sO2rPreloadBuffers[this] = { preloadBuffer, preloadSize };
+                                    OSFastMutex_Unlock(&sO2rPreloadMutex);
+                                    preloadBuffer = nullptr;
+                                    preloadReserved = false;
+                                    preloaded = true;
+                                } else {
+                                    zip_source_free(source);
+                                    zip_error_fini(&zipError);
+                                    preloadSkipReason = "zip-source";
+                                    releasePreloadReservation();
+                                    free(preloadBuffer);
+                                    preloadBuffer = nullptr;
+                                    std::rewind(archiveFile);
+                                }
+                            } else {
+                                zip_error_fini(&zipError);
+                                preloadSkipReason = "zip-source";
+                                releasePreloadReservation();
+                                free(preloadBuffer);
+                                preloadBuffer = nullptr;
+                                std::rewind(archiveFile);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    zip_error_t zipError;
-    zip_error_init(&zipError);
-    zip_source_t* source = zip_source_filep_create(archiveFile, 0, ZIP_LENGTH_TO_END, &zipError);
-    if (source == nullptr) {
-        std::fclose(archiveFile);
-        free(stdioBuffer);
+    if (!preloaded) {
+        std::rewind(archiveFile);
+
+        // Unbuffered made zip_open parse the central directory with one FSA read per entry (oot.o2r:
+        // ~23 s instead of 0.7 s, soh923p12). 16 KiB lets one read cover a small entry's local header
+        // and its data, without paying a large transfer per random-access load.
+        void* stdioBuffer = memalign(0x40, kO2rStdioBufferSize);
+        if (stdioBuffer == nullptr ||
+            std::setvbuf(archiveFile, static_cast<char*>(stdioBuffer), _IOFBF, kO2rStdioBufferSize) != 0) {
+            std::fclose(archiveFile);
+            free(stdioBuffer);
+            SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
+            return false;
+        }
+
+        zip_error_t zipError;
+        zip_error_init(&zipError);
+        zip_source_t* source = zip_source_filep_create(archiveFile, 0, ZIP_LENGTH_TO_END, &zipError);
+        if (source == nullptr) {
+            std::fclose(archiveFile);
+            free(stdioBuffer);
+            zip_error_fini(&zipError);
+            SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
+            return false;
+        }
+
+        mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipError);
+        if (mZipArchive == nullptr) {
+            zip_source_free(source); // also closes archiveFile
+            free(stdioBuffer);
+            zip_error_fini(&zipError);
+            SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
+            return false;
+        }
         zip_error_fini(&zipError);
-        SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
-        return false;
+        sO2rStdioBuffers[this] = stdioBuffer;
     }
 
-    mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipError);
-    if (mZipArchive == nullptr) {
-        zip_source_free(source); // also closes archiveFile
-        free(stdioBuffer);
-        zip_error_fini(&zipError);
-        SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
-        return false;
+#if WIIU_DIAGNOSTICS
+    if (preloaded) {
+        const size_t totalBytes = O2rGetPreloadedBytes();
+        Ship::WiiU::Watchdog::Emit("O2RPRELOAD: name=%s bytes=%u ms=%u total=%u\n", O2rArchiveFileName(*this).c_str(),
+                                   static_cast<uint32_t>(preloadSize), preloadMilliseconds,
+                                   static_cast<uint32_t>(totalBytes / (1024 * 1024)));
+    } else {
+        Ship::WiiU::Watchdog::Emit("O2RPRELOAD: name=%s skip reason=%s\n", O2rArchiveFileName(*this).c_str(),
+                                   preloadSkipReason);
     }
-    zip_error_fini(&zipError);
-    sO2rStdioBuffers[this] = stdioBuffer;
+#else
+    (void)preloadSkipReason;
+#endif
 #else
     mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
     if (mZipArchive == nullptr) {
@@ -664,6 +824,15 @@ bool O2rArchive::Close() {
         free(stdioBuffer->second);
         sO2rStdioBuffers.erase(stdioBuffer);
     }
+
+    OSFastMutex_Lock(&sO2rPreloadMutex);
+    auto preloadBuffer = sO2rPreloadBuffers.find(this);
+    if (preloadBuffer != sO2rPreloadBuffers.end()) {
+        free(preloadBuffer->second.data);
+        sO2rPreloadedBytes -= preloadBuffer->second.size;
+        sO2rPreloadBuffers.erase(preloadBuffer);
+    }
+    OSFastMutex_Unlock(&sO2rPreloadMutex);
 #endif
     return success;
 }
