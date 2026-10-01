@@ -283,7 +283,8 @@ std::shared_ptr<IResource> ResourceLoader::LoadResource(std::string filePath, st
     auto resource = factory->ReadResource(fileToLoad, initData);
 #if defined(__WIIU__) && WIIU_DIAGNOSTICS
     Ship::WiiU::Watchdog::RecordResourceFactory(
-        static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - resourceStart)));
+        static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - resourceStart)),
+        initData->Format == RESOURCE_FORMAT_XML);
 #endif
     return resource;
 }

@@ -157,7 +157,7 @@ extern volatile uint32_t gFrameTimingWaitUs;
 void RecordGX2Wait(uint32_t microseconds);
 void RecordGX2SlotWait(uint32_t microseconds);
 void RecordFrameTiming(uint32_t gpuMicroseconds, uint32_t cpuMicroseconds);
-void RecordResourceFactory(uint32_t microseconds);
+void RecordResourceFactory(uint32_t microseconds, bool xml);
 void RecordTextureUpload(uint32_t microseconds);
 void RecordShaderProgramCreated();
 void ReportHitchFrame(uint32_t microseconds, int32_t scene);
@@ -391,7 +391,7 @@ inline void RecordGX2SlotWait(uint32_t) {
 inline void RecordFrameTiming(uint32_t, uint32_t) {
 }
 
-inline void RecordResourceFactory(uint32_t) {
+inline void RecordResourceFactory(uint32_t, bool) {
 }
 
 inline void RecordTextureUpload(uint32_t) {
