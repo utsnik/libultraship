@@ -805,8 +805,17 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
     ++perf_texture_uploads;
 #if WIIU_DIAGNOSTICS
-    Ship::WiiU::Watchdog::RecordTextureUpload(
-        static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - uploadStart)));
+    {
+        const uint32_t uploadMicroseconds =
+            static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - uploadStart));
+        Ship::WiiU::Watchdog::RecordTextureUpload(uploadMicroseconds);
+        // Name the textures behind in-play stutters (one ~40 ms upload per slow frame in Hyrule Field).
+        if (uploadMicroseconds > 20000) {
+            const char* path = WDOG_TEXTURE_DETAIL();
+            Ship::WiiU::Watchdog::Emit("TEXSLOW: ms=%u %ux%u path=%s\n", uploadMicroseconds / 1000,
+                                       (unsigned int)width, (unsigned int)height, path != nullptr ? path : "?");
+        }
+    }
 #endif
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame texture: GX2Invalidate complete");
