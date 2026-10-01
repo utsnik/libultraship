@@ -338,6 +338,47 @@ static void gfx_gx2_collect_gpu_timing(DrawBufferSlot& slot) {
     slot.gpu_timing_pending = false;
 }
 
+// Texture images the GPU may still sample are freed only after the submission that can reference them has
+// retired. A GX2DrawDone per reallocation stalled the CPU for a whole GPU frame (~43 ms) and was the in-play
+// stutter in Hyrule Field; freeing without any fence hard-freezes the console. fence 0 = not yet submitted:
+// stamped with the frame's submitted timestamp in end_frame, which covers every draw recorded so far.
+struct PendingImageFree {
+    void* image;
+    uint32_t size;
+    OSTime fence;
+};
+static std::vector<PendingImageFree> pending_image_frees;
+
+static void gfx_gx2_defer_image_free(void* image, uint32_t size) {
+    pending_image_frees.push_back({ image, size, 0 });
+}
+
+static void gfx_gx2_stamp_pending_image_frees(OSTime fence) {
+    for (PendingImageFree& pending : pending_image_frees) {
+        if (pending.fence == 0) {
+            pending.fence = fence;
+        }
+    }
+}
+
+// all = true only after a GX2DrawDone (nothing can still be in flight).
+static void gfx_gx2_release_pending_image_frees(bool all) {
+    if (pending_image_frees.empty()) {
+        return;
+    }
+    const OSTime retired = GX2GetRetiredTimeStamp();
+    size_t kept = 0;
+    for (PendingImageFree& pending : pending_image_frees) {
+        if (all || (pending.fence != 0 && pending.fence <= retired)) {
+            WDOG_TEXFREE(pending.size);
+            free(pending.image);
+        } else {
+            pending_image_frees[kept++] = pending;
+        }
+    }
+    pending_image_frees.resize(kept);
+}
+
 static void gfx_gx2_wait_for_draw_buffer_slot(DrawBufferSlot& slot) {
     if (slot.submitted_timestamp != 0) {
         const OSTime retired_timestamp = GX2GetRetiredTimeStamp();
@@ -363,6 +404,7 @@ static void gfx_gx2_prepare_draw_buffer_slot() {
         gfx_gx2_collect_retired_depth_readbacks();
         slot.submitted_timestamp = 0;
     }
+    gfx_gx2_release_pending_image_frees(false);
     draw_buffer = slot.buffer;
     draw_ptr = draw_buffer;
 
@@ -619,9 +661,7 @@ static void gfx_gx2_delete_texture(uint32_t texture_id) {
     }
 
     if (tex->texture.surface.image) {
-        gfx_gx2_draw_done("texture free");
-        WDOG_TEXFREE(tex->texture.surface.imageSize);
-        free(tex->texture.surface.image);
+        gfx_gx2_defer_image_free(tex->texture.surface.image, tex->texture.surface.imageSize);
     }
 
     free((void*)tex);
@@ -708,9 +748,7 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
             // else while the GPU is still reading it, which wedges the GPU and
             // hard-freezes the console with no CPU-side error at all. The
             // framebuffer path already guards its frees this way.
-            gfx_gx2_draw_done("texture reallocation");
-            WDOG_TEXFREE(tex->texture.surface.imageSize);
-            free(tex->texture.surface.image);
+            gfx_gx2_defer_image_free(tex->texture.surface.image, tex->texture.surface.imageSize);
             tex->texture.surface.image = nullptr;
         }
 
@@ -1252,6 +1290,7 @@ void gfx_gx2_shutdown(void) {
 
     if (has_foreground) {
         gfx_gx2_draw_done("shutdown");
+        gfx_gx2_release_pending_image_frees(true);
 
         for (DrawBufferSlot& slot : draw_buffer_slots) {
             if (slot.depth_read_buffer.surface.image) {
@@ -1570,6 +1609,7 @@ static void gfx_gx2_end_frame(void) {
     const OSTime submit_time = OSGetSystemTime();
     slot.cpu_microseconds = gfx_gx2_elapsed_microseconds(frame_start_time, submit_time);
     slot.submitted_timestamp = GX2GetLastSubmittedTimeStamp();
+    gfx_gx2_stamp_pending_image_frees(slot.submitted_timestamp);
     gfx_gx2_perf_tick(slot.cpu_microseconds);
 
     if (draw_buffer_double_buffered) {
@@ -1580,6 +1620,7 @@ static void gfx_gx2_end_frame(void) {
         // Allocation failure at init deliberately preserves the old behavior:
         // the single arena is serialized once per frame.
         gfx_gx2_draw_done("GX2DrawDone");
+        gfx_gx2_release_pending_image_frees(true);
         gfx_gx2_collect_gpu_timing(slot);
         gfx_gx2_collect_depth_readback(slot);
         slot.submitted_timestamp = 0;
