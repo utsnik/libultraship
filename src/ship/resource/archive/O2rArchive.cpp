@@ -79,7 +79,7 @@ struct O2rCacheKeyHash {
 
 struct O2rCacheEntry {
     O2rCacheKey key;
-    std::vector<char> compressedData;
+    std::shared_ptr<std::vector<char>> compressedData;
     zip_uint16_t compMethod;
     zip_uint64_t uncompressedSize;
 };
@@ -106,7 +106,7 @@ struct O2rMutexInitializer {
 static O2rMutexInitializer sO2rMutexInitializer;
 
 static bool O2rCacheLoad(const O2rArchive* archive, const std::string& filePath,
-                         std::vector<char>& compressedData, zip_uint16_t& compMethod,
+                         std::shared_ptr<std::vector<char>>& compressedData, zip_uint16_t& compMethod,
                          zip_uint64_t& uncompressedSize) {
     OSFastMutex_Lock(&sO2rCacheMutex);
     const O2rCacheKey key{ archive, filePath };
@@ -123,16 +123,16 @@ static bool O2rCacheLoad(const O2rArchive* archive, const std::string& filePath,
     uncompressedSize = entry.uncompressedSize;
 #if WIIU_DIAGNOSTICS
     sO2rCacheHits++;
-    sO2rCacheHitBytes += compressedData.size();
+    sO2rCacheHitBytes += compressedData->size();
 #endif
     OSFastMutex_Unlock(&sO2rCacheMutex);
     return true;
 }
 
 static void O2rCacheStore(const O2rArchive* archive, const std::string& filePath,
-                          const std::vector<char>& compressedData, zip_uint16_t compMethod,
+                          const std::shared_ptr<std::vector<char>>& compressedData, zip_uint16_t compMethod,
                           zip_uint64_t uncompressedSize) {
-    if (compressedData.size() > kO2rCacheMaxEntryBytes) {
+    if (compressedData->size() > kO2rCacheMaxEntryBytes) {
         return;
     }
 
@@ -140,21 +140,21 @@ static void O2rCacheStore(const O2rArchive* archive, const std::string& filePath
     const O2rCacheKey key{ archive, filePath };
     auto existingEntry = sO2rCacheIndex.find(key);
     if (existingEntry != sO2rCacheIndex.end()) {
-        sO2rCacheBytes -= existingEntry->second->compressedData.size();
+        sO2rCacheBytes -= existingEntry->second->compressedData->size();
         sO2rCache.erase(existingEntry->second);
         sO2rCacheIndex.erase(existingEntry);
     }
 
-    while (sO2rCacheBytes + compressedData.size() > kO2rCacheMaxBytes && !sO2rCache.empty()) {
+    while (sO2rCacheBytes + compressedData->size() > kO2rCacheMaxBytes && !sO2rCache.empty()) {
         auto leastRecentlyUsed = std::prev(sO2rCache.end());
-        sO2rCacheBytes -= leastRecentlyUsed->compressedData.size();
+        sO2rCacheBytes -= leastRecentlyUsed->compressedData->size();
         sO2rCacheIndex.erase(leastRecentlyUsed->key);
         sO2rCache.pop_back();
     }
 
     sO2rCache.push_front({ key, compressedData, compMethod, uncompressedSize });
     sO2rCacheIndex.emplace(sO2rCache.front().key, sO2rCache.begin());
-    sO2rCacheBytes += compressedData.size();
+    sO2rCacheBytes += compressedData->size();
     OSFastMutex_Unlock(&sO2rCacheMutex);
 }
 
@@ -162,7 +162,7 @@ static void O2rCacheClear(const O2rArchive* archive) {
     OSFastMutex_Lock(&sO2rCacheMutex);
     for (auto cacheEntry = sO2rCache.begin(); cacheEntry != sO2rCache.end();) {
         if (cacheEntry->key.archive == archive) {
-            sO2rCacheBytes -= cacheEntry->compressedData.size();
+            sO2rCacheBytes -= cacheEntry->compressedData->size();
             sO2rCacheIndex.erase(cacheEntry->key);
             cacheEntry = sO2rCache.erase(cacheEntry);
         } else {
@@ -415,12 +415,12 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
     const bool readCompressed =
         zipEntryStat.comp_method == ZIP_CM_STORE || zipEntryStat.comp_method == ZIP_CM_DEFLATE;
-    std::vector<char> compressedData;
+    std::shared_ptr<std::vector<char>> compressedData;
     bool cacheHit = false;
     if (readCompressed) {
         cacheHit = O2rCacheLoad(this, filePath, compressedData, zipEntryStat.comp_method, zipEntryStat.size);
         if (cacheHit) {
-            zipEntryStat.comp_size = compressedData.size();
+            zipEntryStat.comp_size = compressedData->size();
         }
     }
 
@@ -459,16 +459,15 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #endif
 
     auto fileToLoad = std::make_shared<File>();
-    fileToLoad->Buffer = std::make_shared<std::vector<char>>(zipEntryStat.size);
 
 #ifdef __WIIU__
     if (readCompressed) {
         if (!cacheHit) {
-            compressedData.resize(zipEntryStat.comp_size);
+            compressedData = std::make_shared<std::vector<char>>(zipEntryStat.comp_size);
 #if WIIU_DIAGNOSTICS
             const OSTime readStart = OSGetSystemTime();
 #endif
-            const zip_int64_t bytesRead = zip_fread(zipEntryFile, compressedData.data(), zipEntryStat.comp_size);
+            const zip_int64_t bytesRead = zip_fread(zipEntryFile, compressedData->data(), zipEntryStat.comp_size);
 #if WIIU_DIAGNOSTICS
             const uint64_t readMicroseconds = OSTicksToMicroseconds(OSGetSystemTime() - readStart);
             sO2rReadMicroseconds.fetch_add(readMicroseconds, std::memory_order_relaxed);
@@ -489,12 +488,13 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         if (zipEntryStat.comp_method == ZIP_CM_STORE) {
             outputSize = zipEntryStat.comp_size;
             if (outputSize == zipEntryStat.size) {
-                std::memcpy(fileToLoad->Buffer->data(), compressedData.data(), outputSize);
+                fileToLoad->Buffer = compressedData;
             }
         } else {
+            fileToLoad->Buffer = std::make_shared<std::vector<char>>(zipEntryStat.size);
             z_stream stream{};
-            stream.next_in = reinterpret_cast<Bytef*>(compressedData.data());
-            stream.avail_in = static_cast<uInt>(compressedData.size());
+            stream.next_in = reinterpret_cast<Bytef*>(compressedData->data());
+            stream.avail_in = static_cast<uInt>(compressedData->size());
             stream.next_out = reinterpret_cast<Bytef*>(fileToLoad->Buffer->data());
             stream.avail_out = static_cast<uInt>(fileToLoad->Buffer->size());
 
@@ -520,6 +520,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
             return nullptr;
         }
     } else {
+        fileToLoad->Buffer = std::make_shared<std::vector<char>>(zipEntryStat.size);
 #if WIIU_DIAGNOSTICS
         const OSTime readStart = OSGetSystemTime();
 #endif
