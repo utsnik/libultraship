@@ -1063,6 +1063,15 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
                 snprintf(hex[1] + 2 * k, 3, "%02X", back_bytes[k]);
             }
             SPDLOG_INFO("BCCHECK block0 src={} back={}", hex[0], hex[1]);
+            // Raw tiled bytes at offset 0 (element 0,0 for this tiling) and the texture resource words: WORD4 holds
+            // ENDIAN_SWAP, which would explain a format-specific byte order the symmetric round trip cannot see.
+            char tiled_hex[2 * 32 + 1];
+            for (uint32_t k = 0; k < 32; ++k) {
+                snprintf(tiled_hex + 2 * k, 3, "%02X", tiled[k]);
+            }
+            SPDLOG_INFO("BCCHECK tiled0={} regs={:08X} {:08X} {:08X} {:08X} {:08X}", tiled_hex,
+                        tex->texture.regs[0], tex->texture.regs[1], tex->texture.regs[2], tex->texture.regs[3],
+                        tex->texture.regs[4]);
             free(back.image);
         }
     }
