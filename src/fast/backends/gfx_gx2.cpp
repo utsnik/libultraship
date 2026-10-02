@@ -890,6 +890,9 @@ struct BcWatch {
     uint8_t* snapshot;
 };
 static std::vector<BcWatch> bc_watches;
+// coreinit export (no wut header): hardware data breakpoint, 8-byte granule. A CPU store to the armed address raises
+// a DSI that the crash reporter logs with the writer's PC; GPU writes do not trap.
+extern "C" BOOL OSSetDABR(BOOL allCores, uint32_t address, BOOL matchReads, BOOL matchWrites);
 static uint32_t bc_hash(const void* p, uint32_t n) {
     const uint32_t* w = static_cast<const uint32_t*>(p);
     uint32_t h = 2166136261u;
@@ -906,6 +909,9 @@ static void bc_watch_add(GX2TextureEntry* tex, uint32_t width, uint32_t height) 
         }
         bc_watches.push_back({ tex, tex->texture.surface.image, tex->texture.surface.imageSize, width, height,
                                bc_hash(tex->texture.surface.image, tex->texture.surface.imageSize), 0, snap });
+        // Offset 0 was overwritten in every corrupted surface (2026-10-02); the latest large upload wins the DABR.
+        OSSetDABR(TRUE, (uint32_t)(uintptr_t)tex->texture.surface.image & ~7u, FALSE, TRUE);
+        SPDLOG_INFO("BCDABR armed {}x{} at {}", width, height, tex->texture.surface.image);
     }
 }
 static void bc_watch_tick() {
@@ -919,6 +925,7 @@ static void bc_watch_tick() {
             SPDLOG_INFO("BCWATCH {}x{} slot reallocated before check", w.width, w.height);
             continue;
         }
+        OSSetDABR(TRUE, 0, FALSE, FALSE);  // dcbi counts as a store; disarm before our own cache operation
         DCInvalidateRange(w.image, w.size);
         const uint32_t now = bc_hash(w.image, w.size);
         SPDLOG_INFO("BCWATCH {}x{} ptr={} size=0x{:X} align={} {}", w.width, w.height, w.image, w.size,
