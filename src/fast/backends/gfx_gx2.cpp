@@ -1631,7 +1631,7 @@ static void gfx_gx2_end_frame(void) {
     // without this the copy below can overwrite the scan buffer that swap is about to
     // show (GamePad tearing). The draws are already flushed, so the GPU keeps working
     // while we wait. Off switch for A/B runs: gWiiU.CopyAfterFlip 0.
-    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.CopyAfterFlip", 1)) {
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.CopyAfterFlip", 1)) {
         uint32_t swap_count, flip_count;
         OSTime last_flip, last_vsync;
         for (int waits = 0; waits < 10; waits++) {
