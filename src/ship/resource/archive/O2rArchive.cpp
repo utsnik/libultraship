@@ -754,22 +754,23 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     const bool readCompressed =
         zipEntryStat.comp_method == ZIP_CM_STORE || zipEntryStat.comp_method == ZIP_CM_DEFLATE;
     auto fileToLoad = std::make_shared<File>();
+    std::shared_ptr<std::vector<char>> compressedData;
+    bool cacheHit = false;
+    if (readCompressed) {
+        cacheHit = O2rCacheLoad(this, filePath, compressedData, zipEntryStat.comp_method, zipEntryStat.size);
+        if (cacheHit) {
+            zipEntryStat.comp_size = compressedData->size();
+        }
+    }
+
+    // The O2R cache first: a hit costs no SD access at all. Exact reads only replace the libzip SD path.
     bool exactLoaded = false;
-    if (O2rPreloadCVar("gWiiU.O2rExactReads", 1) != 0 && readCompressed && zipEntryIndex >= 0 &&
+    if (!cacheHit && O2rPreloadCVar("gWiiU.O2rExactReads", 1) != 0 && readCompressed && zipEntryIndex >= 0 &&
         static_cast<size_t>(zipEntryIndex) < mExactReadEntries.size()) {
         const ExactReadEntry& exactEntry = mExactReadEntries[static_cast<size_t>(zipEntryIndex)];
         if (mExactReadFd >= 0 && exactEntry.compressedSize == zipEntryStat.comp_size &&
             exactEntry.uncompressedSize == zipEntryStat.size && exactEntry.method == zipEntryStat.comp_method) {
             exactLoaded = LoadExactFile(static_cast<size_t>(zipEntryIndex), *fileToLoad, hitchReadMicroseconds);
-        }
-    }
-
-    std::shared_ptr<std::vector<char>> compressedData;
-    bool cacheHit = false;
-    if (!exactLoaded && readCompressed) {
-        cacheHit = O2rCacheLoad(this, filePath, compressedData, zipEntryStat.comp_method, zipEntryStat.size);
-        if (cacheHit) {
-            zipEntryStat.comp_size = compressedData->size();
         }
     }
 
