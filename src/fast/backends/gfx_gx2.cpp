@@ -936,7 +936,7 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
         tex->texture.surface.mipLevels = 1;
         tex->texture.surface.format = format;
         tex->texture.surface.aa = GX2_AA_MODE1X;
-        tex->texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        tex->texture.surface.tileMode = GX2_TILE_MODE_DEFAULT;
         tex->texture.viewFirstMip = 0;
         tex->texture.viewNumMips = 1;
         tex->texture.viewFirstSlice = 0;
@@ -965,14 +965,37 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
         return;
     }
 
-    const size_t row_bytes = static_cast<size_t>(blocks_wide) * block_bytes;
-    const size_t pitch_bytes = static_cast<size_t>(tex->texture.surface.pitch) * block_bytes;
-    const size_t needed = blocks_high == 0 ? 0 : (static_cast<size_t>(blocks_high - 1) * pitch_bytes) + row_bytes;
-    if (needed > tex->texture.surface.imageSize) {
-        SPDLOG_ERROR("gfx_gx2: refusing BC texture upload that would overrun the surface");
+    GX2Surface staging = {};
+    staging.use = GX2_SURFACE_USE_TEXTURE;
+    staging.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    staging.width = width;
+    staging.height = height;
+    staging.depth = 1;
+    staging.mipLevels = 1;
+    staging.format = format;
+    staging.aa = GX2_AA_MODE1X;
+    staging.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&staging);
+
+    WDOG_ENTER(::Ship::WiiU::Watchdog::PH_TEX_ALLOC, nullptr);
+    staging.image = memalign(staging.alignment, staging.imageSize);
+    WDOG_TEXALLOC(staging.image, staging.imageSize);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_ALLOC);
+    if (!staging.image) {
+        SPDLOG_ERROR("gfx_gx2: BC texture upload staging allocation failed");
         return;
     }
 
+    const size_t row_bytes = static_cast<size_t>(blocks_wide) * block_bytes;
+    const size_t pitch_bytes = static_cast<size_t>(staging.pitch) * block_bytes;
+    const size_t needed = blocks_high == 0 ? 0 : (static_cast<size_t>(blocks_high - 1) * pitch_bytes) + row_bytes;
+    if (needed > staging.imageSize) {
+        SPDLOG_ERROR("gfx_gx2: refusing BC texture upload that would overrun the surface");
+        gfx_gx2_defer_image_free(staging.image, staging.imageSize);
+        return;
+    }
+
+    buf = static_cast<uint8_t*>(staging.image);
     for (uint32_t y = 0; y < blocks_high; ++y) {
         memcpy(buf + (static_cast<size_t>(y) * pitch_bytes), compressed_buf + (static_cast<size_t>(y) * row_bytes),
                row_bytes);
@@ -982,11 +1005,13 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
         SPDLOG_INFO("gfx_gx2: first BC texture: GX2Invalidate ...");
     }
     WDOG_ENTER_FMT(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD, "GX2Invalidate BC ptr=0x%08X size=%u %ux%u pitch=%u",
-                   (unsigned int)(uintptr_t)tex->texture.surface.image,
-                   (unsigned int)tex->texture.surface.imageSize, (unsigned int)width, (unsigned int)height,
-                   (unsigned int)tex->texture.surface.pitch);
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
+                   (unsigned int)(uintptr_t)staging.image, (unsigned int)staging.imageSize, (unsigned int)width,
+                   (unsigned int)height, (unsigned int)staging.pitch);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, staging.image, staging.imageSize);
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
+    GX2CopySurface(&staging, 0, 0, &tex->texture.surface, 0, 0);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
+    gfx_gx2_defer_image_free(staging.image, staging.imageSize);
     ++perf_texture_uploads;
 #if WIIU_DIAGNOSTICS
     Ship::WiiU::Watchdog::RecordTextureUpload(
