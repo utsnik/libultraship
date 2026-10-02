@@ -1130,26 +1130,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes, texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3) };
     }
 
-    const bool texHit = TextureCacheLookup(i, key);
-#if defined(__WIIU__) && WIIU_DIAGNOSTICS
-    // BC investigation (2026-10-02): Kokiri walls sometimes never took the BC path. Log every cache miss and the
-    // first hit per key for Kokiri scene textures: path, flags, region, tile and the texture id (slot) it landed in.
-    if (metadata->resource != nullptr) {
-        static uint32_t texlog_lines = 0;
-        static std::set<std::tuple<const uint8_t*, uint32_t, uint32_t, int>> texlog_hits;
-        const std::string& texPath = metadata->resource->GetInitData()->Path;
-        if (texlog_lines < 3000 && texPath.find("spot04") != std::string::npos &&
-            (!texHit || texlog_hits.insert({ origAddr, origSizeBytes, texFlags, i }).second)) {
-            ++texlog_lines;
-            SPDLOG_INFO("TEXLOG {} i={} tile={} id={} flags=0x{:X} {}x{} fmt={} siz={} line={} orig={} off={} repl={} {}",
-                        texHit ? "hit" : "miss", i, tile, mRenderingState.mTextures[i]->second.texture_id, texFlags,
-                        metadata->width, metadata->height, fmt, siz, mRdp->texture_tile[tile].line_size_bytes,
-                        origSizeBytes, (long)(origAddr - metadata->resource->ImageData), importReplacement ? 1 : 0,
-                        texPath);
-        }
-    }
-#endif
-    if (texHit) {
+    if (TextureCacheLookup(i, key)) {
         return;
     }
 
