@@ -1018,9 +1018,10 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
     // One-time round trip on the first large BC upload: copy the tiled surface back to a linear one and compare it
     // with the source blocks. Large BC textures rendered as garbage (2026-10-02); this tells "bytes never arrive"
     // apart from "bytes arrive but are sampled wrong". A symmetric mis-swizzle would still pass.
-    static bool bc_roundtrip_checked = false;
-    if (!bc_roundtrip_checked && width >= 1024) {
-        bc_roundtrip_checked = true;
+    // Once per format: BC1 at >= 1024 px, BC3 at any size (BC3 drew wrong colours on 2026-10-02 while BC1 was right).
+    static bool bc_roundtrip_checked[2] = { false, false };
+    if (!bc_roundtrip_checked[bc3 ? 1 : 0] && (bc3 || width >= 1024)) {
+        bc_roundtrip_checked[bc3 ? 1 : 0] = true;
         GX2Surface back = staging;
         back.image = memalign(back.alignment, back.imageSize);
         if (back.image) {
@@ -1055,6 +1056,13 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
                         tex->texture.surface.pitch, staging.pitch, tex->texture.surface.imageSize,
                         tex->texture.surface.swizzle, bad_rows, blocks_high, fill_rows,
                         first_bad == UINT32_MAX ? -1 : (int)first_bad, tiled_zero);
+            // First source block and its round-tripped copy, to see how a bad block differs.
+            char hex[2][2 * 16 + 1];
+            for (uint32_t k = 0; k < block_bytes; ++k) {
+                snprintf(hex[0] + 2 * k, 3, "%02X", compressed_buf[k]);
+                snprintf(hex[1] + 2 * k, 3, "%02X", back_bytes[k]);
+            }
+            SPDLOG_INFO("BCCHECK block0 src={} back={}", hex[0], hex[1]);
             free(back.image);
         }
     }
