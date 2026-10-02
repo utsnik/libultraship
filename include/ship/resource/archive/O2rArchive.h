@@ -91,6 +91,7 @@ class O2rArchive final : virtual public Archive {
         uint32_t loads = 0;
         uint64_t compressedBytes = 0;
         uint64_t readMicroseconds = 0;
+        uint64_t loadMicroseconds = 0;
         uint32_t archiveCount = 0;
         HitchArchiveStats topArchives[3]{};
     };

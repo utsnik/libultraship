@@ -1624,11 +1624,12 @@ void ReportHitchFrame(uint32_t renderMicroseconds, int32_t scene) {
     }
     ++sHitchBurstLines;
 
-    Emit("HITCH: frameMs=%u renderMs=%u scene=0x%08X o2rLoads=%u o2rKB=%u o2rReadMs=%u "
+    Emit("HITCH: frameMs=%u renderMs=%u scene=0x%08X o2rLoads=%u o2rKB=%u o2rReadMs=%u o2rLoadMs=%u "
          "topReadMs=%s:%u,%s:%u,%s:%u resourceMs=%u xmlMs=%u xmlRes=%u binRes=%u texUploads=%u texMs=%u "
          "shaders=%u\n",
          (microseconds + 500) / 1000, (renderMicroseconds + 500) / 1000, static_cast<uint32_t>(scene), o2r.loads,
          static_cast<uint32_t>(o2r.compressedBytes / 1024), static_cast<uint32_t>(o2r.readMicroseconds / 1000),
+         static_cast<uint32_t>(o2r.loadMicroseconds / 1000),
          o2r.topArchives[0].name[0] ? o2r.topArchives[0].name : "-",
          static_cast<uint32_t>(o2r.topArchives[0].readMicroseconds / 1000),
          o2r.topArchives[1].name[0] ? o2r.topArchives[1].name : "-",

@@ -14,6 +14,7 @@
 #include <coreinit/time.h>
 #endif
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <iterator>
 #include <list>
@@ -42,6 +43,7 @@ static std::atomic<uint32_t> sO2rRepeatCompressedBytes{ 0 };
 static std::atomic<uint32_t> sO2rHitchLoadCount{ 0 };
 static std::atomic<uint32_t> sO2rHitchCompressedBytes{ 0 };
 static std::atomic<uint32_t> sO2rHitchReadMicroseconds{ 0 };
+static std::atomic<uint32_t> sO2rHitchLoadMicroseconds{ 0 };
 static std::unordered_set<std::string> sO2rLoadedPaths;
 static OSFastMutex sO2rLoadedPathsMutex;
 
@@ -326,6 +328,7 @@ O2rArchive::HitchStats O2rArchive::GetHitchStats() {
     stats.loads = sO2rHitchLoadCount.exchange(0, std::memory_order_relaxed);
     stats.compressedBytes = sO2rHitchCompressedBytes.exchange(0, std::memory_order_relaxed);
     stats.readMicroseconds = sO2rHitchReadMicroseconds.exchange(0, std::memory_order_relaxed);
+    stats.loadMicroseconds = sO2rHitchLoadMicroseconds.exchange(0, std::memory_order_relaxed);
 
     for (auto& archive : sO2rArchiveStats) {
         if (archive.second.hitchReadMicroseconds != 0) {
@@ -619,6 +622,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     sO2rHitchLoadCount.fetch_add(1, std::memory_order_relaxed);
     sO2rHitchCompressedBytes.fetch_add(zipEntryStat.comp_size, std::memory_order_relaxed);
     sO2rHitchReadMicroseconds.fetch_add(hitchReadMicroseconds, std::memory_order_relaxed);
+    sO2rHitchLoadMicroseconds.fetch_add(loadMicroseconds, std::memory_order_relaxed);
     auto& archiveStats = sO2rArchiveStats[archiveName];
     archiveStats.loads++;
     archiveStats.cacheHits += cacheHit ? 1 : 0;
@@ -818,10 +822,18 @@ bool O2rArchive::Open() {
 
         // Unbuffered made zip_open parse the central directory with one FSA read per entry (oot.o2r:
         // ~23 s instead of 0.7 s, soh923p12). 16 KiB lets one read cover a small entry's local header
-        // and its data, without paying a large transfer per random-access load.
-        void* stdioBuffer = memalign(0x40, kO2rStdioBufferSize);
+        // and its data, without paying a large transfer per random-access load. HD texture packs have
+        // entries larger than that (MM Reloaded: median 34 KiB compressed), so each load costs several
+        // SD requests; gWiiU.O2rStdioBufferKB (4..1024, default 16) sizes the buffer for measuring that.
+        // Always memalign'd: a large buffer from setvbuf(nullptr) faults in _free_r at fclose.
+        const size_t stdioBufferSize =
+            static_cast<size_t>(std::clamp(O2rPreloadCVar("gWiiU.O2rStdioBufferKB",
+                                                          static_cast<int32_t>(kO2rStdioBufferSize / 1024)),
+                                           4, 1024)) *
+            1024;
+        void* stdioBuffer = memalign(0x40, stdioBufferSize);
         if (stdioBuffer == nullptr ||
-            std::setvbuf(archiveFile, static_cast<char*>(stdioBuffer), _IOFBF, kO2rStdioBufferSize) != 0) {
+            std::setvbuf(archiveFile, static_cast<char*>(stdioBuffer), _IOFBF, stdioBufferSize) != 0) {
             std::fclose(archiveFile);
             free(stdioBuffer);
             SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
