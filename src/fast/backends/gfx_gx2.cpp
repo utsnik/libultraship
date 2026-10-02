@@ -735,8 +735,11 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
         return;
     }
 
+    // A texture id can be reused after holding a BC (tiled, compressed) surface of the same size; copying RGBA rows into
+    // that surface draws garbage with no alpha, so the format and tile mode must match too, not just the size.
     if ((tex->texture.surface.width != width) || (tex->texture.surface.height != height) ||
-        !tex->texture.surface.image) {
+        (tex->texture.surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8) ||
+        (tex->texture.surface.tileMode != GX2_TILE_MODE_LINEAR_ALIGNED) || !tex->texture.surface.image) {
 
         if (tex->texture.surface.image) {
             // The GPU may still be sampling this texture from an earlier draw.
