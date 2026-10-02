@@ -1013,7 +1013,12 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, staging.image, staging.imageSize);
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
     GX2CopySurface(&staging, 0, 0, &tex->texture.surface, 0, 0);
-    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
+    // GX2CopySurface writes the destination through the colour-buffer path: flush the CB cache to memory as well as
+    // invalidating the texture cache, or the first draws sample whatever the fresh allocation held (2026-10-02: BC
+    // triangles broken or fine from run to run, other textures showing through; the round-trip check's GX2DrawDone
+    // flushed everything, so it always passed).
+    GX2Invalidate(static_cast<GX2InvalidateMode>(GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE),
+                  tex->texture.surface.image, tex->texture.surface.imageSize);
 #if WIIU_DIAGNOSTICS
     // One-time round trip on the first large BC upload: copy the tiled surface back to a linear one and compare it
     // with the source blocks. Large BC textures rendered as garbage (2026-10-02); this tells "bytes never arrive"
