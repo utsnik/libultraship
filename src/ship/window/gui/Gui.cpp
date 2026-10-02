@@ -936,6 +936,15 @@ void Gui::LoadGuiTexture(const std::string& name, const Fast::Texture& res, cons
     std::vector<uint8_t> texBuffer;
     texBuffer.reserve(res.Width * res.Height * 4);
 
+    if ((res.Flags & (TEX_FLAG_BC1 | TEX_FLAG_BC3)) != 0) {
+        static bool unsupported_logged = false;
+        if (!unsupported_logged) {
+            SPDLOG_WARN("ImGui::LoadGuiTexture: CPU texture access does not support BC data; skipping");
+            unsupported_logged = true;
+        }
+        return;
+    }
+
     // For HD textures we need to load the buffer raw (similar to inside gfx_pp)
     if ((res.Flags & TEX_FLAG_LOAD_AS_RAW) != 0) {
         // Raw loading doesn't support TLUT textures

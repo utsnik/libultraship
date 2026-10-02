@@ -179,13 +179,16 @@ struct TextureCacheKey {
     uint8_t fmt, siz;
     uint8_t palette_index;
     uint32_t size_bytes;
+    uint32_t texture_flags;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
     struct Hasher {
         size_t operator()(const TextureCacheKey& key) const noexcept {
             uintptr_t addr = (uintptr_t)key.texture_addr;
-            return (size_t)(addr ^ (addr >> 5));
+            size_t hash = (size_t)(addr ^ (addr >> 5));
+            hash ^= (size_t)key.texture_flags + (hash << 6) + (hash >> 2);
+            return hash;
         }
     };
 };

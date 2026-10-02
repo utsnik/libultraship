@@ -66,6 +66,10 @@ class GfxRenderingAPIGX2 : public GfxRenderingAPI {
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
+#ifdef __WIIU__
+    void UploadTextureCompressed(const uint8_t* compressedBuf, uint32_t width, uint32_t height, uint32_t flags,
+                                 uint32_t dataSize) override;
+#endif
     void SetSamplerParameters(int sampler, bool linearFilter, uint32_t cms, uint32_t cmt) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;

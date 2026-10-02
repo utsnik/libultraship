@@ -877,6 +877,135 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
     }
 }
 
+#ifdef __WIIU__
+static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uint32_t width, uint32_t height,
+                                              uint32_t flags, uint32_t data_size) {
+    WDOG_SCOPE_FMT(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD_FN, "%ux%u BC path=%s", (unsigned int)width,
+                   (unsigned int)height, WDOG_TEXTURE_DETAIL());
+#if WIIU_DIAGNOSTICS
+    const OSTime uploadStart = OSGetSystemTime();
+#endif
+    static bool trace_first_compressed_upload = true;
+    const bool trace = trace_first_compressed_upload;
+    struct GX2TextureEntry* tex = current_texture;
+    if (!tex) {
+        SPDLOG_ERROR("gfx_gx2: compressed texture upload requested without a current texture");
+        return;
+    }
+
+    const bool bc1 = (flags & TEX_FLAG_BC1) != 0;
+    const bool bc3 = (flags & TEX_FLAG_BC3) != 0;
+    static bool invalid_format_logged = false;
+    if (bc1 == bc3 || width == 0 || height == 0 || (width & 3) != 0 || (height & 3) != 0) {
+        if (!invalid_format_logged) {
+            SPDLOG_ERROR("gfx_gx2: invalid BC texture format or dimensions (flags=0x{:X}, size={}x{})", flags, width,
+                         height);
+            invalid_format_logged = true;
+        }
+        return;
+    }
+
+    const uint32_t block_bytes = bc1 ? 8 : 16;
+    const uint32_t blocks_wide = width / 4;
+    const uint32_t blocks_high = height / 4;
+    const size_t expected_size = static_cast<size_t>(blocks_wide) * blocks_high * block_bytes;
+    static bool invalid_size_logged = false;
+    if (compressed_buf == nullptr || data_size != expected_size) {
+        if (!invalid_size_logged) {
+            SPDLOG_ERROR("gfx_gx2: invalid BC texture payload (declared={}, expected={})", data_size, expected_size);
+            invalid_size_logged = true;
+        }
+        return;
+    }
+
+    const auto format = bc1 ? GX2_SURFACE_FORMAT_UNORM_BC1 : GX2_SURFACE_FORMAT_UNORM_BC3;
+    if ((tex->texture.surface.width != width) || (tex->texture.surface.height != height) ||
+        (tex->texture.surface.format != format) || !tex->texture.surface.image) {
+        if (tex->texture.surface.image) {
+            gfx_gx2_defer_image_free(tex->texture.surface.image, tex->texture.surface.imageSize);
+            tex->texture.surface.image = nullptr;
+        }
+
+        tex->texture_uploaded = false;
+        memset(&tex->texture, 0, sizeof(GX2Texture));
+        tex->texture.surface.use = GX2_SURFACE_USE_TEXTURE;
+        tex->texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        tex->texture.surface.width = width;
+        tex->texture.surface.height = height;
+        tex->texture.surface.depth = 1;
+        tex->texture.surface.mipLevels = 1;
+        tex->texture.surface.format = format;
+        tex->texture.surface.aa = GX2_AA_MODE1X;
+        tex->texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        tex->texture.viewFirstMip = 0;
+        tex->texture.viewNumMips = 1;
+        tex->texture.viewFirstSlice = 0;
+        tex->texture.viewNumSlices = 1;
+        tex->texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+
+        if (trace) {
+            SPDLOG_INFO("gfx_gx2: first BC texture: GX2CalcSurfaceSizeAndAlignment ...");
+        }
+        GX2CalcSurfaceSizeAndAlignment(&tex->texture.surface);
+        GX2InitTextureRegs(&tex->texture);
+
+        WDOG_ENTER(::Ship::WiiU::Watchdog::PH_TEX_ALLOC, nullptr);
+        tex->texture.surface.image = memalign(tex->texture.surface.alignment, tex->texture.surface.imageSize);
+        WDOG_TEXALLOC(tex->texture.surface.image, tex->texture.surface.imageSize);
+        if (tex->texture.surface.image == nullptr) {
+            SPDLOG_ERROR("gfx_gx2: BC texture allocation failed dimensions={}x{} imageSize={}", width, height,
+                         tex->texture.surface.imageSize);
+        }
+        WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_ALLOC);
+    }
+
+    uint8_t* buf = static_cast<uint8_t*>(tex->texture.surface.image);
+    if (!buf) {
+        SPDLOG_ERROR("gfx_gx2: BC texture upload allocation failed");
+        return;
+    }
+
+    const size_t row_bytes = static_cast<size_t>(blocks_wide) * block_bytes;
+    const size_t pitch_bytes = static_cast<size_t>(tex->texture.surface.pitch) * block_bytes;
+    const size_t needed = blocks_high == 0 ? 0 : (static_cast<size_t>(blocks_high - 1) * pitch_bytes) + row_bytes;
+    if (needed > tex->texture.surface.imageSize) {
+        SPDLOG_ERROR("gfx_gx2: refusing BC texture upload that would overrun the surface");
+        return;
+    }
+
+    for (uint32_t y = 0; y < blocks_high; ++y) {
+        memcpy(buf + (static_cast<size_t>(y) * pitch_bytes), compressed_buf + (static_cast<size_t>(y) * row_bytes),
+               row_bytes);
+    }
+
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first BC texture: GX2Invalidate ...");
+    }
+    WDOG_ENTER_FMT(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD, "GX2Invalidate BC ptr=0x%08X size=%u %ux%u pitch=%u",
+                   (unsigned int)(uintptr_t)tex->texture.surface.image,
+                   (unsigned int)tex->texture.surface.imageSize, (unsigned int)width, (unsigned int)height,
+                   (unsigned int)tex->texture.surface.pitch);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
+    WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
+    ++perf_texture_uploads;
+#if WIIU_DIAGNOSTICS
+    Ship::WiiU::Watchdog::RecordTextureUpload(
+        static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - uploadStart)));
+#endif
+
+    if (current_shader_program && current_shader_program->samplers_location[current_tile] != -1) {
+        gfx_gx2_set_pixel_texture(current_tile, current_shader_program->samplers_location[current_tile], &tex->texture);
+    }
+
+    tex->texture_uploaded = true;
+    tile_bound_texture[current_tile] = &tex->texture;
+    if (trace) {
+        SPDLOG_INFO("gfx_gx2: first BC texture upload complete size={}x{}", width, height);
+        trace_first_compressed_upload = false;
+    }
+}
+#endif // __WIIU__
+
 static GX2TexClampMode gfx_cm_to_gx2(uint32_t val) {
     switch (val) {
         case G_TX_NOMIRROR | G_TX_CLAMP:
@@ -2066,6 +2195,12 @@ void GfxRenderingAPIGX2::SelectTexture(int tile, uint32_t textureId) {
 void GfxRenderingAPIGX2::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
     gfx_gx2_upload_texture(rgba32Buf, width, height);
 }
+#ifdef __WIIU__
+void GfxRenderingAPIGX2::UploadTextureCompressed(const uint8_t* compressedBuf, uint32_t width, uint32_t height,
+                                                 uint32_t flags, uint32_t dataSize) {
+    gfx_gx2_upload_texture_compressed(compressedBuf, width, height, flags, dataSize);
+}
+#endif
 void GfxRenderingAPIGX2::SetSamplerParameters(int sampler, bool linearFilter, uint32_t cms, uint32_t cmt) {
     gfx_gx2_set_sampler_parameters(sampler, linearFilter, cms, cmt);
 }

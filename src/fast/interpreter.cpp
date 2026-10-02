@@ -558,21 +558,13 @@ std::string_view Interpreter::GetBaseTexturePath(const std::string& path) {
 }
 
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
-    while (mTextureCache.map.bucket_count() > 0) {
-        TextureCacheKey key = { origAddr, { 0 }, 0, 0, 0 }; // bucket index only depends on the address
-        size_t bucket = mTextureCache.map.bucket(key);
-        bool again = false;
-        for (auto it = mTextureCache.map.begin(bucket); it != mTextureCache.map.end(bucket); ++it) {
-            if (it->first.texture_addr == origAddr) {
-                mTextureCache.lru.erase(it->second.lru_location);
-                mTextureCache.free_texture_ids.push_back(it->second.texture_id);
-                mTextureCache.map.erase(it->first);
-                again = true;
-                break;
-            }
-        }
-        if (!again) {
-            break;
+    for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end();) {
+        if (it->first.texture_addr == origAddr) {
+            mTextureCache.lru.erase(it->second.lru_location);
+            mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+            it = mTextureCache.map.erase(it);
+        } else {
+            ++it;
         }
     }
     WDOG_TEXTURE_CACHE_SIZES(mTextureCache.map.size(), mTextureCache.free_texture_ids.size());
@@ -1132,12 +1124,30 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
 
     TextureCacheKey key;
     if (fmt == G_IM_FMT_CI) {
-        key = { origAddr, { mRdp->palettes[0], mRdp->palettes[1] }, fmt, siz, paletteIndex, origSizeBytes };
+        key = { origAddr, { mRdp->palettes[0], mRdp->palettes[1] }, fmt, siz, paletteIndex, origSizeBytes,
+                texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3) };
     } else {
-        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
+        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes, texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3) };
     }
 
     if (TextureCacheLookup(i, key)) {
+        return;
+    }
+
+    const uint32_t compressedFlags = texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3);
+    if (compressedFlags != 0) {
+        static bool unsupported_logged = false;
+        if (compressedFlags == (TEX_FLAG_BC1 | TEX_FLAG_BC3) || (texFlags & TEX_FLAG_LOAD_AS_RAW) == 0 ||
+            (texFlags & TEX_FLAG_LOAD_AS_IMG) != 0 || metadata->resource == nullptr || importReplacement) {
+            if (!unsupported_logged) {
+                SPDLOG_WARN("Interpreter: unsupported BC texture path; skipping compressed texture data");
+                unsupported_logged = true;
+            }
+            return;
+        }
+
+        mRapi->UploadTextureCompressed(metadata->resource->ImageData, metadata->width, metadata->height,
+                                        compressedFlags, metadata->resource->ImageDataSize);
         return;
     }
 
@@ -1222,7 +1232,7 @@ void Interpreter::ImportTextureMask(int i, int tile) {
         return;
     }
 
-    TextureCacheKey key = { orig_addr, {}, 0, 0, 0, 0 };
+    TextureCacheKey key = { orig_addr, {}, 0, 0, 0, 0, 0 };
 
     if (TextureCacheLookup(i, key)) {
         return;
@@ -1837,29 +1847,37 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             uint8_t cms = mRdp->texture_tile[tile].cms;
             uint8_t cmt = mRdp->texture_tile[tile].cmt;
 
-            uint32_t tex_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
-            uint32_t line_size = mRdp->texture_tile[tile].line_size_bytes;
+            const auto& loaded_texture = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+            const uint32_t compressed_flags = loaded_texture.tex_flags & (TEX_FLAG_BC1 | TEX_FLAG_BC3);
 
-            if (line_size == 0) {
-                line_size = 1;
-            }
+            if (compressed_flags != 0 && loaded_texture.raw_tex_metadata.resource != nullptr) {
+                tex_width[i] = loaded_texture.raw_tex_metadata.width;
+                tex_height[i] = loaded_texture.raw_tex_metadata.height;
+            } else {
+                uint32_t tex_size_bytes = loaded_texture.orig_size_bytes;
+                uint32_t line_size = mRdp->texture_tile[tile].line_size_bytes;
 
-            tex_height[i] = tex_size_bytes / line_size;
-            switch (mRdp->texture_tile[tile].siz) {
-                case G_IM_SIZ_4b:
-                    line_size <<= 1;
-                    break;
-                case G_IM_SIZ_8b:
-                    break;
-                case G_IM_SIZ_16b:
-                    line_size /= G_IM_SIZ_16b_LINE_BYTES;
-                    break;
-                case G_IM_SIZ_32b:
-                    line_size /= G_IM_SIZ_32b_LINE_BYTES; // this is 2!
-                    tex_height[i] /= 2;
-                    break;
+                if (line_size == 0) {
+                    line_size = 1;
+                }
+
+                tex_height[i] = tex_size_bytes / line_size;
+                switch (mRdp->texture_tile[tile].siz) {
+                    case G_IM_SIZ_4b:
+                        line_size <<= 1;
+                        break;
+                    case G_IM_SIZ_8b:
+                        break;
+                    case G_IM_SIZ_16b:
+                        line_size /= G_IM_SIZ_16b_LINE_BYTES;
+                        break;
+                    case G_IM_SIZ_32b:
+                        line_size /= G_IM_SIZ_32b_LINE_BYTES; // this is 2!
+                        tex_height[i] /= 2;
+                        break;
+                }
+                tex_width[i] = line_size;
             }
-            tex_width[i] = line_size;
 
             tex_width2[i] = (mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4;
             tex_height2[i] = (mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4;
