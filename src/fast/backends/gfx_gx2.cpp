@@ -890,9 +890,7 @@ struct BcWatch {
     uint8_t* snapshot;
 };
 static std::vector<BcWatch> bc_watches;
-// coreinit export (no wut header): hardware data breakpoint, 8-byte granule. A CPU store to the armed address raises
-// a DSI that the crash reporter logs with the writer's PC; GPU writes do not trap.
-extern "C" BOOL OSSetDABR(BOOL allCores, uint32_t address, BOOL matchReads, BOOL matchWrites);
+
 static uint32_t bc_hash(const void* p, uint32_t n) {
     const uint32_t* w = static_cast<const uint32_t*>(p);
     uint32_t h = 2166136261u;
@@ -909,9 +907,6 @@ static void bc_watch_add(GX2TextureEntry* tex, uint32_t width, uint32_t height) 
         }
         bc_watches.push_back({ tex, tex->texture.surface.image, tex->texture.surface.imageSize, width, height,
                                bc_hash(tex->texture.surface.image, tex->texture.surface.imageSize), 0, snap });
-        // Offset 0 was overwritten in every corrupted surface (2026-10-02); the latest large upload wins the DABR.
-        OSSetDABR(TRUE, (uint32_t)(uintptr_t)tex->texture.surface.image & ~7u, FALSE, TRUE);
-        SPDLOG_INFO("BCDABR armed {}x{} at {}", width, height, tex->texture.surface.image);
     }
 }
 static void bc_watch_tick() {
@@ -925,7 +920,6 @@ static void bc_watch_tick() {
             SPDLOG_INFO("BCWATCH {}x{} slot reallocated before check", w.width, w.height);
             continue;
         }
-        OSSetDABR(TRUE, 0, FALSE, FALSE);  // dcbi counts as a store; disarm before our own cache operation
         DCInvalidateRange(w.image, w.size);
         const uint32_t now = bc_hash(w.image, w.size);
         SPDLOG_INFO("BCWATCH {}x{} ptr={} size=0x{:X} align={} {}", w.width, w.height, w.image, w.size,
@@ -1118,6 +1112,10 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
     // flushed everything, so it always passed).
     GX2Invalidate(static_cast<GX2InvalidateMode>(GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE),
                   tex->texture.surface.image, tex->texture.surface.imageSize);
+    // GX2CopySurface runs on the 3D pipeline and leaves its destination bound as the render target: without this the
+    // rest of the frame rendered into the BC texture (2026-10-02: half of the floor's blocks overwritten with rendered
+    // 64-bit pixels after the copy = the white/black triangles). Same restore as the depth-readback copy.
+    gfx_wiiu_set_context_state();
 #if WIIU_DIAGNOSTICS
     // One-time round trip on the first large BC upload: copy the tiled surface back to a linear one and compare it
     // with the source blocks. Large BC textures rendered as garbage (2026-10-02); this tells "bytes never arrive"
@@ -1132,6 +1130,7 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
             memset(back.image, 0xCD, back.imageSize);
             GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, back.image, back.imageSize);
             GX2CopySurface(&tex->texture.surface, 0, 0, &back, 0, 0);
+            gfx_wiiu_set_context_state();
             GX2DrawDone();
             DCInvalidateRange(back.image, back.imageSize);
             DCInvalidateRange(tex->texture.surface.image, tex->texture.surface.imageSize);
