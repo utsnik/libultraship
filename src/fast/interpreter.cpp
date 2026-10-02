@@ -4748,7 +4748,23 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
+#ifdef __WIIU__
+    // SegAddr's result used to be dereferenced unchecked; a fabricated G_VTX then raised an
+    // ALIGNMENT exception inside GfxSpVertex (seen in Banjo). Skip addresses below the start
+    // of the MEM1/MEM2 heaps or not 8-byte aligned, like the matrix handlers do.
+    const void* addr = gfx->SegAddr(cmd->words.w1);
+    if ((uintptr_t)addr < 0x01000000 || ((uintptr_t)addr & 7) != 0) {
+        static uint32_t sReported = 0;
+        if (sReported < 20) {
+            ++sReported;
+            SPDLOG_WARN("G_VTX: skipped invalid F3DEX vertex address {}", addr);
+        }
+        return false;
+    }
+    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)addr);
+#else
     gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+#endif
 
     return false;
 }
