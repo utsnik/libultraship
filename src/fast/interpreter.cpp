@@ -1146,8 +1146,57 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
             return;
         }
 
-        mRapi->UploadTextureCompressed(metadata->resource->ImageData, metadata->width, metadata->height,
-                                        compressedFlags, metadata->resource->ImageDataSize);
+        // Large N64 textures do not fit TMEM and are loaded in parts (e.g. a 64x64 RGBA16 in two 64x32 halves), each
+        // drawn with its own triangles. Like ImportTextureRaw, upload only the loaded region of the HD image; the
+        // load offset is in RGBA8888-equivalent bytes (h_byte_scale already applied), so crop whole 4x4 blocks.
+        const uint8_t* image = metadata->resource->ImageData;
+        const uint32_t blockBytes = (compressedFlags & TEX_FLAG_BC1) ? 8 : 16;
+        uint32_t origLineSize = mRdp->texture_tile[tile].line_size_bytes;
+        if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
+            origLineSize *= 2;
+        }
+        const uint32_t origHeight = origLineSize != 0 ? origSizeBytes / origLineSize : 0;
+        const uint32_t regionW = (uint32_t)(origLineSize * metadata->h_byte_scale) / 4;
+        uint32_t regionH = (uint32_t)(origHeight * metadata->v_pixel_scale);
+        const size_t offset = static_cast<size_t>(origAddr - image);
+        const uint32_t x0 = (uint32_t)((offset % (metadata->width * 4u)) / 4);
+        const uint32_t y0 = (uint32_t)(offset / (metadata->width * 4u));
+        if (y0 < metadata->height && regionH > metadata->height - y0) {
+            regionH = metadata->height - y0;
+        }
+
+        if (x0 == 0 && y0 == 0 && regionW == metadata->width && regionH == metadata->height) {
+            mRapi->UploadTextureCompressed(image, metadata->width, metadata->height, compressedFlags,
+                                            metadata->resource->ImageDataSize);
+            return;
+        }
+
+        static bool unaligned_logged = false;
+        if (regionW == 0 || regionH == 0 || ((x0 | y0 | regionW | regionH) & 3) != 0 || x0 + regionW > metadata->width ||
+            y0 >= metadata->height) {
+            if (!unaligned_logged) {
+                SPDLOG_WARN("Interpreter: BC texture load region {}x{} at {},{} of {}x{} is not block-aligned; "
+                            "uploading the whole image",
+                            regionW, regionH, x0, y0, metadata->width, metadata->height);
+                unaligned_logged = true;
+            }
+            mRapi->UploadTextureCompressed(image, metadata->width, metadata->height, compressedFlags,
+                                            metadata->resource->ImageDataSize);
+            return;
+        }
+
+        const size_t srcBlockRow = static_cast<size_t>(metadata->width / 4) * blockBytes;
+        const size_t dstBlockRow = static_cast<size_t>(regionW / 4) * blockBytes;
+        const size_t regionBytes = dstBlockRow * (regionH / 4);
+        if (!EnsureTexUploadBuffer(regionBytes)) {
+            return;
+        }
+        for (uint32_t row = 0; row < regionH / 4; ++row) {
+            memcpy(mTexUploadBuffer + row * dstBlockRow,
+                   image + (static_cast<size_t>(y0 / 4 + row) * srcBlockRow) + static_cast<size_t>(x0 / 4) * blockBytes,
+                   dstBlockRow);
+        }
+        mRapi->UploadTextureCompressed(mTexUploadBuffer, regionW, regionH, compressedFlags, (uint32_t)regionBytes);
         return;
     }
 
