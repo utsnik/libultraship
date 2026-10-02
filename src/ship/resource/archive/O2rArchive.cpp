@@ -189,7 +189,7 @@ static void O2rCacheGetStats(uint32_t& hits, uint64_t& hitBytes, size_t& cacheBy
 // wrapped malloc (ExpHeap from 64 KiB up) but fclose frees it with _free_r, which corrupted the heap
 // with a 128 KiB buffer (soh923p15). 0x40 alignment also lets wut's __wut_fsa_read fill it with one
 // FSAReadFile instead of splitting off an unaligned head through its 64-byte bounce buffer.
-constexpr size_t kO2rStdioBufferSize = 16 * 1024;
+constexpr size_t kO2rStdioBufferSize = 64 * 1024; // 2S2H title-intro A/B 2026-10-02: 64 KiB -13% hitch time vs 16, 256 KiB +22%
 static std::unordered_map<const void*, void*> sO2rStdioBuffers;
 
 struct O2rPreloadBuffer {
@@ -824,7 +824,7 @@ bool O2rArchive::Open() {
         // ~23 s instead of 0.7 s, soh923p12). 16 KiB lets one read cover a small entry's local header
         // and its data, without paying a large transfer per random-access load. HD texture packs have
         // entries larger than that (MM Reloaded: median 34 KiB compressed), so each load costs several
-        // SD requests; gWiiU.O2rStdioBufferKB (4..1024, default 16) sizes the buffer for measuring that.
+        // SD requests; gWiiU.O2rStdioBufferKB (4..1024, default 64) sizes the buffer for measuring that.
         // Always memalign'd: a large buffer from setvbuf(nullptr) faults in _free_r at fclose.
         const size_t stdioBufferSize =
             static_cast<size_t>(std::clamp(O2rPreloadCVar("gWiiU.O2rStdioBufferKB",
