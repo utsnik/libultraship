@@ -880,6 +880,49 @@ static void gfx_gx2_upload_texture(const uint8_t* rgba32_buf, uint32_t width, ui
     }
 }
 
+#if WIIU_DIAGNOSTICS
+// BC investigation (2026-10-02): does a large BC surface change after its copy completed (CPU cache write-back or a
+// stray writer)? Hash right after the copy (post GX2DrawDone) and again ~60 frames later.
+struct BcWatch {
+    GX2TextureEntry* tex;
+    void* image;
+    uint32_t size, width, height, hash, frames;
+};
+static std::vector<BcWatch> bc_watches;
+static uint32_t bc_hash(const void* p, uint32_t n) {
+    const uint32_t* w = static_cast<const uint32_t*>(p);
+    uint32_t h = 2166136261u;
+    for (uint32_t k = 0; k < n / 4; ++k) {
+        h = (h ^ w[k]) * 16777619u;
+    }
+    return h;
+}
+static void bc_watch_add(GX2TextureEntry* tex, uint32_t width, uint32_t height) {
+    if (bc_watches.size() < 32) {
+        bc_watches.push_back({ tex, tex->texture.surface.image, tex->texture.surface.imageSize, width, height,
+                               bc_hash(tex->texture.surface.image, tex->texture.surface.imageSize), 0 });
+    }
+}
+static void bc_watch_tick() {
+    size_t kept = 0;
+    for (BcWatch& w : bc_watches) {
+        if (++w.frames < 60) {
+            bc_watches[kept++] = w;
+            continue;
+        }
+        if (w.tex->texture.surface.image != w.image) {
+            SPDLOG_INFO("BCWATCH {}x{} slot reallocated before check", w.width, w.height);
+            continue;
+        }
+        DCInvalidateRange(w.image, w.size);
+        const uint32_t now = bc_hash(w.image, w.size);
+        SPDLOG_INFO("BCWATCH {}x{} ptr={} align={} {}", w.width, w.height, w.image,
+                    w.tex->texture.surface.alignment, now == w.hash ? "UNCHANGED" : "CHANGED after copy");
+    }
+    bc_watches.resize(kept);
+}
+#endif
+
 #ifdef __WIIU__
 static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uint32_t width, uint32_t height,
                                               uint32_t flags, uint32_t data_size) {
@@ -1012,6 +1055,9 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
                    (unsigned int)height, (unsigned int)staging.pitch);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, staging.image, staging.imageSize);
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
+    // The destination is written by the GPU: write back and drop any CPU cache lines the recycled allocation still
+    // holds (e.g. freed resource buffers), or a later eviction overwrites the copied blocks with stale data.
+    DCFlushRange(tex->texture.surface.image, tex->texture.surface.imageSize);
     GX2CopySurface(&staging, 0, 0, &tex->texture.surface, 0, 0);
     // GX2CopySurface writes the destination through the colour-buffer path: flush the CB cache to memory as well as
     // invalidating the texture cache, or the first draws sample whatever the fresh allocation held (2026-10-02: BC
@@ -1079,6 +1125,13 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
                         tex->texture.regs[4]);
             free(back.image);
         }
+    }
+#endif
+#if WIIU_DIAGNOSTICS
+    if (width >= 1024) {
+        GX2DrawDone();
+        DCInvalidateRange(tex->texture.surface.image, tex->texture.surface.imageSize);
+        bc_watch_add(tex, width, height);
     }
 #endif
     gfx_gx2_defer_image_free(staging.image, staging.imageSize);
@@ -1813,6 +1866,9 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
 }
 
 static void gfx_gx2_end_frame(void) {
+#if WIIU_DIAGNOSTICS
+    bc_watch_tick();
+#endif
     const bool trace = gfx_gx2_trace_first_frame;
     DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
     Ship::WiiU::Watchdog::gDrawBufferHighWaterBytes = draw_buffer_frame_high_water;
