@@ -887,6 +887,7 @@ struct BcWatch {
     GX2TextureEntry* tex;
     void* image;
     uint32_t size, width, height, hash, frames;
+    uint8_t* snapshot;
 };
 static std::vector<BcWatch> bc_watches;
 static uint32_t bc_hash(const void* p, uint32_t n) {
@@ -899,8 +900,12 @@ static uint32_t bc_hash(const void* p, uint32_t n) {
 }
 static void bc_watch_add(GX2TextureEntry* tex, uint32_t width, uint32_t height) {
     if (bc_watches.size() < 32) {
+        uint8_t* snap = static_cast<uint8_t*>(malloc(tex->texture.surface.imageSize));
+        if (snap) {
+            memcpy(snap, tex->texture.surface.image, tex->texture.surface.imageSize);
+        }
         bc_watches.push_back({ tex, tex->texture.surface.image, tex->texture.surface.imageSize, width, height,
-                               bc_hash(tex->texture.surface.image, tex->texture.surface.imageSize), 0 });
+                               bc_hash(tex->texture.surface.image, tex->texture.surface.imageSize), 0, snap });
     }
 }
 static void bc_watch_tick() {
@@ -916,8 +921,40 @@ static void bc_watch_tick() {
         }
         DCInvalidateRange(w.image, w.size);
         const uint32_t now = bc_hash(w.image, w.size);
-        SPDLOG_INFO("BCWATCH {}x{} ptr={} align={} {}", w.width, w.height, w.image,
+        SPDLOG_INFO("BCWATCH {}x{} ptr={} size=0x{:X} align={} {}", w.width, w.height, w.image, w.size,
                     w.tex->texture.surface.alignment, now == w.hash ? "UNCHANGED" : "CHANGED after copy");
+        if (now != w.hash && w.snapshot) {
+            // Where and how: changed 32-byte lines, their first/last offsets, the 64 KiB pages touched, a sample.
+            const uint8_t* cur = static_cast<const uint8_t*>(w.image);
+            uint32_t lines = 0, first = UINT32_MAX, last = 0, runs = 0;
+            bool in_run = false;
+            uint64_t pages[4] = { 0, 0, 0, 0 };
+            for (uint32_t off = 0; off + 32 <= w.size; off += 32) {
+                const bool diff = memcmp(cur + off, w.snapshot + off, 32) != 0;
+                if (diff) {
+                    ++lines;
+                    first = std::min(first, off);
+                    last = off;
+                    const uint32_t page = off >> 16;
+                    if (page < 256) {
+                        pages[page >> 6] |= 1ull << (page & 63);
+                    }
+                    if (!in_run) {
+                        ++runs;
+                    }
+                }
+                in_run = diff;
+            }
+            char was[65], is[65];
+            for (uint32_t k = 0; k < 32 && first != UINT32_MAX; ++k) {
+                snprintf(was + 2 * k, 3, "%02X", w.snapshot[first + k]);
+                snprintf(is + 2 * k, 3, "%02X", cur[first + k]);
+            }
+            SPDLOG_INFO("BCWATCH diff lines={}/{} runs={} first=0x{:X} last=0x{:X} pages={:016X}{:016X}{:016X}{:016X}",
+                        lines, w.size / 32, runs, first, last, pages[3], pages[2], pages[1], pages[0]);
+            SPDLOG_INFO("BCWATCH sample was={} now={}", was, is);
+        }
+        free(w.snapshot);
     }
     bc_watches.resize(kept);
 }
@@ -998,6 +1035,11 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
         WDOG_ENTER(::Ship::WiiU::Watchdog::PH_TEX_ALLOC, nullptr);
         tex->texture.surface.image = memalign(tex->texture.surface.alignment, tex->texture.surface.imageSize);
         WDOG_TEXALLOC(tex->texture.surface.image, tex->texture.surface.imageSize);
+#if WIIU_DIAGNOSTICS
+        SPDLOG_INFO("BCALLOC surf {}x{} ptr={} end={} tile={}", width, height, tex->texture.surface.image,
+                    static_cast<void*>(static_cast<uint8_t*>(tex->texture.surface.image) + tex->texture.surface.imageSize),
+                    (unsigned int)tex->texture.surface.tileMode);
+#endif
         if (tex->texture.surface.image == nullptr) {
             SPDLOG_ERROR("gfx_gx2: BC texture allocation failed dimensions={}x{} imageSize={}", width, height,
                          tex->texture.surface.imageSize);
@@ -1026,6 +1068,10 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
     WDOG_ENTER(::Ship::WiiU::Watchdog::PH_TEX_ALLOC, nullptr);
     staging.image = memalign(staging.alignment, staging.imageSize);
     WDOG_TEXALLOC(staging.image, staging.imageSize);
+#if WIIU_DIAGNOSTICS
+    SPDLOG_INFO("BCALLOC stage {}x{} ptr={} end={}", width, height, staging.image,
+                static_cast<void*>(static_cast<uint8_t*>(staging.image) + staging.imageSize));
+#endif
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_ALLOC);
     if (!staging.image) {
         SPDLOG_ERROR("gfx_gx2: BC texture upload staging allocation failed");
