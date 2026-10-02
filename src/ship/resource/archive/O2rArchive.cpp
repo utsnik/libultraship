@@ -539,7 +539,8 @@ bool O2rArchive::PrepareExactReads() {
     return true;
 }
 
-bool O2rArchive::LoadExactFile(size_t entryIndex, File& file, uint64_t& hitchReadMicroseconds) {
+bool O2rArchive::LoadExactFile(size_t entryIndex, File& file, uint64_t& hitchReadMicroseconds,
+                               std::shared_ptr<std::vector<char>>& compressedOut) {
     std::lock_guard<std::mutex> lock(mExactReadMutex);
     if (mExactReadFd < 0 || entryIndex >= mExactReadEntries.size()) {
         return false;
@@ -683,6 +684,11 @@ bool O2rArchive::LoadExactFile(size_t entryIndex, File& file, uint64_t& hitchRea
                                       std::memory_order_relaxed);
 #endif
 
+    // Hand the compressed bytes to the O2R cache like the libzip path does, so a re-entered area hits RAM.
+    if (entry.compressedSize <= kO2rCacheMaxEntryBytes) {
+        compressedOut = std::make_shared<std::vector<char>>(
+            reinterpret_cast<const char*>(compressedData), reinterpret_cast<const char*>(compressedData) + entry.compressedSize);
+    }
     freeBuffer();
     return true;
 }
@@ -770,7 +776,12 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         const ExactReadEntry& exactEntry = mExactReadEntries[static_cast<size_t>(zipEntryIndex)];
         if (mExactReadFd >= 0 && exactEntry.compressedSize == zipEntryStat.comp_size &&
             exactEntry.uncompressedSize == zipEntryStat.size && exactEntry.method == zipEntryStat.comp_method) {
-            exactLoaded = LoadExactFile(static_cast<size_t>(zipEntryIndex), *fileToLoad, hitchReadMicroseconds);
+            std::shared_ptr<std::vector<char>> exactCompressed;
+            exactLoaded = LoadExactFile(static_cast<size_t>(zipEntryIndex), *fileToLoad, hitchReadMicroseconds,
+                                        exactCompressed);
+            if (exactLoaded && exactCompressed != nullptr) {
+                O2rCacheStore(this, filePath, exactCompressed, zipEntryStat.comp_method, zipEntryStat.size);
+            }
         }
     }
 

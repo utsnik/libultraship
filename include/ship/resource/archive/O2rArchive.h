@@ -123,7 +123,8 @@ class O2rArchive final : virtual public Archive {
     };
 
     bool PrepareExactReads();
-    bool LoadExactFile(size_t entryIndex, File& file, uint64_t& hitchReadMicroseconds);
+    bool LoadExactFile(size_t entryIndex, File& file, uint64_t& hitchReadMicroseconds,
+                       std::shared_ptr<std::vector<char>>& compressedOut);
     void CloseExactReads();
 
     int mExactReadFd = -1;
