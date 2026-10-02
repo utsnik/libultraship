@@ -1103,6 +1103,21 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
 }
 
+// Dev builds: report every BC texture that misses the whole-image path, once per resource path, so a tour lists all
+// of them (SKIP = not drawn at all, UNALIGNED = wrong region drawn, CROP = partial load, not yet seen on hardware).
+static void BcPathLog(const char* kind, const RawTexMetadata* metadata, uint32_t texFlags, const char* why) {
+#if defined(__WIIU__) && WIIU_DIAGNOSTICS
+    static std::set<std::string> seen;
+    const std::string path = metadata->resource != nullptr ? metadata->resource->GetInitData()->Path : "<none>";
+    if (seen.insert(std::string(kind) + path).second) {
+        SPDLOG_INFO("BCPATH {} #{} flags=0x{:X} {}x{} ({}) {}", kind, seen.size(), texFlags, metadata->width,
+                    metadata->height, why, path);
+    }
+#else
+    (void)kind, (void)metadata, (void)texFlags, (void)why;
+#endif
+}
+
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     uint8_t fmt = mRdp->texture_tile[tile].fmt;
     uint8_t siz = mRdp->texture_tile[tile].siz;
@@ -1143,6 +1158,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
                 SPDLOG_WARN("Interpreter: unsupported BC texture path; skipping compressed texture data");
                 unsupported_logged = true;
             }
+            BcPathLog("SKIP", metadata, texFlags, importReplacement ? "replacement" : "flags/resource");
             return;
         }
 
@@ -1180,11 +1196,13 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
                             regionW, regionH, x0, y0, metadata->width, metadata->height);
                 unaligned_logged = true;
             }
+            BcPathLog("UNALIGNED", metadata, texFlags, "whole image uploaded");
             mRapi->UploadTextureCompressed(image, metadata->width, metadata->height, compressedFlags,
                                             metadata->resource->ImageDataSize);
             return;
         }
 
+        BcPathLog("CROP", metadata, texFlags, "partial load");
         const size_t srcBlockRow = static_cast<size_t>(metadata->width / 4) * blockBytes;
         const size_t dstBlockRow = static_cast<size_t>(regionW / 4) * blockBytes;
         const size_t regionBytes = dstBlockRow * (regionH / 4);
