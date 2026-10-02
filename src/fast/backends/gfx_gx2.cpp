@@ -1014,6 +1014,51 @@ static void gfx_gx2_upload_texture_compressed(const uint8_t* compressed_buf, uin
     WDOG_LEAVE(::Ship::WiiU::Watchdog::PH_TEX_UPLOAD);
     GX2CopySurface(&staging, 0, 0, &tex->texture.surface, 0, 0);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tex->texture.surface.image, tex->texture.surface.imageSize);
+#if WIIU_DIAGNOSTICS
+    // One-time round trip on the first large BC upload: copy the tiled surface back to a linear one and compare it
+    // with the source blocks. Large BC textures rendered as garbage (2026-10-02); this tells "bytes never arrive"
+    // apart from "bytes arrive but are sampled wrong". A symmetric mis-swizzle would still pass.
+    static bool bc_roundtrip_checked = false;
+    if (!bc_roundtrip_checked && width >= 1024) {
+        bc_roundtrip_checked = true;
+        GX2Surface back = staging;
+        back.image = memalign(back.alignment, back.imageSize);
+        if (back.image) {
+            memset(back.image, 0xCD, back.imageSize);
+            GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, back.image, back.imageSize);
+            GX2CopySurface(&tex->texture.surface, 0, 0, &back, 0, 0);
+            GX2DrawDone();
+            DCInvalidateRange(back.image, back.imageSize);
+            DCInvalidateRange(tex->texture.surface.image, tex->texture.surface.imageSize);
+            const uint8_t* back_bytes = static_cast<const uint8_t*>(back.image);
+            uint32_t bad_rows = 0, fill_rows = 0, first_bad = UINT32_MAX;
+            for (uint32_t y = 0; y < blocks_high; ++y) {
+                const uint8_t* row = back_bytes + static_cast<size_t>(y) * pitch_bytes;
+                if (memcmp(row, compressed_buf + static_cast<size_t>(y) * row_bytes, row_bytes) != 0) {
+                    ++bad_rows;
+                    if (first_bad == UINT32_MAX) {
+                        first_bad = y;
+                    }
+                    if (row[0] == 0xCD && row[1] == 0xCD && row[2] == 0xCD && row[3] == 0xCD) {
+                        ++fill_rows;
+                    }
+                }
+            }
+            const uint8_t* tiled = static_cast<const uint8_t*>(tex->texture.surface.image);
+            uint32_t tiled_zero = 0;
+            for (uint32_t k = 0; k < tex->texture.surface.imageSize; ++k) {
+                tiled_zero += tiled[k] == 0;
+            }
+            SPDLOG_INFO("BCCHECK {}x{} fmt=0x{:X} tile={} pitch={} stagingPitch={} imageSize={} swizzle=0x{:X} "
+                        "badRows={}/{} fillRows={} firstBad={} tiledZeroBytes={}",
+                        width, height, (unsigned int)format, (unsigned int)tex->texture.surface.tileMode,
+                        tex->texture.surface.pitch, staging.pitch, tex->texture.surface.imageSize,
+                        tex->texture.surface.swizzle, bad_rows, blocks_high, fill_rows,
+                        first_bad == UINT32_MAX ? -1 : (int)first_bad, tiled_zero);
+            free(back.image);
+        }
+    }
+#endif
     gfx_gx2_defer_image_free(staging.image, staging.imageSize);
     ++perf_texture_uploads;
 #if WIIU_DIAGNOSTICS

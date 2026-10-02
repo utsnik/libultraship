@@ -1847,37 +1847,32 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             uint8_t cms = mRdp->texture_tile[tile].cms;
             uint8_t cmt = mRdp->texture_tile[tile].cmt;
 
+            // BC replacements use the N64 tile dimensions like raw HD textures: UVs are normalised by the original
+            // size and the GPU samples the HD surface with normalised coordinates.
             const auto& loaded_texture = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
-            const uint32_t compressed_flags = loaded_texture.tex_flags & (TEX_FLAG_BC1 | TEX_FLAG_BC3);
+            uint32_t tex_size_bytes = loaded_texture.orig_size_bytes;
+            uint32_t line_size = mRdp->texture_tile[tile].line_size_bytes;
 
-            if (compressed_flags != 0 && loaded_texture.raw_tex_metadata.resource != nullptr) {
-                tex_width[i] = loaded_texture.raw_tex_metadata.width;
-                tex_height[i] = loaded_texture.raw_tex_metadata.height;
-            } else {
-                uint32_t tex_size_bytes = loaded_texture.orig_size_bytes;
-                uint32_t line_size = mRdp->texture_tile[tile].line_size_bytes;
-
-                if (line_size == 0) {
-                    line_size = 1;
-                }
-
-                tex_height[i] = tex_size_bytes / line_size;
-                switch (mRdp->texture_tile[tile].siz) {
-                    case G_IM_SIZ_4b:
-                        line_size <<= 1;
-                        break;
-                    case G_IM_SIZ_8b:
-                        break;
-                    case G_IM_SIZ_16b:
-                        line_size /= G_IM_SIZ_16b_LINE_BYTES;
-                        break;
-                    case G_IM_SIZ_32b:
-                        line_size /= G_IM_SIZ_32b_LINE_BYTES; // this is 2!
-                        tex_height[i] /= 2;
-                        break;
-                }
-                tex_width[i] = line_size;
+            if (line_size == 0) {
+                line_size = 1;
             }
+
+            tex_height[i] = tex_size_bytes / line_size;
+            switch (mRdp->texture_tile[tile].siz) {
+                case G_IM_SIZ_4b:
+                    line_size <<= 1;
+                    break;
+                case G_IM_SIZ_8b:
+                    break;
+                case G_IM_SIZ_16b:
+                    line_size /= G_IM_SIZ_16b_LINE_BYTES;
+                    break;
+                case G_IM_SIZ_32b:
+                    line_size /= G_IM_SIZ_32b_LINE_BYTES; // this is 2!
+                    tex_height[i] /= 2;
+                    break;
+            }
+            tex_width[i] = line_size;
 
             tex_width2[i] = (mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4;
             tex_height2[i] = (mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4;
