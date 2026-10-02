@@ -16,11 +16,13 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <fcntl.h>
 #include <iterator>
 #include <list>
 #include <limits>
 #include <malloc.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -411,6 +413,290 @@ void O2rArchive::ReleaseZipHandle(zip_t* handle) {
     mZipArchivePool.push_back(handle);
 }
 
+#ifdef __WIIU__
+static int32_t O2rPreloadCVar(const char* name, int32_t defaultValue);
+
+namespace {
+static bool O2rReadFully(int fd, void* buffer, size_t size) {
+    auto* bytes = static_cast<uint8_t*>(buffer);
+    while (size != 0) {
+        const ssize_t bytesRead = ::read(fd, bytes, size);
+        if (bytesRead <= 0) {
+            return false;
+        }
+        bytes += bytesRead;
+        size -= static_cast<size_t>(bytesRead);
+    }
+    return true;
+}
+
+static uint16_t O2rReadLe16(const uint8_t* data) {
+    return static_cast<uint16_t>(data[0]) | static_cast<uint16_t>(data[1] << 8);
+}
+
+static uint32_t O2rReadLe32(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+           (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
+}
+} // namespace
+
+bool O2rArchive::PrepareExactReads() {
+    CloseExactReads();
+
+    const int fd = ::open(GetPath().c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    auto fail = [&]() {
+        ::close(fd);
+        mExactReadEntries.clear();
+        return false;
+    };
+
+    const off_t archiveSize = ::lseek(fd, 0, SEEK_END);
+    if (archiveSize < 22) {
+        return fail();
+    }
+
+    const uint64_t archiveSize64 = static_cast<uint64_t>(archiveSize);
+    const size_t tailSize = static_cast<size_t>(std::min<uint64_t>(archiveSize64, 22 + 0xffff));
+    std::vector<uint8_t> tail(tailSize);
+    if (::lseek(fd, archiveSize - static_cast<off_t>(tailSize), SEEK_SET) == static_cast<off_t>(-1) ||
+        !O2rReadFully(fd, tail.data(), tail.size())) {
+        return fail();
+    }
+
+    size_t eocdOffset = tail.size();
+    for (size_t offset = tail.size() - 22;; --offset) {
+        if (O2rReadLe32(tail.data() + offset) == 0x06054b50) {
+            const uint16_t commentLength = O2rReadLe16(tail.data() + offset + 20);
+            if (offset + 22 + commentLength == tail.size()) {
+                eocdOffset = offset;
+                break;
+            }
+        }
+        if (offset == 0) {
+            break;
+        }
+    }
+    if (eocdOffset == tail.size()) {
+        return fail();
+    }
+
+    const uint16_t diskNumber = O2rReadLe16(tail.data() + eocdOffset + 4);
+    const uint16_t centralDirectoryDisk = O2rReadLe16(tail.data() + eocdOffset + 6);
+    const uint16_t entriesOnDisk = O2rReadLe16(tail.data() + eocdOffset + 8);
+    const uint16_t entryCount = O2rReadLe16(tail.data() + eocdOffset + 10);
+    const uint32_t centralDirectorySize = O2rReadLe32(tail.data() + eocdOffset + 12);
+    const uint32_t centralDirectoryOffset = O2rReadLe32(tail.data() + eocdOffset + 16);
+    if (diskNumber != 0 || centralDirectoryDisk != 0 || entriesOnDisk != entryCount || entryCount == 0xffff ||
+        centralDirectorySize == 0xffffffff || centralDirectoryOffset == 0xffffffff ||
+        centralDirectoryOffset > archiveSize64 ||
+        centralDirectorySize > archiveSize64 - centralDirectoryOffset ||
+        static_cast<uint64_t>(centralDirectoryOffset) + centralDirectorySize >
+            archiveSize64 - (tail.size() - eocdOffset)) {
+        return fail();
+    }
+
+    std::vector<uint8_t> centralDirectory(centralDirectorySize);
+    if (::lseek(fd, static_cast<off_t>(centralDirectoryOffset), SEEK_SET) == static_cast<off_t>(-1) ||
+        !O2rReadFully(fd, centralDirectory.data(), centralDirectory.size())) {
+        return fail();
+    }
+
+    size_t offset = 0;
+    mExactReadEntries.reserve(entryCount);
+    for (uint16_t i = 0; i < entryCount; ++i) {
+        if (centralDirectory.size() - offset < 46 ||
+            O2rReadLe32(centralDirectory.data() + offset) != 0x02014b50) {
+            return fail();
+        }
+
+        const uint16_t method = O2rReadLe16(centralDirectory.data() + offset + 10);
+        const uint32_t compressedSize = O2rReadLe32(centralDirectory.data() + offset + 20);
+        const uint32_t uncompressedSize = O2rReadLe32(centralDirectory.data() + offset + 24);
+        const uint16_t nameLength = O2rReadLe16(centralDirectory.data() + offset + 28);
+        const uint16_t extraLength = O2rReadLe16(centralDirectory.data() + offset + 30);
+        const uint16_t commentLength = O2rReadLe16(centralDirectory.data() + offset + 32);
+        const uint16_t entryDisk = O2rReadLe16(centralDirectory.data() + offset + 34);
+        const uint32_t localHeaderOffset = O2rReadLe32(centralDirectory.data() + offset + 42);
+        const size_t variableLength = static_cast<size_t>(nameLength) + extraLength + commentLength;
+        if (entryDisk != 0 || compressedSize == 0xffffffff || uncompressedSize == 0xffffffff ||
+            localHeaderOffset == 0xffffffff || variableLength > centralDirectory.size() - offset - 46) {
+            return fail();
+        }
+
+        mExactReadEntries.push_back({ localHeaderOffset, compressedSize, uncompressedSize, method, nameLength,
+                                      extraLength });
+        offset += 46 + variableLength;
+    }
+    if (offset != centralDirectory.size()) {
+        return fail();
+    }
+
+    mExactReadFd = fd;
+    return true;
+}
+
+bool O2rArchive::LoadExactFile(size_t entryIndex, File& file, uint64_t& hitchReadMicroseconds) {
+    std::lock_guard<std::mutex> lock(mExactReadMutex);
+    if (mExactReadFd < 0 || entryIndex >= mExactReadEntries.size()) {
+        return false;
+    }
+
+    const ExactReadEntry& entry = mExactReadEntries[entryIndex];
+    if (entry.compressedSize == 0 || entry.uncompressedSize == 0 ||
+        (entry.method != ZIP_CM_STORE && entry.method != ZIP_CM_DEFLATE) ||
+        entry.compressedSize > std::numeric_limits<uInt>::max() ||
+        entry.uncompressedSize > std::numeric_limits<uInt>::max()) {
+        return false;
+    }
+
+    const size_t headerSize = 30 + static_cast<size_t>(entry.nameLength) + entry.extraLength;
+    const size_t initialReadSize = headerSize + entry.compressedSize;
+    if (headerSize < 30 || initialReadSize < headerSize ||
+        initialReadSize > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        return false;
+    }
+
+    void* rawBuffer = memalign(0x40, initialReadSize);
+    if (rawBuffer == nullptr) {
+        return false;
+    }
+    auto* buffer = static_cast<uint8_t*>(rawBuffer);
+    auto freeBuffer = [&]() {
+        free(rawBuffer);
+    };
+
+#if WIIU_DIAGNOSTICS
+    const OSTime readStart = OSGetSystemTime();
+    bool readRecorded = false;
+    auto recordRead = [&]() {
+        if (readRecorded) {
+            return;
+        }
+        readRecorded = true;
+        const uint64_t readMicroseconds = OSTicksToMicroseconds(OSGetSystemTime() - readStart);
+        sO2rReadMicroseconds.fetch_add(readMicroseconds, std::memory_order_relaxed);
+        hitchReadMicroseconds += readMicroseconds;
+    };
+#else
+    auto recordRead = []() {};
+#endif
+
+    if (::lseek(mExactReadFd, static_cast<off_t>(entry.localHeaderOffset), SEEK_SET) == static_cast<off_t>(-1) ||
+        ::read(mExactReadFd, buffer, initialReadSize) != static_cast<ssize_t>(initialReadSize)) {
+        recordRead();
+        freeBuffer();
+        return false;
+    }
+
+    if (O2rReadLe32(buffer) != 0x04034b50 || O2rReadLe16(buffer + 8) != entry.method ||
+        O2rReadLe16(buffer + 26) != entry.nameLength) {
+        recordRead();
+        freeBuffer();
+        return false;
+    }
+
+    const uint16_t localExtraLength = O2rReadLe16(buffer + 28);
+    if (localExtraLength < entry.extraLength) {
+        recordRead();
+        freeBuffer();
+        return false;
+    }
+
+    const size_t extraRemainder = static_cast<size_t>(localExtraLength) - entry.extraLength;
+    const size_t fullReadSize = initialReadSize + extraRemainder;
+    if (fullReadSize < initialReadSize ||
+        extraRemainder > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        recordRead();
+        freeBuffer();
+        return false;
+    }
+    if (extraRemainder != 0) {
+        void* resizedBuffer = memalign(0x40, fullReadSize);
+        if (resizedBuffer == nullptr) {
+            recordRead();
+            freeBuffer();
+            return false;
+        }
+        std::memcpy(resizedBuffer, buffer, initialReadSize);
+        freeBuffer();
+        rawBuffer = resizedBuffer;
+        buffer = static_cast<uint8_t*>(rawBuffer);
+        if (::read(mExactReadFd, buffer + initialReadSize, extraRemainder) !=
+            static_cast<ssize_t>(extraRemainder)) {
+            recordRead();
+            freeBuffer();
+            return false;
+        }
+    }
+    recordRead();
+
+    const uint8_t* compressedData = buffer + 30 + entry.nameLength + localExtraLength;
+#if WIIU_DIAGNOSTICS
+    const OSTime inflateStart = OSGetSystemTime();
+#endif
+    if (entry.method == ZIP_CM_STORE) {
+        if (entry.compressedSize != entry.uncompressedSize) {
+#if WIIU_DIAGNOSTICS
+            sO2rInflateMicroseconds.fetch_add(OSTicksToMicroseconds(OSGetSystemTime() - inflateStart),
+                                              std::memory_order_relaxed);
+#endif
+            freeBuffer();
+            return false;
+        }
+        file.Buffer = std::make_shared<std::vector<char>>(entry.uncompressedSize);
+        std::memcpy(file.Buffer->data(), compressedData, entry.uncompressedSize);
+    } else {
+        file.Buffer = std::make_shared<std::vector<char>>(entry.uncompressedSize);
+        z_stream stream{};
+        stream.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(compressedData));
+        stream.avail_in = entry.compressedSize;
+        stream.next_out = reinterpret_cast<Bytef*>(file.Buffer->data());
+        stream.avail_out = entry.uncompressedSize;
+        if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
+#if WIIU_DIAGNOSTICS
+            sO2rInflateMicroseconds.fetch_add(OSTicksToMicroseconds(OSGetSystemTime() - inflateStart),
+                                              std::memory_order_relaxed);
+#endif
+            freeBuffer();
+            file.Buffer.reset();
+            return false;
+        }
+        const int inflateResult = inflate(&stream, Z_FINISH);
+        const uLong outputSize = stream.total_out;
+        const int inflateEndResult = inflateEnd(&stream);
+        if (inflateResult != Z_STREAM_END || inflateEndResult != Z_OK || outputSize != entry.uncompressedSize) {
+            freeBuffer();
+            file.Buffer.reset();
+#if WIIU_DIAGNOSTICS
+            sO2rInflateMicroseconds.fetch_add(OSTicksToMicroseconds(OSGetSystemTime() - inflateStart),
+                                              std::memory_order_relaxed);
+#endif
+            return false;
+        }
+    }
+#if WIIU_DIAGNOSTICS
+    sO2rInflateMicroseconds.fetch_add(OSTicksToMicroseconds(OSGetSystemTime() - inflateStart),
+                                      std::memory_order_relaxed);
+#endif
+
+    freeBuffer();
+    return true;
+}
+
+void O2rArchive::CloseExactReads() {
+    std::lock_guard<std::mutex> lock(mExactReadMutex);
+    if (mExactReadFd >= 0) {
+        ::close(mExactReadFd);
+        mExactReadFd = -1;
+    }
+    mExactReadEntries.clear();
+}
+#endif
+
 std::shared_ptr<File> O2rArchive::LoadFile(uint64_t hash) {
     const std::string& filePath =
         *Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToString(hash);
@@ -421,8 +707,8 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
 #if WIIU_DIAGNOSTICS
     O2rLoadTimer loadTimer;
-    uint64_t hitchReadMicroseconds = 0;
 #endif
+    uint64_t hitchReadMicroseconds = 0;
 #endif
 
     zip_t* zipArchive = GetZipHandle();
@@ -467,9 +753,20 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #ifdef __WIIU__
     const bool readCompressed =
         zipEntryStat.comp_method == ZIP_CM_STORE || zipEntryStat.comp_method == ZIP_CM_DEFLATE;
+    auto fileToLoad = std::make_shared<File>();
+    bool exactLoaded = false;
+    if (O2rPreloadCVar("gWiiU.O2rExactReads", 1) != 0 && readCompressed && zipEntryIndex >= 0 &&
+        static_cast<size_t>(zipEntryIndex) < mExactReadEntries.size()) {
+        const ExactReadEntry& exactEntry = mExactReadEntries[static_cast<size_t>(zipEntryIndex)];
+        if (mExactReadFd >= 0 && exactEntry.compressedSize == zipEntryStat.comp_size &&
+            exactEntry.uncompressedSize == zipEntryStat.size && exactEntry.method == zipEntryStat.comp_method) {
+            exactLoaded = LoadExactFile(static_cast<size_t>(zipEntryIndex), *fileToLoad, hitchReadMicroseconds);
+        }
+    }
+
     std::shared_ptr<std::vector<char>> compressedData;
     bool cacheHit = false;
-    if (readCompressed) {
+    if (!exactLoaded && readCompressed) {
         cacheHit = O2rCacheLoad(this, filePath, compressedData, zipEntryStat.comp_method, zipEntryStat.size);
         if (cacheHit) {
             zipEntryStat.comp_size = compressedData->size();
@@ -477,7 +774,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     }
 
     struct zip_file* zipEntryFile = nullptr;
-    if (!cacheHit) {
+    if (!exactLoaded && !cacheHit) {
 #if WIIU_DIAGNOSTICS
         const OSTime openStart = OSGetSystemTime();
 #endif
@@ -489,10 +786,11 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     }
 #else
     struct zip_file* zipEntryFile = zip_fopen_index(zipArchive, zipEntryIndex, 0);
+    auto fileToLoad = std::make_shared<File>();
 #endif
     if (!zipEntryFile
 #ifdef __WIIU__
-        && !cacheHit
+        && !cacheHit && !exactLoaded
 #endif
     ) {
         SPDLOG_TRACE("Failed to open file {} in zip archive  {}.", filePath, GetPath());
@@ -501,7 +799,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     }
 
 #ifdef __WIIU__
-    if (readCompressed && (zipEntryStat.comp_size > std::numeric_limits<uInt>::max() ||
+    if (!exactLoaded && readCompressed && (zipEntryStat.comp_size > std::numeric_limits<uInt>::max() ||
                            zipEntryStat.size > std::numeric_limits<uInt>::max())) {
         SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
         if (!cacheHit) {
@@ -512,10 +810,10 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     }
 #endif
 
-    auto fileToLoad = std::make_shared<File>();
-
 #ifdef __WIIU__
-    if (readCompressed) {
+    if (exactLoaded) {
+        // The exact-read path has already populated fileToLoad and accounted for its read.
+    } else if (readCompressed) {
         if (!cacheHit) {
             compressedData = std::make_shared<std::vector<char>>(zipEntryStat.comp_size);
 #if WIIU_DIAGNOSTICS
@@ -595,7 +893,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 
     if (
 #ifdef __WIIU__
-        !cacheHit &&
+        !exactLoaded && !cacheHit &&
 #endif
         zip_fclose(zipEntryFile) != 0) {
         SPDLOG_TRACE("Error closing file {} in zip archive  {}.", filePath, GetPath());
@@ -884,7 +1182,17 @@ bool O2rArchive::Open() {
     }
 #endif
 
+#ifdef __WIIU__
+    if (!preloaded) {
+        PrepareExactReads();
+    }
+#endif
     auto zipNumEntries = zip_get_num_entries(mZipArchive, 0);
+#ifdef __WIIU__
+    if (mExactReadFd >= 0 && (zipNumEntries < 0 || mExactReadEntries.size() != static_cast<size_t>(zipNumEntries))) {
+        CloseExactReads();
+    }
+#endif
     for (auto i = 0; i < zipNumEntries; i++) {
         auto zipEntryName = zip_get_name(mZipArchive, i, 0);
 
@@ -903,6 +1211,9 @@ bool O2rArchive::Open() {
 bool O2rArchive::Close() {
     bool success = true;
 
+#ifdef __WIIU__
+    CloseExactReads();
+#endif
     if (mZipArchive != nullptr) {
         if (zip_close(mZipArchive) == -1) {
             SPDLOG_ERROR("Failed to close zip file \"{}\"", GetPath());
@@ -980,6 +1291,7 @@ bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_
         mZipArchivePool.clear();
     }
 #ifdef __WIIU__
+    CloseExactReads();
     O2rCacheClear(this);
     auto stdioBuffer = sO2rStdioBuffers.find(this);
     if (stdioBuffer != sO2rStdioBuffers.end()) {

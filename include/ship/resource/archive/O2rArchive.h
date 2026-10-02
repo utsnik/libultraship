@@ -112,6 +112,23 @@ class O2rArchive final : virtual public Archive {
     /** @brief Wii U: the single buffered handle from Open() is lent out; concurrent loaders wait for it. */
     std::condition_variable mHandleCv;
     bool mHandleBusy = false;
+
+    struct ExactReadEntry {
+        uint32_t localHeaderOffset;
+        uint32_t compressedSize;
+        uint32_t uncompressedSize;
+        uint16_t method;
+        uint16_t nameLength;
+        uint16_t extraLength;
+    };
+
+    bool PrepareExactReads();
+    bool LoadExactFile(size_t entryIndex, File& file, uint64_t& hitchReadMicroseconds);
+    void CloseExactReads();
+
+    int mExactReadFd = -1;
+    std::vector<ExactReadEntry> mExactReadEntries;
+    std::mutex mExactReadMutex;
 #endif
 };
 } // namespace Ship
