@@ -591,11 +591,12 @@ static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_
     prg->used_textures[0] = cc_features.usedTextures[0];
     prg->used_textures[1] = cc_features.usedTextures[1];
 
-    gfx_gx2_load_shader(prg);
     if (trace) {
         SPDLOG_INFO("gfx_gx2: shader creation: sampler/uniform lookup ...");
     }
-
+    // Look up the sampler and uniform locations BEFORE loading: gfx_gx2_load_shader binds every tile's texture at
+    // samplers_location[tile], and a fresh pool entry has them all 0, so the first draw with a new combiner bound
+    // every tile into slot 0 and left uTex1/masks unbound (2026-10-02: effects drew as squares the first time only).
     prg->window_params_offset = GX2GetPixelUniformVarOffset(&prg->group.pixelShader, "window_params");
     prg->samplers_location[0] = GX2GetPixelSamplerVarLocation(&prg->group.pixelShader, "uTex0");
     prg->samplers_location[1] = GX2GetPixelSamplerVarLocation(&prg->group.pixelShader, "uTex1");
@@ -605,6 +606,8 @@ static struct ShaderProgram* gfx_gx2_create_and_load_new_shader(uint64_t shader_
     prg->samplers_location[5] = GX2GetPixelSamplerVarLocation(&prg->group.pixelShader, "uTexBlend1");
 
     prg->used_noise = cc_features.opt_alpha && cc_features.opt_noise;
+
+    gfx_gx2_load_shader(prg);
 
     printf("Generated and loaded shader\n");
 
