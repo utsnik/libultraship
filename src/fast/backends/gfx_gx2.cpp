@@ -128,6 +128,11 @@ static int current_tile;
 // backgrounds (a textured copy after an untextured draw) came out white. load_shader rebinds these.
 static GX2Texture* tile_bound_texture[6];
 static GX2Sampler* tile_bound_sampler[6];
+// The texture entry selected for each tile. Samplers live in the texture entry on GX2, so a sampler update must go
+// to the tile's own texture: the interpreter often updates tile i after selecting another texture (tile i+1, a mask
+// or a blend texture) or without reselecting at all, and writing current_texture's sampler then left tile i's
+// texture with its old CLAMP for good (2S2H wall streaks). OpenGL's per-unit glTexParameteri never had this.
+static struct GX2TextureEntry* tile_bound_entry[6];
 
 // 8 MiB per frame arena. Exhaustion keeps the serialized fallback below.
 #define DRAW_BUFFER_SIZE 0x800000
@@ -661,6 +666,9 @@ static void gfx_gx2_delete_texture(uint32_t texture_id) {
         if (tile_bound_sampler[tile] == &tex->sampler) {
             tile_bound_sampler[tile] = nullptr;
         }
+        if (tile_bound_entry[tile] == tex) {
+            tile_bound_entry[tile] = nullptr;
+        }
     }
 
     if (tex->texture.surface.image) {
@@ -691,6 +699,9 @@ static void gfx_gx2_select_texture(int tile, uint32_t texture_id) {
     }
     current_texture = tex;
     current_tile = tile;
+    if (tile >= 0 && tile < 6) {
+        tile_bound_entry[tile] = tex;
+    }
     tile_bound_texture[tile] = tex->texture_uploaded ? &tex->texture : nullptr;
     tile_bound_sampler[tile] = tex->sampler_set ? &tex->sampler : nullptr;
 
@@ -1073,13 +1084,16 @@ static void gfx_gx2_set_sampler_parameters(int tile, bool linear_filter, uint32_
                     linear_filter ? 1u : 0u, (uint32_t)cms, (uint32_t)cmt);
     static bool trace_first_sampler_update = true;
     const bool trace = trace_first_sampler_update;
-    struct GX2TextureEntry* tex = current_texture;
+    struct GX2TextureEntry* tex = (tile >= 0 && tile < 6 && tile_bound_entry[tile]) ? tile_bound_entry[tile]
+                                                                                    : current_texture;
     if (!tex) {
         SPDLOG_ERROR("gfx_gx2: sampler update requested without a current texture");
         return;
     }
 
-    current_tile = tile;
+    if (tex == current_texture) {
+        current_tile = tile;
+    }
 
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame sampler: GX2InitSampler ...");
@@ -2112,6 +2126,7 @@ void gfx_gx2_select_texture_fb(int fb) {
     }
     tile_bound_texture[0] = &buffer->texture;
     tile_bound_sampler[0] = &buffer->sampler;
+    tile_bound_entry[0] = nullptr; // not a texture entry: sampler updates fall back to current_texture as before
     uint32_t location = current_shader_program->samplers_location[0];
     gfx_gx2_set_pixel_texture(0, location, &buffer->texture);
     GX2SetPixelSampler(&buffer->sampler, location);
