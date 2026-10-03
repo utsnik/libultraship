@@ -2,9 +2,11 @@
 
 #include <stdint.h>
 
+#include <mutex>
 #include <unordered_map>
 #include <set>
 #include "imconfig.h"
+#include <spdlog/spdlog.h>
 
 namespace Fast {
 struct ShaderProgram;
@@ -42,6 +44,12 @@ class GfxRenderingAPI {
     virtual uint32_t NewTexture() = 0;
     virtual void SelectTexture(int tile, uint32_t textureId) = 0;
     virtual void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) = 0;
+    virtual void UploadTextureCompressed(const uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t) {
+        static std::once_flag unsupported_logged;
+        std::call_once(unsupported_logged, [] {
+            SPDLOG_WARN("Compressed BC texture upload is unsupported by this rendering backend; skipping");
+        });
+    }
     virtual void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) = 0;
     virtual void SetDepthTestAndMask(bool depth_test, bool z_upd) = 0;
     virtual void SetZmodeDecal(bool decal) = 0;

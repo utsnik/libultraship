@@ -1411,6 +1411,21 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
 }
 
+// Dev builds: report every BC texture that misses the whole-image path, once per resource path, so a tour lists all
+// of them (SKIP = not drawn at all, UNALIGNED = wrong region drawn, CROP = partial load, not yet seen on hardware).
+static void BcPathLog(const char* kind, const RawTexMetadata* metadata, uint32_t texFlags, const char* why) {
+#if defined(__WIIU__) && WIIU_DIAGNOSTICS
+    static std::set<std::string> seen;
+    const std::string path = metadata->resource != nullptr ? metadata->resource->GetInitData()->Path : "<none>";
+    if (seen.insert(std::string(kind) + path).second) {
+        SPDLOG_INFO("BCPATH {} #{} flags=0x{:X} {}x{} ({}) {}", kind, seen.size(), texFlags, metadata->width,
+                    metadata->height, why, path);
+    }
+#else
+    (void)kind, (void)metadata, (void)texFlags, (void)why;
+#endif
+}
+
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     uint8_t fmt = mRdp->texture_tile[tile].fmt;
     uint8_t siz = mRdp->texture_tile[tile].siz;
@@ -1465,17 +1480,87 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
                     fmt,
                     siz,
                     paletteIndex,
-                    origSizeBytes };
+                    origSizeBytes,
+                    texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3) };
         } else {
             // CI8 uses both palette halves
             key = { origAddr,     { mRdp->palette_dram_addr[0], mRdp->palette_dram_addr[1] }, fmt, siz, paletteIndex,
-                    origSizeBytes };
+                    origSizeBytes, texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3) };
         }
     } else {
-        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
+        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes, texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3) };
     }
 
     if (TextureCacheLookup(i, key)) {
+        return;
+    }
+
+    const uint32_t compressedFlags = texFlags & (TEX_FLAG_BC1 | TEX_FLAG_BC3);
+    if (compressedFlags != 0) {
+        static bool unsupported_logged = false;
+        if (compressedFlags == (TEX_FLAG_BC1 | TEX_FLAG_BC3) || (texFlags & TEX_FLAG_LOAD_AS_RAW) == 0 ||
+            (texFlags & TEX_FLAG_LOAD_AS_IMG) != 0 || metadata->resource == nullptr || importReplacement) {
+            if (!unsupported_logged) {
+                SPDLOG_WARN("Interpreter: unsupported BC texture path; skipping compressed texture data");
+                unsupported_logged = true;
+            }
+            BcPathLog("SKIP", metadata, texFlags, importReplacement ? "replacement" : "flags/resource");
+            return;
+        }
+
+        // Large N64 textures do not fit TMEM and are loaded in parts (e.g. a 64x64 RGBA16 in two 64x32 halves), each
+        // drawn with its own triangles. Like ImportTextureRaw, upload only the loaded region of the HD image; the
+        // load offset is in RGBA8888-equivalent bytes (h_byte_scale already applied), so crop whole 4x4 blocks.
+        const uint8_t* image = metadata->resource->ImageData;
+        const uint32_t blockBytes = (compressedFlags & TEX_FLAG_BC1) ? 8 : 16;
+        uint32_t origLineSize = mRdp->texture_tile[tile].line_size_bytes;
+        if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
+            origLineSize *= 2;
+        }
+        const uint32_t origHeight = origLineSize != 0 ? origSizeBytes / origLineSize : 0;
+        const uint32_t regionW = (uint32_t)(origLineSize * metadata->h_byte_scale) / 4;
+        uint32_t regionH = (uint32_t)(origHeight * metadata->v_pixel_scale);
+        const size_t offset = static_cast<size_t>(origAddr - image);
+        const uint32_t x0 = (uint32_t)((offset % (metadata->width * 4u)) / 4);
+        const uint32_t y0 = (uint32_t)(offset / (metadata->width * 4u));
+        if (y0 < metadata->height && regionH > metadata->height - y0) {
+            regionH = metadata->height - y0;
+        }
+
+        if (x0 == 0 && y0 == 0 && regionW == metadata->width && regionH == metadata->height) {
+            mRapi->UploadTextureCompressed(image, metadata->width, metadata->height, compressedFlags,
+                                            metadata->resource->ImageDataSize);
+            return;
+        }
+
+        static bool unaligned_logged = false;
+        if (regionW == 0 || regionH == 0 || ((x0 | y0 | regionW | regionH) & 3) != 0 || x0 + regionW > metadata->width ||
+            y0 >= metadata->height) {
+            if (!unaligned_logged) {
+                SPDLOG_WARN("Interpreter: BC texture load region {}x{} at {},{} of {}x{} is not block-aligned; "
+                            "uploading the whole image",
+                            regionW, regionH, x0, y0, metadata->width, metadata->height);
+                unaligned_logged = true;
+            }
+            BcPathLog("UNALIGNED", metadata, texFlags, "whole image uploaded");
+            mRapi->UploadTextureCompressed(image, metadata->width, metadata->height, compressedFlags,
+                                            metadata->resource->ImageDataSize);
+            return;
+        }
+
+        BcPathLog("CROP", metadata, texFlags, "partial load");
+        const size_t srcBlockRow = static_cast<size_t>(metadata->width / 4) * blockBytes;
+        const size_t dstBlockRow = static_cast<size_t>(regionW / 4) * blockBytes;
+        const size_t regionBytes = dstBlockRow * (regionH / 4);
+        if (!EnsureTexUploadBuffer(regionBytes)) {
+            return;
+        }
+        for (uint32_t row = 0; row < regionH / 4; ++row) {
+            memcpy(mTexUploadBuffer + row * dstBlockRow,
+                   image + (static_cast<size_t>(y0 / 4 + row) * srcBlockRow) + static_cast<size_t>(x0 / 4) * blockBytes,
+                   dstBlockRow);
+        }
+        mRapi->UploadTextureCompressed(mTexUploadBuffer, regionW, regionH, compressedFlags, (uint32_t)regionBytes);
         return;
     }
 
@@ -2206,43 +2291,51 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             uint8_t cms = mRdp->texture_tile[tile].cms;
             uint8_t cmt = mRdp->texture_tile[tile].cmt;
 
-            uint32_t loaded_line_size = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
-            uint32_t loaded_size = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes;
-            uint32_t loaded_full_line =
-                mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
-            uint32_t tex_size_bytes;
-            uint32_t line_size;
-            if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
-                line_size = loaded_line_size;
-                tex_size_bytes = loaded_size;
+            // BC replacements use the N64 tile dimensions like raw HD textures: UVs are normalised by the original
+            // size and the GPU samples the HD surface with normalised coordinates.
+            const auto& loaded_texture = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+            const uint32_t compressed_flags = loaded_texture.tex_flags & (TEX_FLAG_BC1 | TEX_FLAG_BC3);
+            if (compressed_flags != 0 && loaded_texture.raw_tex_metadata.resource != nullptr) {
+                tex_width[i] = loaded_texture.raw_tex_metadata.width;
+                tex_height[i] = loaded_texture.raw_tex_metadata.height;
             } else {
-                line_size = mRdp->texture_tile[tile].line_size_bytes;
-                tex_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
-                // RGBA32: texture_tile stores TMEM-interleaved stride (half of actual DRAM stride).
-                if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
-                    line_size *= 2;
+                uint32_t loaded_line_size = loaded_texture.line_size_bytes;
+                uint32_t loaded_size = loaded_texture.size_bytes;
+                uint32_t loaded_full_line = loaded_texture.full_image_line_size_bytes;
+                uint32_t tex_size_bytes;
+                uint32_t line_size;
+                if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
+                    line_size = loaded_line_size;
+                    tex_size_bytes = loaded_size;
+                } else {
+                    line_size = mRdp->texture_tile[tile].line_size_bytes;
+                    tex_size_bytes = loaded_texture.orig_size_bytes;
+                    // RGBA32: texture_tile stores TMEM-interleaved stride (half of actual DRAM stride).
+                    if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
+                        line_size *= 2;
+                    }
                 }
-            }
 
-            if (line_size == 0) {
-                line_size = 1;
-            }
+                if (line_size == 0) {
+                    line_size = 1;
+                }
 
-            tex_height[i] = tex_size_bytes / line_size;
-            switch (mRdp->texture_tile[tile].siz) {
-                case G_IM_SIZ_4b:
-                    line_size <<= 1;
-                    break;
-                case G_IM_SIZ_8b:
-                    break;
-                case G_IM_SIZ_16b:
-                    line_size /= G_IM_SIZ_16b_LINE_BYTES;
-                    break;
-                case G_IM_SIZ_32b:
-                    line_size /= 4; // RGBA32: 4 bytes per pixel (line_size is now actual DRAM stride)
-                    break;
+                tex_height[i] = tex_size_bytes / line_size;
+                switch (mRdp->texture_tile[tile].siz) {
+                    case G_IM_SIZ_4b:
+                        line_size <<= 1;
+                        break;
+                    case G_IM_SIZ_8b:
+                        break;
+                    case G_IM_SIZ_16b:
+                        line_size /= G_IM_SIZ_16b_LINE_BYTES;
+                        break;
+                    case G_IM_SIZ_32b:
+                        line_size /= 4; // RGBA32: 4 bytes per pixel (line_size is now actual DRAM stride)
+                        break;
+                }
+                tex_width[i] = line_size;
             }
-            tex_width[i] = line_size;
 
             tex_width2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
             tex_height2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
