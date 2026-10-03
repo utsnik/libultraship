@@ -1541,6 +1541,14 @@ static ProfileBucket sBkProfile[2][kProfileTableSize];
 // Interrupted OSThread pointers, validated only by their tag in the alarm callback.
 static ProfileBucket sThProfile[2][kProfileTableSize];
 static OSAlarm sProfileAlarm;
+// Last ~10 s of samples (pc, first game-code return for system pcs, time) so a HITCH line can be followed by the
+// samples of exactly that frame (2026-10-03: cached area entries still cost 430-650 ms, ~300 ms outside rendering).
+static const uint32_t kHitchRingSize = 1024;
+static uint32_t sHitchRingPc[kHitchRingSize];
+static uint32_t sHitchRingCaller[kHitchRingSize];
+static uint32_t sHitchRingLr[kHitchRingSize];
+static uint32_t sHitchRingTime[kHitchRingSize];
+static volatile uint32_t sHitchRingHead = 0;
 static ProfileTop sTopPcs[kProfileTopPcCount];
 static ProfileTop sTopLrs[kProfileTopLrCount];
 static uint32_t sProfileSampleCount = 0;
@@ -1638,6 +1646,37 @@ void ReportHitchFrame(uint32_t renderMicroseconds, int32_t scene) {
          static_cast<uint32_t>(o2r.topArchives[2].readMicroseconds / 1000),
          resourceMilliseconds, xmlMilliseconds, xmlResources, binaryResources, textureUploads, textureMilliseconds,
          shaderPrograms);
+    // The profiler samples of this frame, oldest first: "pc" or "pc<caller" (caller = first game-code return
+    // address when the pc is in a system RPL). The host symbolises and sums them per function.
+    const uint32_t frameStart = (uint32_t)(now - OSMicrosecondsToTicks(microseconds));
+    const uint32_t head = sHitchRingHead;
+    char line[240];
+    int length = 0;
+    uint32_t count = 0;
+    for (uint32_t k = head > kHitchRingSize ? head - kHitchRingSize : 0; k < head; ++k) {
+        const uint32_t slot = k & (kHitchRingSize - 1);
+        if ((int32_t)(sHitchRingTime[slot] - frameStart) < 0) {
+            continue;
+        }
+        if (length == 0) {
+            length = snprintf(line, sizeof(line), "HPROF:");
+        }
+        // "pc/lr" or "pc/lr<caller"; caller = first game return for a system pc, bit 31 = game thread blocked there.
+        length += sHitchRingCaller[slot] != 0
+                      ? snprintf(line + length, sizeof(line) - (size_t)length, " %X/%X<%X", sHitchRingPc[slot],
+                                 sHitchRingLr[slot], sHitchRingCaller[slot])
+                      : snprintf(line + length, sizeof(line) - (size_t)length, " %X/%X", sHitchRingPc[slot],
+                                 sHitchRingLr[slot]);
+        ++count;
+        if (length > 200) {
+            Emit("%s\n", line);
+            length = 0;
+        }
+    }
+    if (length > 0) {
+        Emit("%s\n", line);
+    }
+    Emit("HPROF: samples=%u\n", count);
 }
 
 static OSThread sThread;
@@ -2068,8 +2107,10 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
     if (allocatorCaller != 0) {
         ProfileAdd(sAcProfile[set], allocatorCaller & ~0xFu);
     }
+    uint32_t gameCaller = 0;
     if (!ProfileIsGameText(pc)) {
         const uint32_t caller = ProfileFirstGameReturn(context->lr, context->gpr[1], stack);
+        gameCaller = caller;
         ProfileAdd(sGcProfile[set], caller != 0 ? (caller & ~0xFu) : 0xFFFFFFF0u);
     }
     if (sSampleThread != nullptr && context != &sSampleThread->context) {
@@ -2077,6 +2118,18 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
             ProfileFirstGameReturn(sSampleThread->context.lr, sSampleThread->context.gpr[1],
                                    ProfileStackOf(sSampleThread));
         ProfileAdd(sBkProfile[set], blocked != 0 ? (blocked & ~0xFu) : 0xFFFFFFF0u);
+        // The game thread is not running on its core: record where it is blocked (bit 31 marks "blocked").
+        if (blocked != 0) {
+            gameCaller = blocked | 0x80000000u;
+        }
+    }
+    {
+        const uint32_t slot = sHitchRingHead & (kHitchRingSize - 1);
+        sHitchRingPc[slot] = pc;
+        sHitchRingCaller[slot] = gameCaller;
+        sHitchRingLr[slot] = context->lr;
+        sHitchRingTime[slot] = (uint32_t)OSGetSystemTime();
+        sHitchRingHead = sHitchRingHead + 1;
     }
     ++sProfileCount[set];
 }
