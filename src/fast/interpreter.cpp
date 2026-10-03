@@ -2253,48 +2253,42 @@ void Interpreter::PrepareTriangleState(bool is_rect) {
             // BC replacements use the N64 tile dimensions like raw HD textures: UVs are normalised by the original
             // size and the GPU samples the HD surface with normalised coordinates.
             const auto& loaded_texture = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
-            const uint32_t compressed_flags = loaded_texture.tex_flags & (TEX_FLAG_BC1 | TEX_FLAG_BC3);
-            if (compressed_flags != 0 && loaded_texture.raw_tex_metadata.resource != nullptr) {
-                tex_width[i] = loaded_texture.raw_tex_metadata.width;
-                tex_height[i] = loaded_texture.raw_tex_metadata.height;
+            uint32_t loaded_line_size = loaded_texture.line_size_bytes;
+            uint32_t loaded_size = loaded_texture.size_bytes;
+            uint32_t loaded_full_line = loaded_texture.full_image_line_size_bytes;
+            uint32_t tex_size_bytes;
+            uint32_t line_size;
+            if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
+                line_size = loaded_line_size;
+                tex_size_bytes = loaded_size;
             } else {
-                uint32_t loaded_line_size = loaded_texture.line_size_bytes;
-                uint32_t loaded_size = loaded_texture.size_bytes;
-                uint32_t loaded_full_line = loaded_texture.full_image_line_size_bytes;
-                uint32_t tex_size_bytes;
-                uint32_t line_size;
-                if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
-                    line_size = loaded_line_size;
-                    tex_size_bytes = loaded_size;
-                } else {
-                    line_size = mRdp->texture_tile[tile].line_size_bytes;
-                    tex_size_bytes = loaded_texture.orig_size_bytes;
-                    // RGBA32: texture_tile stores TMEM-interleaved stride (half of actual DRAM stride).
-                    if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
-                        line_size *= 2;
-                    }
+                line_size = mRdp->texture_tile[tile].line_size_bytes;
+                tex_size_bytes = loaded_texture.orig_size_bytes;
+                // RGBA32: texture_tile stores TMEM-interleaved stride (half of actual DRAM stride).
+                if (mRdp->texture_tile[tile].siz == G_IM_SIZ_32b) {
+                    line_size *= 2;
                 }
-
-                if (line_size == 0) {
-                    line_size = 1;
-                }
-
-                tex_height[i] = tex_size_bytes / line_size;
-                switch (mRdp->texture_tile[tile].siz) {
-                    case G_IM_SIZ_4b:
-                        line_size <<= 1;
-                        break;
-                    case G_IM_SIZ_8b:
-                        break;
-                    case G_IM_SIZ_16b:
-                        line_size /= G_IM_SIZ_16b_LINE_BYTES;
-                        break;
-                    case G_IM_SIZ_32b:
-                        line_size /= 4; // RGBA32: 4 bytes per pixel (line_size is now actual DRAM stride)
-                        break;
-                }
-                tex_width[i] = line_size;
             }
+
+            if (line_size == 0) {
+                line_size = 1;
+            }
+
+            tex_height[i] = tex_size_bytes / line_size;
+            switch (mRdp->texture_tile[tile].siz) {
+                case G_IM_SIZ_4b:
+                    line_size <<= 1;
+                    break;
+                case G_IM_SIZ_8b:
+                    break;
+                case G_IM_SIZ_16b:
+                    line_size /= G_IM_SIZ_16b_LINE_BYTES;
+                    break;
+                case G_IM_SIZ_32b:
+                    line_size /= 4; // RGBA32: 4 bytes per pixel (line_size is now actual DRAM stride)
+                    break;
+            }
+            tex_width[i] = line_size;
 
             tex_width2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].lrs);
             tex_height2[i] = GetTileSizeFromCoordinates(mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrt);
