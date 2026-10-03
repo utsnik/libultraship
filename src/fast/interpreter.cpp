@@ -147,6 +147,12 @@ struct TriSetup {
     float tex_width_inv[2], tex_height_inv[2], clamp_s[2], clamp_t[2];
 };
 static TriSetup sTri;
+// gWiiU.TriCacheVerify 1 (dev check): on every cache hit, derive the state anyway and compare. Applying unchanged state
+// is a no-op, so a correct cache costs nothing visible; a wrong one is logged (with the last opcodes) and corrected.
+static bool sTriVerify = false;
+static uint32_t sTriHits = 0, sTriMisses = 0, sTriMismatches = 0, sTriRuns = 0;
+static uint8_t sOpRing[16];
+static uint32_t sOpRingPos = 0;
 static uint64_t sStaleSlots = 0;
 static uint64_t sStaleFromSubDl = 0; // subset of sStaleSlots set by sub-DL culling
 static uint64_t sPerfStaleTris = 0;
@@ -157,8 +163,10 @@ static uint64_t sPerfFlushCounts[static_cast<size_t>(PerfFlushReason::Count)] = 
 // changes arrive with an empty batch and cost nothing. Unlabelled Flush() calls count as Explicit.
 static PerfFlushReason sPendingFlushReason = PerfFlushReason::Explicit;
 
+static uint32_t sStateChangeRequests = 0; // every RecordPerfFlush = a state change GfxSpTri1 had to apply
 static inline void RecordPerfFlush(PerfFlushReason reason) {
     sPendingFlushReason = reason;
+    ++sStateChangeRequests;
 }
 
 Interpreter::Interpreter() {
@@ -2097,9 +2105,45 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     if (is_rect || sTriCacheGen != sTriStateGen) {
+        ++sTriMisses;
         PrepareTriangleState(is_rect);
         // Rectangles set state temporarily and restore it without a command: never reuse their setup.
         sTriCacheGen = is_rect ? 0 : sTriStateGen;
+    } else {
+        ++sTriHits;
+        if (sTriVerify) {
+            const TriSetup cached = sTri;
+            const uint32_t changes = sStateChangeRequests;
+            PrepareTriangleState(false);
+            const TriSetup& now = sTri;
+            bool same = changes == sStateChangeRequests && cached.use_alpha == now.use_alpha &&
+                        cached.use_fog == now.use_fog && cached.use_grayscale == now.use_grayscale &&
+                        cached.uv_half_offset == now.uv_half_offset && cached.numInputs == now.numInputs &&
+                        cached.tm == now.tm && cached.comb == now.comb &&
+                        memcmp(&cached.clip_parameters, &now.clip_parameters, sizeof(now.clip_parameters)) == 0;
+            for (int t = 0; t < 2 && same; t++) {
+                same = cached.usedTextures[t] == now.usedTextures[t] &&
+                       (!now.usedTextures[t] ||
+                        (cached.texture_scale_s[t] == now.texture_scale_s[t] &&
+                         cached.texture_scale_t[t] == now.texture_scale_t[t] &&
+                         cached.uls_div4[t] == now.uls_div4[t] && cached.ult_div4[t] == now.ult_div4[t] &&
+                         cached.tex_width_inv[t] == now.tex_width_inv[t] &&
+                         cached.tex_height_inv[t] == now.tex_height_inv[t] && cached.clamp_s[t] == now.clamp_s[t] &&
+                         cached.clamp_t[t] == now.clamp_t[t]));
+            }
+            if (!same && ++sTriMismatches <= 20) {
+                char ops[16 * 3 + 1];
+                for (uint32_t k = 0; k < 16; k++) {
+                    snprintf(ops + 3 * k, 4, "%02X ", sOpRing[(sOpRingPos + k) & 15]);
+                }
+                SPDLOG_INFO("TRICACHE MISMATCH #{} changes={} alpha {}->{} fog {}->{} tm {}->{} comb {}->{} "
+                            "inputs {}->{} tex {}{}->{}{} lastOps {}",
+                            sTriMismatches, sStateChangeRequests - changes, cached.use_alpha, now.use_alpha,
+                            cached.use_fog, now.use_fog, cached.tm, now.tm, (void*)cached.comb, (void*)now.comb,
+                            cached.numInputs, now.numInputs, cached.usedTextures[0], cached.usedTextures[1],
+                            now.usedTextures[0], now.usedTextures[1], ops);
+            }
+        }
     }
     const TriSetup& st = sTri;
     const bool use_alpha = st.use_alpha;
@@ -5307,6 +5351,7 @@ static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+    sOpRing[sOpRingPos++ & 15] = (uint8_t)opcode;
 
 #ifdef USE_GBI_TRACE
     if (cmd->words.trace.valid &&
@@ -5548,6 +5593,11 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     ++sTriStateGen;
+    sTriVerify = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gWiiU.TriCacheVerify", 0) != 0;
+    if (++sTriRuns % 600 == 0) {
+        SPDLOG_INFO("TRICACHE hits={} misses={} verify={} mismatches={}", sTriHits, sTriMisses, sTriVerify ? 1 : 0,
+                    sTriMismatches);
+    }
     SpReset();
 
     mGetPixelDepthPending.clear();
