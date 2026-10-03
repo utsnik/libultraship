@@ -195,6 +195,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
         "-Wl,--wrap=_Znam"
         "-Wl,--wrap=_Znwj"
         "-Wl,--wrap=_Znaj"
+        "-Wl,--wrap=VPADRead"
+        "-Wl,--wrap=KPADReadEx"
     )
 else()
     target_compile_definitions(libultraship PRIVATE
