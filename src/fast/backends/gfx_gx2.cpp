@@ -219,7 +219,7 @@ static uint32_t current_scissor_width = WIIU_DEFAULT_FB_WIDTH;
 static uint32_t current_scissor_height = WIIU_DEFAULT_FB_HEIGHT;
 
 static bool current_zmode_decal = false;
-static bool current_SSDB = -2.0f;
+static float current_SSDB = -2.0f;
 static bool current_use_alpha = false;
 
 static uint32_t gfx_gx2_elapsed_microseconds(OSTime start, OSTime end) {
@@ -1150,7 +1150,9 @@ static void gfx_gx2_set_zmode_decal(bool zmode_decal) {
         const int n64modeFactor = 120;
         const int noVanishFactor = 100;
         float SSDB = -2.0f;
-        switch (CVarGetInteger("gDirtPathFix", 0)) {
+        // CVAR_Z_FIGHTING_MODE like the PC backends: the game sets it per scene (SoH SceneSpecificDirtPathFix); the old
+        // "gDirtPathFix" name is migrated away and cleared by SoH, so reading it left the fix dead on Wii U.
+        switch (CVarGetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
             // scaled z-fighting (N64 mode like)
             case 1:
                 if (current_framebuffer) {
