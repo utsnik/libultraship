@@ -276,7 +276,9 @@ static void add_tex_clamp_T(struct RegTable* tbl, struct ShaderWriter* writer, u
         ALU_MAX(__, _y, texcoord_reg, _y, _R127, _y)
         ALU_LAST,
 
-        ALU_MIN(texcoord_reg, _y, ALU_SRC_PV, _y, texcoord_reg, _w)
+        /* T-only: the attribute is (u, v, clamp_t), so clamp_t is in .z. Reading .w got the GPU fill value 1.0
+           and clamped at the texture edge instead of the tile edge (2S2H wall streaks). */
+        ALU_MIN(texcoord_reg, _y, ALU_SRC_PV, _y, texcoord_reg, _z)
         ALU_LAST,
     );
 }
