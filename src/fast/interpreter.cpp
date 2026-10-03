@@ -132,6 +132,21 @@ static uint64_t sPerfGfxSpVertexCount = 0;
 // Vertex-batch culling (see VtxBatchCulled): slots whose last load was skipped as wholly off one clip plane.
 // They carry that plane's clip_rej bit but no transformed data; a triangle that reaches them without being
 // trivially rejected is dropped and counted (sPerfStaleTris) instead of drawn from stale values.
+// Triangle-state cache (see PrepareTriangleState): sTriStateGen is bumped by every state-changing display-list
+// command, at the start of each Run and on texture-cache clears; sTri belongs to generation sTriCacheGen.
+static uint32_t sTriStateGen = 1;
+static uint32_t sTriCacheGen = 0;
+struct TriSetup {
+    bool use_alpha, use_fog, use_grayscale, uv_half_offset;
+    bool usedTextures[2];
+    uint8_t numInputs;
+    uint32_t tm;
+    ColorCombiner* comb;
+    GfxClipParameters clip_parameters;
+    float texture_scale_s[2], texture_scale_t[2], uls_div4[2], ult_div4[2];
+    float tex_width_inv[2], tex_height_inv[2], clamp_s[2], clamp_t[2];
+};
+static TriSetup sTri;
 static uint64_t sStaleSlots = 0;
 static uint64_t sStaleFromSubDl = 0; // subset of sStaleSlots set by sub-DL culling
 static uint64_t sPerfStaleTris = 0;
@@ -458,6 +473,7 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
 }
 
 void Interpreter::TextureCacheClear() {
+    ++sTriStateGen;
     mOtrTextureCache.clear();
     WDOG_OTR_TEXTURE_CACHE_SIZE(mOtrTextureCache.size());
     for (const auto& entry : mTextureCache.map) {
@@ -1711,77 +1727,12 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->v = t;
 }
 
-void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
-    struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
-    struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
-    struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
-    struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
-
-    // if (rand()%2) return;
-
-    if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
-        // The whole triangle lies outside the visible area
-        return;
-    }
-    // (Rectangles use slots MAX_VERTICES..+3, which are never stale.)
-    if (sStaleSlots != 0 && ((vtx1_idx < 64 && ((sStaleSlots >> vtx1_idx) & 1)) ||
-                             (vtx2_idx < 64 && ((sStaleSlots >> vtx2_idx) & 1)) ||
-                             (vtx3_idx < 64 && ((sStaleSlots >> vtx3_idx) & 1)))) {
-        ++sPerfStaleTris;
-        const uint64_t tri = (vtx1_idx < 64 ? 1ULL << vtx1_idx : 0) | (vtx2_idx < 64 ? 1ULL << vtx2_idx : 0) |
-                             (vtx3_idx < 64 ? 1ULL << vtx3_idx : 0);
-        if (tri & sStaleFromSubDl) {
-            ++sPerfStaleTrisSubDl;
-        }
-        return;
-    }
-
-    const uint32_t cull_both = get_attr(CULL_BOTH);
-    const uint32_t cull_front = get_attr(CULL_FRONT);
-    const uint32_t cull_back = get_attr(CULL_BACK);
-
-    if ((mRsp->geometry_mode & cull_both) != 0) {
-        float cross;
-        if (v1->w != 0.0f && v2->w != 0.0f && v3->w != 0.0f) {
-            cross = -(v1->x * (v2->y * v3->w - v2->w * v3->y) -
-                      v1->y * (v2->x * v3->w - v2->w * v3->x) +
-                      v1->w * (v2->x * v3->y - v2->y * v3->x));
-        } else {
-            float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
-            float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
-            float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
-            float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
-            cross = dx1 * dy2 - dy1 * dx2;
-
-            if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
-                // If one vertex lies behind the eye, negating cross will give the correct result.
-                // If all vertices lie behind the eye, the triangle will be rejected anyway.
-                cross = -cross;
-            }
-        }
-
-        // If inverted culling is requested, negate the cross
-        if (ucode_handler_index == UcodeHandlers::ucode_f3dex2 &&
-            (mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) == 1) {
-            cross = -cross;
-        }
-
-        auto cull_type = mRsp->geometry_mode & cull_both;
-
-        if (cull_type == cull_front) {
-            if (cross <= 0) {
-                return;
-            }
-        } else if (cull_type == cull_back) {
-            if (cross >= 0) {
-                return;
-            }
-        } else if (cull_type == cull_both) {
-            // Why is this even an option?
-            return;
-        }
-    }
-
+// Everything GfxSpTri1 derives from RDP/RSP state before it emits vertices (depth/decal/viewport, combiner, texture
+// import, samplers, shader, UV constants). It only changes when a display-list command other than a vertex, triangle,
+// matrix or DL-flow command runs (gfx_step bumps sTriStateGen), so consecutive triangles reuse it: re-deriving it per
+// triangle was the "dirty-flag fast path" lever in docs/2026-09-29-soh-night-perf.md (Water Temple 3DS geometry spent
+// ~60% of its render CPU in GfxSpTri1/GfxSpVertex, 2026-10-03).
+void Interpreter::PrepareTriangleState(bool is_rect) {
     bool depth_test = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
@@ -2047,6 +1998,127 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
     const bool uv_half_offset = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT && !is_rect;
+
+
+    TriSetup& o = sTri;
+    o.use_alpha = use_alpha;
+    o.use_fog = use_fog;
+    o.use_grayscale = use_grayscale;
+    o.comb = comb;
+    o.numInputs = numInputs;
+    o.tm = tm;
+    o.clip_parameters = clip_parameters;
+    o.uv_half_offset = uv_half_offset;
+    for (int t = 0; t < 2; t++) {
+        o.usedTextures[t] = usedTextures[t];
+        if (!usedTextures[t]) {
+            continue;
+        }
+        o.texture_scale_s[t] = texture_scale_s[t];
+        o.texture_scale_t[t] = texture_scale_t[t];
+        o.uls_div4[t] = uls_div4[t];
+        o.ult_div4[t] = ult_div4[t];
+        o.tex_width_inv[t] = tex_width_inv[t];
+        o.tex_height_inv[t] = tex_height_inv[t];
+        o.clamp_s[t] = clamp_s[t];
+        o.clamp_t[t] = clamp_t[t];
+    }
+}
+
+void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
+    struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
+    struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
+    struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+
+    // if (rand()%2) return;
+
+    if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
+        // The whole triangle lies outside the visible area
+        return;
+    }
+    // (Rectangles use slots MAX_VERTICES..+3, which are never stale.)
+    if (sStaleSlots != 0 && ((vtx1_idx < 64 && ((sStaleSlots >> vtx1_idx) & 1)) ||
+                             (vtx2_idx < 64 && ((sStaleSlots >> vtx2_idx) & 1)) ||
+                             (vtx3_idx < 64 && ((sStaleSlots >> vtx3_idx) & 1)))) {
+        ++sPerfStaleTris;
+        const uint64_t tri = (vtx1_idx < 64 ? 1ULL << vtx1_idx : 0) | (vtx2_idx < 64 ? 1ULL << vtx2_idx : 0) |
+                             (vtx3_idx < 64 ? 1ULL << vtx3_idx : 0);
+        if (tri & sStaleFromSubDl) {
+            ++sPerfStaleTrisSubDl;
+        }
+        return;
+    }
+
+    const uint32_t cull_both = get_attr(CULL_BOTH);
+    const uint32_t cull_front = get_attr(CULL_FRONT);
+    const uint32_t cull_back = get_attr(CULL_BACK);
+
+    if ((mRsp->geometry_mode & cull_both) != 0) {
+        float cross;
+        if (v1->w != 0.0f && v2->w != 0.0f && v3->w != 0.0f) {
+            cross = -(v1->x * (v2->y * v3->w - v2->w * v3->y) -
+                      v1->y * (v2->x * v3->w - v2->w * v3->x) +
+                      v1->w * (v2->x * v3->y - v2->y * v3->x));
+        } else {
+            float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
+            float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
+            float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
+            float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
+            cross = dx1 * dy2 - dy1 * dx2;
+
+            if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
+                // If one vertex lies behind the eye, negating cross will give the correct result.
+                // If all vertices lie behind the eye, the triangle will be rejected anyway.
+                cross = -cross;
+            }
+        }
+
+        // If inverted culling is requested, negate the cross
+        if (ucode_handler_index == UcodeHandlers::ucode_f3dex2 &&
+            (mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) == 1) {
+            cross = -cross;
+        }
+
+        auto cull_type = mRsp->geometry_mode & cull_both;
+
+        if (cull_type == cull_front) {
+            if (cross <= 0) {
+                return;
+            }
+        } else if (cull_type == cull_back) {
+            if (cross >= 0) {
+                return;
+            }
+        } else if (cull_type == cull_both) {
+            // Why is this even an option?
+            return;
+        }
+    }
+
+    if (is_rect || sTriCacheGen != sTriStateGen) {
+        PrepareTriangleState(is_rect);
+        // Rectangles set state temporarily and restore it without a command: never reuse their setup.
+        sTriCacheGen = is_rect ? 0 : sTriStateGen;
+    }
+    const TriSetup& st = sTri;
+    const bool use_alpha = st.use_alpha;
+    const bool use_fog = st.use_fog;
+    const bool use_grayscale = st.use_grayscale;
+    const ColorCombiner* comb = st.comb;
+    const uint8_t numInputs = st.numInputs;
+    const bool* usedTextures = st.usedTextures;
+    const uint32_t tm = st.tm;
+    const float* texture_scale_s = st.texture_scale_s;
+    const float* texture_scale_t = st.texture_scale_t;
+    const float* uls_div4 = st.uls_div4;
+    const float* ult_div4 = st.ult_div4;
+    const float* tex_width_inv = st.tex_width_inv;
+    const float* tex_height_inv = st.tex_height_inv;
+    const float* clamp_s = st.clamp_s;
+    const float* clamp_t = st.clamp_t;
+    const GfxClipParameters& clip_parameters = st.clip_parameters;
+    const bool uv_half_offset = st.uv_half_offset;
 
     // Write through a local pointer: storing to mBufVboLen after every float (it cannot stay in a register
     // across the float stores, which may alias it) cost a store per component.
@@ -5215,6 +5287,22 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
     }
 }
 
+// Commands that cannot change the state PrepareTriangleState derives (vertices, triangles, matrices, DL flow,
+// syncs/no-ops). Every other command invalidates the triangle-state cache.
+static inline bool TriStateNeutral(GfxOpcodeHandlerFunc f) {
+    return f == gfx_tri1_otr_handler_f3dex2 || f == gfx_tri1_handler_f3dex2 || f == gfx_tri1_handler_f3dex ||
+           f == gfx_tri1_handler_f3d || f == gfx_tri2_handler_f3dex || f == gfx_quad_handler_f3dex2 ||
+           f == gfx_quad_handler_f3dex || f == gfx_vtx_handler_f3dex2 || f == gfx_vtx_handler_f3dex ||
+           f == gfx_vtx_handler_f3d || f == gfx_vtx_hash_handler_custom || f == gfx_vtx_otr_filepath_handler_custom ||
+           f == gfx_modify_vtx_handler_f3dex2 || f == gfx_mtx_handler_f3dex2 || f == gfx_mtx_handler_f3d ||
+           f == gfx_mtx_otr_handler_custom || f == gfx_mtx_otr_filepath_handler_custom ||
+           f == gfx_pop_mtx_handler_f3dex2 || f == gfx_pop_mtx_handler_f3d || f == gfx_dl_handler_common ||
+           f == gfx_dl_otr_hash_handler_custom || f == gfx_dl_otr_filepath_handler_custom ||
+           f == gfx_dl_index_handler || f == gfx_end_dl_handler_common || f == gfx_noop_handler_f3dex2 ||
+           f == gfx_cull_dl_handler_f3dex2 || f == gfx_branch_z_otr_handler_f3dex2 || f == gfx_marker_handler_otr ||
+           f == gfx_stubbed_command_handler;
+}
+
 static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
@@ -5235,6 +5323,7 @@ static void gfx_step() {
 #endif
 
     if (opcode == F3DEX2_G_LOAD_UCODE) {
+        ++sTriStateGen; // the cull/attribute mapping is ucode-specific
         gfx_set_ucode_handler((UcodeHandlers)(cmd->words.w0 & 0xFFFFFF));
         ++cmd;
         return;
@@ -5242,16 +5331,28 @@ static void gfx_step() {
     }
 
     if (otrHandlers.contains(opcode)) {
-        if (otrHandlers.at(opcode).second(&cmd)) {
+        const GfxOpcodeHandlerFunc handler = otrHandlers.at(opcode).second;
+        if (!TriStateNeutral(handler)) {
+            ++sTriStateGen;
+        }
+        if (handler(&cmd)) {
             return;
         }
     } else if (rdpHandlers.contains(opcode)) {
-        if (rdpHandlers.at(opcode).second(&cmd)) {
+        const GfxOpcodeHandlerFunc handler = rdpHandlers.at(opcode).second;
+        if (!TriStateNeutral(handler)) {
+            ++sTriStateGen;
+        }
+        if (handler(&cmd)) {
             return;
         }
     } else if (ucode_handler_index < ucode_handlers.size()) {
         if (ucode_handlers[ucode_handler_index]->contains(opcode)) {
-            if (ucode_handlers[ucode_handler_index]->at(opcode).second(&cmd)) {
+            const GfxOpcodeHandlerFunc handler = ucode_handlers[ucode_handler_index]->at(opcode).second;
+            if (!TriStateNeutral(handler)) {
+                ++sTriStateGen;
+            }
+            if (handler(&cmd)) {
                 return;
             }
         } else {
@@ -5446,6 +5547,7 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+    ++sTriStateGen;
     SpReset();
 
     mGetPixelDepthPending.clear();
