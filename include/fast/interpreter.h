@@ -195,9 +195,9 @@ struct TextureCacheKey {
     struct Hasher {
         size_t operator()(const TextureCacheKey& key) const noexcept {
             uintptr_t addr = (uintptr_t)key.texture_addr;
-            size_t hash = (size_t)(addr ^ (addr >> 5));
-            hash ^= (size_t)key.texture_flags + (hash << 6) + (hash >> 2);
-            return hash;
+            // Address only: TextureCacheDelete finds every entry for an address through this bucket, so the hash
+            // must not depend on anything else (texture_flags still separates BC entries through operator==).
+            return (size_t)(addr ^ (addr >> 5));
         }
     };
 };
