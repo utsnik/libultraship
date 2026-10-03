@@ -3792,10 +3792,11 @@ extern "C" void FastGetAndResetCullDlPerf(uint64_t* tested, uint64_t* rejected) 
 // all outside the same clip plane, the rest of the list is skipped, as the RSP does. Every triangle inside
 // the box would fail GfxSpTri1's `v1->clip_rej & v2->clip_rej & v3->clip_rej` test anyway, and the flags
 // already include the widescreen aspect scaling, so this only drops work whose output is discarded.
-// Off switch: gWiiU.CullDisplayLists 0 (in case a replacement model outgrows its original bounding box).
+// Default OFF (gWiiU.CullDisplayLists 1 enables): ending a list early broke skinned packs that reuse the previous
+// limb's vertices (Lost Woods Deku Scrub line to Link, 2026-10-03); it only saved ~3 lists/frame.
 bool gfx_cull_dl_handler_f3dex2(F3DGfx** cmd) {
     Interpreter* gfx = mInstance.lock().get();
-    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.CullDisplayLists", 1) == 0) {
+    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.CullDisplayLists", 0) == 0) {
         return false;
     }
 
