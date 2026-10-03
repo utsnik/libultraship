@@ -94,7 +94,7 @@ void ResetInputState() {
 
 bool IsInputEdgeFixEnabled() {
     if ((runtime.cvarCalls++ & 0xFFu) == 0) {
-        const auto context = Ship::Context::GetInstance();
+        const auto context = Ship::Context::GetRawInstance();
         if (context != nullptr) {
             const auto consoleVariables = context->GetConsoleVariables();
             if (consoleVariables != nullptr) {
