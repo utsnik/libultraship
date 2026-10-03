@@ -666,6 +666,10 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 
 // Archives are opened before Context::InitConsoleVariables (SoH's OTR version probe), so the
 // console variables may not exist yet: fall back to the default then instead of dereferencing null.
+// A game may raise the preload defaults for its own archive set (2S2H: mm.o2r and its BC texture pack).
+// The json values still win; without the hook every game keeps 16 MB per archive / 64 MB in total.
+extern "C" void wiiu_o2r_preload_defaults(int32_t* maxArchiveMB, int32_t* budgetMB) __attribute__((weak));
+
 static int32_t O2rPreloadCVar(const char* name, int32_t defaultValue) {
     auto context = Context::GetRawInstance();
     if (context == nullptr || context->GetConsoleVariables() == nullptr) {
@@ -713,10 +717,13 @@ bool O2rArchive::Open() {
             preloadSkipReason = "size";
         } else {
             const size_t archiveSize = static_cast<size_t>(archiveSize64);
-            const int32_t maxArchiveMB =
-                O2rPreloadCVar("gWiiU.O2rPreloadMaxArchiveMB", 16);
-            const int32_t budgetMB =
-                O2rPreloadCVar("gWiiU.O2rPreloadBudgetMB", 64);
+            int32_t defaultMaxArchiveMB = 16;
+            int32_t defaultBudgetMB = 64;
+            if (wiiu_o2r_preload_defaults != nullptr) {
+                wiiu_o2r_preload_defaults(&defaultMaxArchiveMB, &defaultBudgetMB);
+            }
+            const int32_t maxArchiveMB = O2rPreloadCVar("gWiiU.O2rPreloadMaxArchiveMB", defaultMaxArchiveMB);
+            const int32_t budgetMB = O2rPreloadCVar("gWiiU.O2rPreloadBudgetMB", defaultBudgetMB);
             const uint64_t maxArchiveBytes = maxArchiveMB > 0
                                                   ? static_cast<uint64_t>(maxArchiveMB) * 1024 * 1024
                                                   : 0;
