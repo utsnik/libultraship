@@ -1546,6 +1546,7 @@ static OSAlarm sProfileAlarm;
 static const uint32_t kHitchRingSize = 1024;
 static uint32_t sHitchRingPc[kHitchRingSize];
 static uint32_t sHitchRingCaller[kHitchRingSize];
+static uint32_t sHitchRingLr[kHitchRingSize];
 static uint32_t sHitchRingTime[kHitchRingSize];
 static volatile uint32_t sHitchRingHead = 0;
 static ProfileTop sTopPcs[kProfileTopPcCount];
@@ -1659,10 +1660,12 @@ void ReportHitchFrame(uint32_t renderMicroseconds, int32_t scene) {
         if (length == 0) {
             length = snprintf(line, sizeof(line), "HPROF:");
         }
+        // "pc/lr" or "pc/lr<caller"; caller = first game return for a system pc, bit 31 = game thread blocked there.
         length += sHitchRingCaller[slot] != 0
-                      ? snprintf(line + length, sizeof(line) - (size_t)length, " %X<%X", sHitchRingPc[slot],
-                                 sHitchRingCaller[slot])
-                      : snprintf(line + length, sizeof(line) - (size_t)length, " %X", sHitchRingPc[slot]);
+                      ? snprintf(line + length, sizeof(line) - (size_t)length, " %X/%X<%X", sHitchRingPc[slot],
+                                 sHitchRingLr[slot], sHitchRingCaller[slot])
+                      : snprintf(line + length, sizeof(line) - (size_t)length, " %X/%X", sHitchRingPc[slot],
+                                 sHitchRingLr[slot]);
         ++count;
         if (length > 200) {
             Emit("%s\n", line);
@@ -2109,18 +2112,23 @@ static void ProfileAlarmCallback(OSAlarm* alarm, OSContext* context) {
         gameCaller = caller;
         ProfileAdd(sGcProfile[set], caller != 0 ? (caller & ~0xFu) : 0xFFFFFFF0u);
     }
-    {
-        const uint32_t slot = sHitchRingHead & (kHitchRingSize - 1);
-        sHitchRingPc[slot] = pc;
-        sHitchRingCaller[slot] = gameCaller;
-        sHitchRingTime[slot] = (uint32_t)OSGetSystemTime();
-        sHitchRingHead = sHitchRingHead + 1;
-    }
     if (sSampleThread != nullptr && context != &sSampleThread->context) {
         const uint32_t blocked =
             ProfileFirstGameReturn(sSampleThread->context.lr, sSampleThread->context.gpr[1],
                                    ProfileStackOf(sSampleThread));
         ProfileAdd(sBkProfile[set], blocked != 0 ? (blocked & ~0xFu) : 0xFFFFFFF0u);
+        // The game thread is not running on its core: record where it is blocked (bit 31 marks "blocked").
+        if (blocked != 0) {
+            gameCaller = blocked | 0x80000000u;
+        }
+    }
+    {
+        const uint32_t slot = sHitchRingHead & (kHitchRingSize - 1);
+        sHitchRingPc[slot] = pc;
+        sHitchRingCaller[slot] = gameCaller;
+        sHitchRingLr[slot] = context->lr;
+        sHitchRingTime[slot] = (uint32_t)OSGetSystemTime();
+        sHitchRingHead = sHitchRingHead + 1;
     }
     ++sProfileCount[set];
 }
