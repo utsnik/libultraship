@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <thread>
 #include "ship/utils/StringHelper.h"
+#include "ship/utils/glob.h"
 #include "ship/utils/Utils.h"
 #include "ship/config/ConsoleVariable.h"
 #include "ship/Context.h"
@@ -398,10 +399,37 @@ void ResourceManager::UnloadResources(const ResourceFilter& filter) {
 }
 
 void ResourceManager::UnloadResourcesProcess(const ResourceFilter& filter) {
-    auto list = GetArchiveManager()->ListFiles(filter.IncludeMasks, filter.ExcludeMasks);
-
-    for (const auto& key : *list.get()) {
-        UnloadResource({ key, mDefaultCacheOwner, mDefaultCacheArchive });
+    // Walk the cache instead of listing every archive path: SoH unloads "alt/*" on EVERY scene change, and listing
+    // that meant copying and glob-matching every alt path in every archive (tens of thousands) to find the few
+    // thousand cached ones - ~10% of each Wii U area entry (2026-10-03 HPROF). Same entries are unloaded: default
+    // owner/archive keys whose path matches the filter (cached paths all come from the archives).
+    const auto matches = [](const std::list<std::string>& masks, const std::string& path) {
+        for (const auto& mask : masks) {
+            if (glob_match(mask.c_str(), path.c_str())) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Erased resources are released after the lock: a destructor may unload other resources (see UnloadResource).
+    std::vector<std::variant<ResourceLoadError, std::shared_ptr<IResource>>> released;
+    {
+        const std::lock_guard<std::mutex> lock(mMutex);
+        for (auto it = mResourceCache.begin(); it != mResourceCache.end();) {
+            const ResourceIdentifier& id = it->first;
+            if (id.Owner == mDefaultCacheOwner && id.Parent == mDefaultCacheArchive &&
+                (filter.IncludeMasks.empty() || matches(filter.IncludeMasks, id.Path)) &&
+                !matches(filter.ExcludeMasks, id.Path)) {
+                released.push_back(std::move(it->second));
+                it = mResourceCache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!released.empty()) {
+            mCacheGeneration.fetch_add(1, std::memory_order_relaxed);
+            WDOG_RESOURCE_CACHE_SIZE(mResourceCache.size());
+        }
     }
 }
 
