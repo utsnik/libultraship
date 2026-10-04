@@ -192,8 +192,14 @@ void Fast3dGui::ImGuiBackendInit() {
 
 #ifdef __APPLE__
         case WindowBackend::FAST3D_SDL_METAL: {
-            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
-            api->MetalInit(mImpl.Metal.Renderer);
+            auto interpreter = mInterpreter.lock();
+            if (interpreter == nullptr) {
+                return;
+            }
+            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)interpreter->GetCurrentRenderingAPI();
+            if (api != nullptr) {
+                api->MetalInit(mImpl.Metal.Renderer);
+            }
             break;
         }
 #endif
@@ -260,8 +266,13 @@ void Fast3dGui::ImGuiBackendNewFrame() {
 
 #ifdef __APPLE__
         case WindowBackend::FAST3D_SDL_METAL: {
-            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
-            api->NewFrame();
+            auto interpreter = mInterpreter.lock();
+            if (interpreter != nullptr) {
+                GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)interpreter->GetCurrentRenderingAPI();
+                if (api != nullptr) {
+                    api->NewFrame();
+                }
+            }
             break;
         }
 #endif
@@ -315,8 +326,14 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
 
 #ifdef __APPLE__
         case WindowBackend::FAST3D_SDL_METAL: {
-            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
-            api->RenderDrawData(data);
+            auto interpreter = mInterpreter.lock();
+            if (interpreter == nullptr) {
+                return;
+            }
+            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)interpreter->GetCurrentRenderingAPI();
+            if (api != nullptr) {
+                api->RenderDrawData(data);
+            }
             break;
         }
 #endif
@@ -356,8 +373,14 @@ void Fast3dGui::DrawFloatingWindows() {
 #ifdef __APPLE__
         // Metal requires additional frame setup to get ImGui ready for drawing floating windows
         if (mImpl.Backend == WindowBackend::FAST3D_SDL_METAL) {
-            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
-            api->SetupFloatingFrame();
+            auto interpreter = mInterpreter.lock();
+            if (interpreter == nullptr) {
+                return;
+            }
+            GfxRenderingAPIMetal* api = (GfxRenderingAPIMetal*)interpreter->GetCurrentRenderingAPI();
+            if (api != nullptr) {
+                api->SetupFloatingFrame();
+            }
         }
 #endif
 
@@ -382,9 +405,14 @@ void Fast3dGui::CalculateGameViewport() {
     mainPos.x -= mTemporaryWindowPos.x;
     mainPos.y -= mTemporaryWindowPos.y;
     ImVec2 size = ImGui::GetContentRegionAvail();
-    const auto interpreter = mInterpreter.lock().get();
-    interpreter->mCurDimensions.width = (uint32_t)(size.x * mInterpreter.lock()->mCurDimensions.internal_mul);
-    interpreter->mCurDimensions.height = (uint32_t)(size.y * mInterpreter.lock()->mCurDimensions.internal_mul);
+    const auto interpreter = mInterpreter.lock();
+    if (interpreter == nullptr) {
+        // Extraction can draw frames before the interpreter is wired up.
+        ImGui::End();
+        return;
+    }
+    interpreter->mCurDimensions.width = (uint32_t)(size.x * interpreter->mCurDimensions.internal_mul);
+    interpreter->mCurDimensions.height = (uint32_t)(size.y * interpreter->mCurDimensions.internal_mul);
     interpreter->mGameWindowViewport.x = (int16_t)mainPos.x;
     interpreter->mGameWindowViewport.y = (int16_t)mainPos.y;
     interpreter->mGameWindowViewport.width = (int16_t)size.x;
@@ -439,14 +467,14 @@ void Fast3dGui::DrawGame() {
     ImVec2 mainPos = ImGui::GetWindowPos();
     ImVec2 size = ImGui::GetContentRegionAvail();
     ImVec2 pos = ImVec2(0, 0);
-    const auto interpreter = mInterpreter.lock().get();
+    const auto interpreter = mInterpreter.lock();
 
     if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_LOW_RES_MODE, 0) ==
         1) { // N64 Mode takes priority
         const float sw = size.y * 320.0f / 240.0f;
         pos = ImVec2(floor(size.x / 2 - sw / 2), 0);
         size = ImVec2(sw, size.y);
-    } else if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+    } else if (interpreter != nullptr && Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
                    CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0)) {
         if (!Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
                 CVAR_PREFIX_ADVANCED_RESOLUTION ".PixelPerfectMode", 0)) {
@@ -506,7 +534,10 @@ void Fast3dGui::ApplyResolutionChanges() {
     constexpr uint32_t maxResolutionHeight = 4320; // on either axis. if you have the VRAM for it.
     uint32_t newWidth;
     uint32_t newHeight;
-    const auto interpreter = mInterpreter.lock().get();
+    const auto interpreter = mInterpreter.lock();
+    if (interpreter == nullptr) {
+        return;
+    }
     interpreter->GetCurDimensions(&newWidth, &newHeight);
 
     if (verticalResolutionToggle) { // Use fixed vertical resolution
@@ -547,7 +578,10 @@ void Fast3dGui::ApplyResolutionChanges() {
 }
 
 int16_t Fast3dGui::GetIntegerScaleFactor() {
-    const auto interpreter = mInterpreter.lock().get();
+    const auto interpreter = mInterpreter.lock();
+    if (interpreter == nullptr) {
+        return 1;
+    }
     if (!Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
             CVAR_PREFIX_ADVANCED_RESOLUTION ".IntegerScale.FitAutomatically", 0)) {
         int16_t factor = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
@@ -592,8 +626,12 @@ int16_t Fast3dGui::GetIntegerScaleFactor() {
 }
 
 ImTextureID Fast3dGui::GetTextureById(int32_t id) {
-    GfxRenderingAPI* api = mInterpreter.lock()->GetCurrentRenderingAPI();
-    return api->GetTextureById(id);
+    auto interpreter = mInterpreter.lock();
+    if (interpreter == nullptr) {
+        return nullptr;
+    }
+    GfxRenderingAPI* api = interpreter->GetCurrentRenderingAPI();
+    return api != nullptr ? api->GetTextureById(id) : nullptr;
 }
 
 bool Fast3dGui::HasTextureByName(const std::string& name) {
@@ -627,7 +665,14 @@ void Fast3dGui::LoadTextureFromRawImage(const std::string& name, const std::stri
 }
 
 void Fast3dGui::LoadTextureFromResource(const std::string& name, std::shared_ptr<Ship::GuiTexture> texture) {
-    GfxRenderingAPI* api = mInterpreter.lock()->GetCurrentRenderingAPI();
+    auto interpreter = mInterpreter.lock();
+    if (interpreter == nullptr || texture == nullptr) {
+        return;
+    }
+    GfxRenderingAPI* api = interpreter->GetCurrentRenderingAPI();
+    if (api == nullptr) {
+        return;
+    }
 
     // TODO: Nothing ever unloads the texture from Fast3D here.
     texture->Metadata.RendererTextureId = api->NewTexture();
@@ -640,7 +685,14 @@ void Fast3dGui::LoadTextureFromResource(const std::string& name, std::shared_ptr
 
 void Fast3dGui::LoadGuiTexture(const std::string& name, const Fast::Texture& res, const std::string& palettePath,
                                const ImVec4& tint) {
-    GfxRenderingAPI* api = mInterpreter.lock()->GetCurrentRenderingAPI();
+    auto interpreter = mInterpreter.lock();
+    if (interpreter == nullptr) {
+        return;
+    }
+    GfxRenderingAPI* api = interpreter->GetCurrentRenderingAPI();
+    if (api == nullptr) {
+        return;
+    }
     std::vector<uint8_t> texBuffer;
     texBuffer.reserve(res.Width * res.Height * 4);
 
@@ -827,8 +879,12 @@ void Fast3dGui::LoadGuiTexture(const std::string& name, const Fast::Texture& res
 
 void Fast3dGui::LoadGuiTexture(const std::string& name, const std::string& path, const std::string& palettePath,
                                const ImVec4& tint) {
-    const auto res = static_cast<Fast::Texture*>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true).get());
+    const auto resource = Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true);
+    const auto res = static_cast<Fast::Texture*>(resource.get());
+    if (res == nullptr) {
+        SPDLOG_WARN("ImGui::ResourceLoad: Failed to load asset from path: {}", path);
+        return;
+    }
 
     LoadGuiTexture(name, *res, palettePath, tint);
 }
@@ -836,8 +892,14 @@ void Fast3dGui::LoadGuiTexture(const std::string& name, const std::string& path,
 void Fast3dGui::UnloadTexture(const std::string& name) {
     if (mGuiTextures.contains(name)) {
         Ship::GuiTextureMetadata tex = mGuiTextures[name];
-        GfxRenderingAPI* api = mInterpreter.lock()->GetCurrentRenderingAPI();
-        api->DeleteTexture(tex.RendererTextureId);
+        auto interpreter = mInterpreter.lock();
+        if (interpreter == nullptr) {
+            return;
+        }
+        GfxRenderingAPI* api = interpreter->GetCurrentRenderingAPI();
+        if (api != nullptr) {
+            api->DeleteTexture(tex.RendererTextureId);
+        }
         mGuiTextures.erase(name);
     }
 }
