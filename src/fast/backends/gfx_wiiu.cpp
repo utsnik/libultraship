@@ -26,6 +26,7 @@
 #include <whb/proc.h>
 #include <proc_ui/procui.h>
 #include <proc_ui/memory.h>
+#include <sysapp/launch.h>
 
 #include <vpad/input.h>
 #include <padscore/kpad.h>
@@ -164,6 +165,10 @@ bool gfx_wiiu_init_mem1(void) {
 }
 
 void gfx_wiiu_close(void) {
+    // Ask ProcUI to perform the normal title-exit sequence. The caller must keep
+    // pumping frames until WHBProcIsRunning() becomes false; tearing down GX2 or
+    // calling exit() while the title still owns the foreground can hang Cafe OS.
+    SYSLaunchMenu();
 }
 
 void gfx_wiiu_destroy_mem1(void) {
