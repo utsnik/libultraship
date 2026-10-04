@@ -2,6 +2,8 @@
 #define GFX_WIIU_H
 #ifdef ENABLE_GX2
 
+#include <atomic>
+
 #include <vpad/input.h>
 #include <padscore/kpad.h>
 
@@ -19,7 +21,7 @@
 #define WIIU_DEFAULT_FB_WIDTH 1920
 #define WIIU_DEFAULT_FB_HEIGHT 1080
 
-extern bool has_foreground;
+extern std::atomic<bool> has_foreground;
 extern uint32_t frametime;
 extern uint64_t gfx_wiiu_perf_vsync_wait_us;
 extern uint32_t gfx_wiiu_perf_dropped_frames;

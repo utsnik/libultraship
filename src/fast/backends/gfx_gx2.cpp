@@ -1472,7 +1472,7 @@ void gfx_gx2_shutdown(void) {
 
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_gx2_shutdown enter\n");
 
-    if (has_foreground) {
+    if (has_foreground.load(std::memory_order_acquire)) {
         gfx_gx2_draw_done("shutdown");
         gfx_gx2_release_pending_image_frees(true);
 
@@ -1777,6 +1777,10 @@ static void gfx_gx2_perf_tick(uint32_t cpu_us) {
 }
 
 static void gfx_gx2_end_frame(void) {
+    if (!has_foreground.load(std::memory_order_acquire)) {
+        return;
+    }
+
     const bool trace = gfx_gx2_trace_first_frame;
     DrawBufferSlot& slot = draw_buffer_slots[draw_buffer_slot_index];
     Ship::WiiU::Watchdog::gDrawBufferHighWaterBytes = draw_buffer_frame_high_water;
@@ -1819,12 +1823,25 @@ static void gfx_gx2_end_frame(void) {
         uint32_t swap_count, flip_count;
         OSTime last_flip, last_vsync;
         for (int waits = 0; waits < 10; waits++) {
+            if (!has_foreground.load(std::memory_order_acquire)) {
+                return;
+            }
+
             GX2GetSwapStatus(&swap_count, &flip_count, &last_flip, &last_vsync);
             if (swap_count == flip_count) {
                 break;
             }
+
+            if (!has_foreground.load(std::memory_order_acquire)) {
+                return;
+            }
+
             GX2WaitForVsync();
         }
+    }
+
+    if (!has_foreground.load(std::memory_order_acquire)) {
+        return;
     }
 
     if (trace) {

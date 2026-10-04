@@ -4,6 +4,8 @@
 #include <time.h>
 #include <malloc.h>
 
+#include <atomic>
+
 #include <spdlog/spdlog.h>
 
 #include <coreinit/time.h>
@@ -77,7 +79,7 @@ KPADStatus* GetKPADStatus(WPADChan chan, KPADError* error);
 static MEMHeapHandle heap_MEM1 = nullptr;
 static MEMHeapHandle heap_foreground = nullptr;
 
-bool has_foreground = false;
+std::atomic<bool> has_foreground{ false };
 uint64_t gfx_wiiu_perf_vsync_wait_us = 0;
 uint32_t gfx_wiiu_perf_dropped_frames = 0;
 static void* mem1_storage = nullptr;
@@ -281,8 +283,6 @@ void gfx_wiiu_free_foreground(void* block) {
 }
 
 static uint32_t gfx_wiiu_proc_callback_acquired(void* context) {
-    has_foreground = true;
-
     bool result = gfx_wiiu_init_foreground();
     if (!result) {
         SPDLOG_ERROR("gfx_wiiu: failed to initialize foreground heap");
@@ -315,10 +315,14 @@ static uint32_t gfx_wiiu_proc_callback_acquired(void* context) {
                     GX2_BUFFERING_MODE_DOUBLE);
     SPDLOG_INFO("gfx_wiiu: acquired: GX2SetDRCBuffer complete");
 
+    has_foreground.store(true, std::memory_order_release);
+
     return 0;
 }
 
 static uint32_t gfx_wiiu_proc_callback_released(void* context) {
+    has_foreground.store(false, std::memory_order_release);
+
     if (tv_scan_buffer) {
         gfx_wiiu_free_foreground(tv_scan_buffer);
         tv_scan_buffer = nullptr;
@@ -330,8 +334,6 @@ static uint32_t gfx_wiiu_proc_callback_released(void* context) {
     }
 
     gfx_wiiu_destroy_foreground();
-
-    has_foreground = false;
 
     return 0;
 }
@@ -516,7 +518,7 @@ static void gfx_wiiu_shutdown(void) {
 
     Ship::WiiU::Watchdog::Emit("SHUTDOWN: gfx_wiiu_shutdown enter\n");
 
-    if (has_foreground) {
+    if (has_foreground.load(std::memory_order_acquire)) {
         gfx_wiiu_proc_callback_released(nullptr);
         gfx_wiiu_destroy_mem1();
     }
@@ -676,7 +678,15 @@ static bool gfx_wiiu_start_frame(void) {
     uint32_t wait_count = 0;
 
     while (true) {
+        if (!has_foreground.load(std::memory_order_acquire)) {
+            return false;
+        }
+
         GX2GetSwapStatus(&swap_count, &flip_count, &last_flip, &last_vsync);
+
+        if (!has_foreground.load(std::memory_order_acquire)) {
+            return false;
+        }
 
         if (swap_count - flip_count <= 1) {
             break;
@@ -698,6 +708,10 @@ static bool gfx_wiiu_start_frame(void) {
         wait_count++;
         // Blocks on the GPU's vsync interrupt. If the display pipeline stops, this never
         // returns - which is one way the main thread could stop without any CPU fault.
+        if (!has_foreground.load(std::memory_order_acquire)) {
+            return false;
+        }
+
         const OSTime wait_start = OSGetSystemTime();
         GX2WaitForVsync();
         const uint64_t wait_microseconds = OSTicksToMicroseconds(OSGetSystemTime() - wait_start);
@@ -710,10 +724,28 @@ static bool gfx_wiiu_start_frame(void) {
 }
 
 static void gfx_wiiu_swap_buffers_begin(void) {
+    if (!has_foreground.load(std::memory_order_acquire)) {
+        return;
+    }
+
     GX2SwapScanBuffers();
+
+    if (!has_foreground.load(std::memory_order_acquire)) {
+        return;
+    }
+
     GX2Flush();
 
+    if (!has_foreground.load(std::memory_order_acquire)) {
+        return;
+    }
+
     gfx_wiiu_set_context_state();
+
+    if (!has_foreground.load(std::memory_order_acquire)) {
+        return;
+    }
+
     GX2SetTVEnable(TRUE);
     GX2SetDRCEnable(TRUE);
 }
