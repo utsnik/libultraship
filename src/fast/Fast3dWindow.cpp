@@ -189,6 +189,10 @@ void Fast3dWindow::Close() {
 }
 
 void Fast3dWindow::RunGuiOnly() {
+    // Extraction can draw frames before the interpreter is wired up.
+    if (mInterpreter == nullptr) {
+        return;
+    }
     mInterpreter->RunGuiOnly();
 }
 
