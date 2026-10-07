@@ -2381,7 +2381,16 @@ void GfxRenderingAPIGX2::SetCurrentPrimDepth(float depth) {
 }
 
 ImTextureID GfxRenderingAPIGX2::GetTextureById(int id) {
-    return (ImTextureID)(uintptr_t)gfx_gx2_get_framebuffer_texture_id(id);
+    // Ids here are NewTexture() ids (GUI textures such as menu icons), as on the other backends; framebuffers go
+    // through GetFramebufferTextureId(). Reading a GX2TextureEntry as a Framebuffer took imtex from the wrong
+    // offset and GX2SetPixelTexture faulted on the garbage pointer (2S2H menu DSI).
+    if (id == 0) {
+        return nullptr;
+    }
+    if (gfx_gx2_lookup_framebuffer(id) != nullptr) {
+        return (ImTextureID)(uintptr_t)gfx_gx2_get_framebuffer_texture_id(id);
+    }
+    return (ImTextureID)&((struct GX2TextureEntry*)(uintptr_t)id)->imtex;
 }
 
 } // namespace Fast
