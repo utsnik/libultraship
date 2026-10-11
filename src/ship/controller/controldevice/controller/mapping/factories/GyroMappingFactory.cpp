@@ -41,9 +41,16 @@ std::shared_ptr<ControllerGyroMapping> GyroMappingFactory::CreateGyroMappingFrom
     for (auto [instanceId, gamepad] :
          Context::GetInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager()->GetConnectedSDLGamepadsForPort(
              portIndex)) {
+#ifdef __WIIU__
+        // SDL's Wii U driver exposes no sensors; SDLGyroMapping reads the GamePad's (player 0) gyro itself.
+        if (SDL_GameControllerGetPlayerIndex(gamepad) != 0) {
+            continue;
+        }
+#else
         if (!SDL_GameControllerHasSensor(gamepad, SDL_SENSOR_GYRO)) {
             continue;
         }
+#endif
 
         for (int32_t button = SDL_CONTROLLER_BUTTON_A; button < SDL_CONTROLLER_BUTTON_MAX; button++) {
             if (SDL_GameControllerGetButton(gamepad, static_cast<SDL_GameControllerButton>(button))) {

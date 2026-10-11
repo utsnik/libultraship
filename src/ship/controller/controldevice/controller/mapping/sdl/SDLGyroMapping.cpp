@@ -7,7 +7,41 @@
 #include "ship/utils/StringHelper.h"
 #include "ship/controller/controldeck/ControlDeck.h"
 
+#ifdef __WIIU__
+#include "port/wiiu/WiiUImpl.h"
+#endif
+
 namespace Ship {
+namespace {
+#ifdef __WIIU__
+// SDL's Wii U driver exposes no sensors, so read the GamePad (SDL player 0) gyro directly, scaled as libultraship's
+// removed WiiUGyroMapping did.
+bool GetGyroData(SDL_GameController* gamepad, float gyroData[3]) {
+    if (SDL_GameControllerGetPlayerIndex(gamepad) != 0) {
+        return false;
+    }
+    VPADReadError error;
+    VPADStatus* status = WiiU::GetVPADStatus(&error);
+    if (status == nullptr) {
+        return false;
+    }
+    gyroData[0] = status->gyro.x * -8.0f;
+    gyroData[1] = status->gyro.z * 8.0f;
+    gyroData[2] = status->gyro.y * 8.0f;
+    return true;
+}
+#else
+bool GetGyroData(SDL_GameController* gamepad, float gyroData[3]) {
+    if (!SDL_GameControllerHasSensor(gamepad, SDL_SENSOR_GYRO)) {
+        return false;
+    }
+    SDL_GameControllerSetSensorEnabled(gamepad, SDL_SENSOR_GYRO, SDL_TRUE);
+    SDL_GameControllerGetSensorData(gamepad, SDL_SENSOR_GYRO, gyroData, 3);
+    return true;
+}
+#endif
+} // namespace
+
 SDLGyroMapping::SDLGyroMapping(uint8_t portIndex, float sensitivity, float neutralPitch, float neutralYaw,
                                float neutralRoll)
     : ControllerInputMapping(PhysicalDeviceType::SDLGamepad),
@@ -19,14 +53,11 @@ void SDLGyroMapping::Recalibrate() {
     for (const auto& [instanceId, gamepad] :
          Context::GetInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager()->GetConnectedSDLGamepadsForPort(
              mPortIndex)) {
-        if (!SDL_GameControllerHasSensor(gamepad, SDL_SENSOR_GYRO)) {
-            continue;
-        }
-
         // just use gyro on the first gyro supported device we find
         float gyroData[3];
-        SDL_GameControllerSetSensorEnabled(gamepad, SDL_SENSOR_GYRO, SDL_TRUE);
-        SDL_GameControllerGetSensorData(gamepad, SDL_SENSOR_GYRO, gyroData, 3);
+        if (!GetGyroData(gamepad, gyroData)) {
+            continue;
+        }
 
         mNeutralPitch = gyroData[0];
         mNeutralYaw = gyroData[1];
@@ -50,14 +81,11 @@ void SDLGyroMapping::UpdatePad(float& x, float& y) {
     for (const auto& [instanceId, gamepad] :
          Context::GetInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager()->GetConnectedSDLGamepadsForPort(
              mPortIndex)) {
-        if (!SDL_GameControllerHasSensor(gamepad, SDL_SENSOR_GYRO)) {
-            continue;
-        }
-
         // just use gyro on the first gyro supported device we find
         float gyroData[3];
-        SDL_GameControllerSetSensorEnabled(gamepad, SDL_SENSOR_GYRO, SDL_TRUE);
-        SDL_GameControllerGetSensorData(gamepad, SDL_SENSOR_GYRO, gyroData, 3);
+        if (!GetGyroData(gamepad, gyroData)) {
+            continue;
+        }
 
         x = (gyroData[0] - mNeutralPitch) * mSensitivity;
         y = (gyroData[1] - mNeutralYaw) * mSensitivity;
