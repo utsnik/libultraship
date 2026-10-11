@@ -48,9 +48,11 @@ std::shared_ptr<ControllerRumbleMapping> RumbleMappingFactory::CreateRumbleMappi
                                           ->GetControlDeck()
                                           ->GetConnectedPhysicalDeviceManager()
                                           ->GetConnectedSDLGamepadsForPort(portIndex)) {
+#ifndef __WIIU__ // SDL's Wii U driver reports no rumble; SDLRumbleMapping drives the motors itself
         if (!SDL_GameControllerHasRumble(gamepad)) {
             continue;
         }
+#endif
 
         for (int32_t button = SDL_CONTROLLER_BUTTON_A; button < SDL_CONTROLLER_BUTTON_MAX; button++) {
             if (SDL_GameControllerGetButton(gamepad, static_cast<SDL_GameControllerButton>(button))) {
