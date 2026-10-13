@@ -1259,6 +1259,13 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         return;
     }
 
+    // The decode below writes the buffer, so it must exist first: the upload buffer is allocated lazily, and a CI8
+    // texture as a session's first import wrote through a null pointer (DSI, DAR=0 in ImportTextureCi8). The inner
+    // loop can run up to one line past sizeBytes. Sized like this, the later Ensure never reallocates mid-texture.
+    if (!EnsureTexUploadBuffer((static_cast<size_t>(sizeBytes) + lineSizeBytes) * 4)) {
+        return;
+    }
+
     for (uint32_t i = 0, j = 0; i < sizeBytes; j += fullImageLineSizeBytes - lineSizeBytes) {
         for (uint32_t k = 0; k < lineSizeBytes; i++, k++, j++) {
             uint8_t idx = addr[j];
