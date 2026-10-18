@@ -6050,11 +6050,13 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
 }
 
 // Commands that cannot change the state PrepareTriangleState derives (vertices, triangles, matrices, DL flow,
-// syncs/no-ops). Every other command invalidates the triangle-state cache.
+// syncs/no-ops). Every other command invalidates the triangle-state cache. G_QUAD is deliberately omitted: although
+// it is one opcode, it expands to two draw calls and is the boundary used by the game's runtime HUD quads; keeping a
+// prior triangle setup here lets the first half of a quad inherit state from an unrelated preceding draw.
 static inline bool TriStateNeutral(GfxOpcodeHandlerFunc f) {
     return f == gfx_tri1_otr_handler_f3dex2 || f == gfx_tri1_handler_f3dex2 || f == gfx_tri1_handler_f3dex ||
-           f == gfx_tri1_handler_f3d || f == gfx_tri2_handler_f3dex || f == gfx_quad_handler_f3dex2 ||
-           f == gfx_quad_handler_f3dex || f == gfx_vtx_handler_f3dex2 || f == gfx_vtx_handler_f3dex ||
+           f == gfx_tri1_handler_f3d || f == gfx_tri2_handler_f3dex || f == gfx_vtx_handler_f3dex2 ||
+           f == gfx_vtx_handler_f3dex ||
            f == gfx_vtx_handler_f3d || f == gfx_vtx_hash_handler_custom || f == gfx_vtx_otr_filepath_handler_custom ||
            f == gfx_modify_vtx_handler_f3dex2 || f == gfx_mtx_handler_f3dex2 || f == gfx_mtx_handler_f3d ||
            f == gfx_mtx_otr_handler_custom || f == gfx_mtx_otr_filepath_handler_custom ||
