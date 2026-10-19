@@ -827,6 +827,16 @@ static int generatePixelShader(GX2PixelShader *psh, struct CCFeatures *cc_featur
     // frag pos
     psh->regs.spi_ps_input_cntls[0] = 0 | (1 << 8);
 
+    // Cemu-only: this slot shares semantic 0 with the first real input below, so
+    // Cemu's GLSL translator declares passParameterSem0 twice and the pipeline
+    // fails to build (nothing draws). Real hardware ignores the duplicate; give
+    // it a semantic no vertex shader exports instead of deleting the slot
+    // (deleting it shifts every input one GPR down and blends go black/alpha 0).
+    // See homelab memory note gx2-ps-slot0-semantic-cemu.md.
+    if (!needs_noise && psh->regs.num_spi_ps_input_cntl > 1) {
+        psh->regs.spi_ps_input_cntls[0] = (psh->regs.spi_ps_input_cntls[0] & ~0xffu) | 0x7fu;
+    }
+
     // inputs
     for (uint32_t i = 0; i < num_ps_inputs; i++) {
         psh->regs.spi_ps_input_cntls[i + 1] = i | (1 << 8);
