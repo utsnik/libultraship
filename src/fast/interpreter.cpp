@@ -160,6 +160,10 @@ static bool sTriVerify = false;
 static uint32_t sTriHits = 0, sTriMisses = 0, sTriMismatches = 0, sTriRuns = 0;
 static uint8_t sOpRing[16];
 static uint32_t sOpRingPos = 0;
+static uint8_t sCurrentOpcode = 0xFF;
+static uint8_t sPrecedingOpcode = 0xFF;
+static const char* sCurrentOpcodeName = "<start>";
+static const char* sPrecedingOpcodeName = "<start>";
 static uint64_t sStaleSlots = 0;
 static uint64_t sStaleFromSubDl = 0; // subset of sStaleSlots set by sub-DL culling
 static uint64_t sPerfStaleTris = 0;
@@ -2556,12 +2560,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 for (uint32_t k = 0; k < 16; k++) {
                     snprintf(ops + 3 * k, 4, "%02X ", sOpRing[(sOpRingPos + k) & 15]);
                 }
-                SPDLOG_INFO("TRICACHE MISMATCH #{} changes={} alpha {}->{} fog {}->{} tm {}->{} comb {}->{} "
-                            "inputs {}->{} tex {}{}->{}{} lastOps {}",
-                            sTriMismatches, sStateChangeRequests - changes, cached.use_alpha, now.use_alpha,
-                            cached.use_fog, now.use_fog, cached.tm, now.tm, (void*)cached.comb, (void*)now.comb,
-                            cached.numInputs, now.numInputs, cached.usedTextures[0], cached.usedTextures[1],
-                            now.usedTextures[0], now.usedTextures[1], ops);
+                SPDLOG_INFO("TRICACHE MISMATCH #{} preceding={} (0x{:02X}) current={} (0x{:02X}) changes={} "
+                            "alpha {}->{} fog {}->{} tm {}->{} comb {}->{} inputs {}->{} tex {}{}->{}{} lastOps {}",
+                            sTriMismatches, sPrecedingOpcodeName, sPrecedingOpcode, sCurrentOpcodeName,
+                            sCurrentOpcode, sStateChangeRequests - changes, cached.use_alpha, now.use_alpha, cached.use_fog,
+                            now.use_fog, cached.tm, now.tm, (void*)cached.comb, (void*)now.comb, cached.numInputs,
+                            now.numInputs, cached.usedTextures[0], cached.usedTextures[1], now.usedTextures[0],
+                            now.usedTextures[1], ops);
             }
         }
     }
@@ -3023,6 +3028,12 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
         mRdp->palettes[1] = src;
         mRdp->palette_dram_addr[1] = src;
     }
+
+    // TLUT contents are part of every CI texture's decoded GPU image. The command already
+    // invalidates the triangle-state generation in gfx_step, but without dirtying the texture
+    // slots PrepareTriangleState can skip ImportTexture and retain the previous palette.
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = true;
 }
 
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
@@ -3462,6 +3473,7 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
     auto& loadtex = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
     loadtex.full_image_line_size_bytes = loadtex.line_size_bytes = mRdp->texture_tile[tile].line_size_bytes;
     loadtex.size_bytes = loadtex.orig_size_bytes = loadtex.line_size_bytes * h;
+    mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 
     uint8_t saved_tile = mRdp->first_tile_index;
     if (saved_tile != tile) {
@@ -6026,6 +6038,22 @@ const char* GfxGetOpcodeName(int8_t opcode) {
     return nullptr;
 }
 
+static const char* gfx_opcode_name_for_step(int8_t opcode) {
+    if (opcode == F3DEX2_G_LOAD_UCODE || opcode == F3DEX_G_LOAD_UCODE) {
+        return "G_LOAD_UCODE";
+    }
+    if (otrHandlers.contains(opcode)) {
+        return otrHandlers.at(opcode).first;
+    }
+    if (rdpHandlers.contains(opcode)) {
+        return rdpHandlers.at(opcode).first;
+    }
+    if (ucode_handler_index < ucode_handlers.size() && ucode_handlers[ucode_handler_index]->contains(opcode)) {
+        return ucode_handlers[ucode_handler_index]->at(opcode).first;
+    }
+    return "<unknown>";
+}
+
 // TODO, implement a system where we can get the current opcode handler by writing to the GWords. If the powers that be
 // are OK with that...
 static void gfx_set_ucode_handler(UcodeHandlers ucode) {
@@ -6071,6 +6099,10 @@ static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+    sPrecedingOpcode = sCurrentOpcode;
+    sPrecedingOpcodeName = sCurrentOpcodeName;
+    sCurrentOpcode = (uint8_t)opcode;
+    sCurrentOpcodeName = gfx_opcode_name_for_step(opcode);
     sOpRing[sOpRingPos++ & 15] = (uint8_t)opcode;
 
 #ifdef USE_GBI_TRACE
@@ -6349,6 +6381,10 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     ++sTriStateGen;
+    sCurrentOpcode = 0xFF;
+    sPrecedingOpcode = 0xFF;
+    sCurrentOpcodeName = "<start>";
+    sPrecedingOpcodeName = "<start>";
     sTriVerify = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gWiiU.TriCacheVerify", 0) != 0;
     if (++sTriRuns % 600 == 0) {
         SPDLOG_INFO("TRICACHE hits={} misses={} verify={} mismatches={}", sTriHits, sTriMisses, sTriVerify ? 1 : 0,

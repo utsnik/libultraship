@@ -1577,6 +1577,14 @@ static void gfx_gx2_start_frame(void) {
                              GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
     }
 
+    // ImGui writes the GX2 shader and sampler bindings directly. current_shader_program and
+    // tile_bound_* still describe the last game draw, so restore them before the interpreter
+    // evaluates its logical state; otherwise PrepareTriangleState can see the same cached
+    // ShaderProgram and legitimately skip the LoadShader call while GX2 is still using ImGui.
+    if (current_shader_program != nullptr) {
+        gfx_gx2_load_shader(current_shader_program);
+    }
+
     frame_count++;
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame state: GX2SetPolygonControl complete; state setup complete");
