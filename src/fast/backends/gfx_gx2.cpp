@@ -112,7 +112,11 @@ struct Framebuffer {
 };
 
 static struct Framebuffer main_framebuffer;
+// Framebuffer ids are small integers (0 = main buffer), as on the other backends. They used to be the struct's
+// address, but G_COPYFB packs each id into 11 bits (G_READFB into 8): every copy into a framebuffer was truncated
+// and rejected, so the pause background and the mono/sepia cutscene filter drew uninitialised memory.
 static std::map<int, struct Framebuffer*> framebuffer_registry = {{0, &main_framebuffer}};
+static int next_framebuffer_id = 1;
 static struct Framebuffer* current_framebuffer;
 
 static std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgram> shader_program_pool;
@@ -1880,10 +1884,9 @@ static int gfx_gx2_create_framebuffer(void) {
     buffer->imtex.Texture = &buffer->texture;
     buffer->imtex.Sampler = &buffer->sampler;
 
-    // some more 32-bit shenanigans :D
-    SPDLOG_INFO("gfx_gx2: CreateFramebuffer complete ptr={}", static_cast<const void*>(buffer));
-    const int framebuffer_id = static_cast<int>(reinterpret_cast<uintptr_t>(buffer));
+    const int framebuffer_id = next_framebuffer_id++;
     framebuffer_registry[framebuffer_id] = buffer;
+    SPDLOG_INFO("gfx_gx2: CreateFramebuffer complete id={} ptr={}", framebuffer_id, static_cast<const void*>(buffer));
     return framebuffer_id;
 }
 
@@ -1898,9 +1901,8 @@ static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32
     // NO logging here: this runs per frame, and every spdlog emit on this port is a
     // BLOCKING sendto over UDP. Two lines a frame was ~45 datagrams/sec of pure stall.
     // (The Banjo port lost 60 fps -> 3.7 fps to exactly this pattern.)
-    struct Framebuffer* buffer = (struct Framebuffer*)fb;
-
     // we don't support updating the main buffer (fb 0)
+    struct Framebuffer* buffer = fb == 0 ? nullptr : gfx_gx2_lookup_framebuffer(fb);
     if (!buffer) {
         return;
     }
@@ -2006,9 +2008,8 @@ static void gfx_gx2_update_framebuffer_parameters(int fb, uint32_t width, uint32
 
 void gfx_gx2_start_draw_to_framebuffer(int fb, float noise_scale) {
     const bool trace = gfx_gx2_trace_first_frame;
-    struct Framebuffer* buffer = (struct Framebuffer*)fb;
-
     // fb 0 = main buffer
+    struct Framebuffer* buffer = gfx_gx2_lookup_framebuffer(fb);
     if (!buffer) {
         buffer = &main_framebuffer;
     }
@@ -2085,7 +2086,7 @@ void gfx_gx2_resolve_msaa_color_buffer(int fb_id_target, int fb_id_source) {
     struct Framebuffer* src_buffer = gfx_gx2_lookup_framebuffer(fb_id_source);
     struct Framebuffer* target_buffer = gfx_gx2_lookup_framebuffer(fb_id_target);
 
-    if (!src_buffer || !target_buffer) {
+    if (!src_buffer || !target_buffer || src_buffer == target_buffer) {
         static uint32_t rejection_logs = 0;
         if (rejection_logs < 4) {
             ++rejection_logs;
@@ -2095,13 +2096,27 @@ void gfx_gx2_resolve_msaa_color_buffer(int fb_id_target, int fb_id_source) {
         return;
     }
 
-    if (src_buffer->color_buffer.surface.aa == GX2_AA_MODE1X) {
+    GX2Surface* src_surface = &src_buffer->color_buffer.surface;
+    GX2Surface* dst_surface = &target_buffer->color_buffer.surface;
+    if (!src_surface->image || !dst_surface->image || src_surface->width != dst_surface->width ||
+        src_surface->height != dst_surface->height || src_surface->format != dst_surface->format) {
+        // GX2CopySurface / GX2ResolveAAColorBuffer need matching surfaces; a mismatched copy would scramble the target.
+        static uint32_t mismatch_logs = 0;
+        if (mismatch_logs < 4) {
+            ++mismatch_logs;
+            Ship::WiiU::Watchdog::Emit("GX2: framebuffer copy size mismatch source=%d %ux%u target=%d %ux%u\n",
+                                       fb_id_source, (unsigned)src_surface->width, (unsigned)src_surface->height,
+                                       fb_id_target, (unsigned)dst_surface->width, (unsigned)dst_surface->height);
+        }
+        return;
+    }
+
+    if (src_surface->aa == GX2_AA_MODE1X) {
         if (trace) {
             SPDLOG_INFO("gfx_gx2: first frame: GX2CopySurface (resolve) ...");
         }
-        GX2CopySurface(&src_buffer->color_buffer.surface, src_buffer->color_buffer.viewMip,
-                       src_buffer->color_buffer.viewFirstSlice, &target_buffer->color_buffer.surface,
-                       target_buffer->color_buffer.viewMip, target_buffer->color_buffer.viewFirstSlice);
+        GX2CopySurface(src_surface, src_buffer->color_buffer.viewMip, src_buffer->color_buffer.viewFirstSlice,
+                       dst_surface, target_buffer->color_buffer.viewMip, target_buffer->color_buffer.viewFirstSlice);
         if (trace) {
             SPDLOG_INFO("gfx_gx2: first frame: GX2CopySurface (resolve) complete");
         }
@@ -2109,18 +2124,29 @@ void gfx_gx2_resolve_msaa_color_buffer(int fb_id_target, int fb_id_source) {
         if (trace) {
             SPDLOG_INFO("gfx_gx2: first frame: GX2ResolveAAColorBuffer ...");
         }
-        GX2ResolveAAColorBuffer(&src_buffer->color_buffer, &target_buffer->color_buffer.surface,
-                                target_buffer->color_buffer.viewMip, target_buffer->color_buffer.viewFirstSlice);
+        GX2ResolveAAColorBuffer(&src_buffer->color_buffer, dst_surface, target_buffer->color_buffer.viewMip,
+                                target_buffer->color_buffer.viewFirstSlice);
         if (trace) {
             SPDLOG_INFO("gfx_gx2: first frame: GX2ResolveAAColorBuffer complete");
         }
     }
+
+    // Same rules as the BC upload copy: the destination is written through the colour-buffer path, so flush the CB
+    // cache and drop stale texture-cache lines before it is sampled, and restore the context state, because the copy
+    // runs on the 3D pipeline and leaves the destination bound as the render target (the rest of the frame would
+    // otherwise draw into the copy).
+    GX2Invalidate(static_cast<GX2InvalidateMode>(GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE),
+                  dst_surface->image, dst_surface->imageSize);
+    gfx_wiiu_set_context_state();
+    if (current_framebuffer) {
+        GX2SetColorBuffer(&current_framebuffer->color_buffer, GX2_RENDER_TARGET_0);
+        GX2SetDepthBuffer(&current_framebuffer->depth_buffer);
+    }
 }
 
 void* gfx_gx2_get_framebuffer_texture_id(int fb_id) {
-    struct Framebuffer* buffer = (struct Framebuffer*)fb_id;
-
     // fb 0 = main buffer
+    struct Framebuffer* buffer = gfx_gx2_lookup_framebuffer(fb_id);
     if (!buffer) {
         buffer = &main_framebuffer;
     }
@@ -2129,7 +2155,7 @@ void* gfx_gx2_get_framebuffer_texture_id(int fb_id) {
 }
 
 void gfx_gx2_select_texture_fb(int fb) {
-    struct Framebuffer* buffer = (struct Framebuffer*)fb;
+    struct Framebuffer* buffer = fb == 0 ? nullptr : gfx_gx2_lookup_framebuffer(fb);
     if (!buffer) {
         SPDLOG_ERROR("gfx_gx2: texture framebuffer selection received a null framebuffer");
         return;
@@ -2149,9 +2175,8 @@ void gfx_gx2_select_texture_fb(int fb) {
 
 static std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
 gfx_gx2_get_pixel_depth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
-    struct Framebuffer* buffer = (struct Framebuffer*)fb_id;
-
     // fb 0 = main buffer
+    struct Framebuffer* buffer = gfx_gx2_lookup_framebuffer(fb_id);
     if (!buffer) {
         buffer = &main_framebuffer;
     }
