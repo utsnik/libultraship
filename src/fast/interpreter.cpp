@@ -622,6 +622,16 @@ bool Interpreter::EnsureTexUploadBuffer(size_t requiredBytes) {
     return true;
 }
 
+// Prefer the loaded texture's DRAM stride when it describes a 2D load. LoadBlock with the
+// standard width=1 sentinel stores the whole load as one line, so fall back to the tile stride.
+static uint32_t GetEffectiveLineSize(uint32_t lineSizeBytes, uint32_t fullImageLineSizeBytes, uint32_t sizeBytes,
+                                     uint32_t tileLineSizeBytes) {
+    if ((lineSizeBytes != sizeBytes || fullImageLineSizeBytes != sizeBytes) && lineSizeBytes > 0) {
+        return lineSizeBytes;
+    }
+    return tileLineSizeBytes;
+}
+
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
@@ -639,8 +649,26 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t line_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
 
-    uint32_t width = mRdp->texture_tile[tile].line_size_bytes / 2;
-    uint32_t height = sizeBytes / mRdp->texture_tile[tile].line_size_bytes;
+    uint32_t widthBytes = GetEffectiveLineSize(line_size_bytes, fullImageLineSizeBytes, sizeBytes,
+                                               mRdp->texture_tile[tile].line_size_bytes);
+    uint32_t width = widthBytes / 2;
+    uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
+
+    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t loadedPixels = width * height;
+    uint32_t renderedPixels = tile_w * tile_h;
+    bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+    bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
+    bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // HD replacement textures must still clamp to the rendered tile region
+    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
+    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+        width = tile_w;
+    }
+    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+        height = tile_h;
+    }
 
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (fullImageLineSizeBytes == sizeBytes) {
@@ -690,11 +718,46 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     uint32_t full_image_line_size_bytes =
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t line_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
-    SUPPORT_CHECK(full_image_line_size_bytes == line_size_bytes);
+    uint32_t widthBytes = GetEffectiveLineSize(line_size_bytes, full_image_line_size_bytes, size_bytes,
+                                               mRdp->texture_tile[tile].line_size_bytes * 2);
+    uint32_t width = widthBytes / 4;
+    uint32_t height = widthBytes > 0 ? size_bytes / widthBytes : 0;
 
-    uint32_t width = mRdp->texture_tile[tile].line_size_bytes / 2;
-    uint32_t height = (size_bytes / 2) / mRdp->texture_tile[tile].line_size_bytes;
-    mRapi->UploadTexture(addr, width, height);
+    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t loadedPixels = width * height;
+    uint32_t renderedPixels = tile_w * tile_h;
+    bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+    bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
+    bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // HD replacement textures must still clamp to the rendered tile region
+    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
+    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+        width = tile_w;
+    }
+    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+        height = tile_h;
+    }
+
+    if (full_image_line_size_bytes == size_bytes) {
+        full_image_line_size_bytes = width * 4;
+    }
+    if (!EnsureTexUploadBuffer(static_cast<size_t>(width) * height * 4)) {
+        return;
+    }
+    uint32_t fullImageStridePixels = full_image_line_size_bytes / 4;
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint32_t srcIdx = y * fullImageStridePixels + x;
+            mTexUploadBuffer[4 * i + 0] = addr[4 * srcIdx + 0];
+            mTexUploadBuffer[4 * i + 1] = addr[4 * srcIdx + 1];
+            mTexUploadBuffer[4 * i + 2] = addr[4 * srcIdx + 2];
+            mTexUploadBuffer[4 * i + 3] = addr[4 * srcIdx + 3];
+            i++;
+        }
+    }
+    mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
@@ -945,33 +1008,58 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     else
         palette = mRdp->palettes[palIdx / 8] + (palIdx % 8) * 16 * 2;
 
-    SUPPORT_CHECK(fullImageLineSizeBytes == lineSizeBytes);
-
     if (!EnsureTexUploadBuffer(static_cast<size_t>(sizeBytes) * 2 * 4)) {
         return;
     }
 
-    for (uint32_t i = 0; i < sizeBytes * 2; i++) {
-        uint8_t byte = addr[i / 2];
-        uint8_t idx = (byte >> (4 - (i % 2) * 4)) & 0xf;
-        uint16_t col16 = (palette[idx * 2] << 8) | palette[idx * 2 + 1]; // Big endian load
-        uint8_t a = col16 & 1;
-        uint8_t r = col16 >> 11;
-        uint8_t g = (col16 >> 6) & 0x1f;
-        uint8_t b = (col16 >> 1) & 0x1f;
-        mTexUploadBuffer[4 * i + 0] = SCALE_5_8(r);
-        mTexUploadBuffer[4 * i + 1] = SCALE_5_8(g);
-        mTexUploadBuffer[4 * i + 2] = SCALE_5_8(b);
-        mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
-    }
-
-    uint32_t resultLineSizeBytes = mRdp->texture_tile[tile].line_size_bytes;
+    uint32_t baseLineSizeBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
+                                                      mRdp->texture_tile[tile].line_size_bytes);
+    uint32_t resultLineSizeBytes = baseLineSizeBytes;
     if (metadata->h_byte_scale != 1) {
         resultLineSizeBytes *= metadata->h_byte_scale;
     }
 
     uint32_t width = resultLineSizeBytes * 2;
-    uint32_t height = sizeBytes / resultLineSizeBytes;
+    uint32_t height = resultLineSizeBytes > 0 ? sizeBytes / resultLineSizeBytes : 0;
+
+    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t loadedPixels = width * height;
+    uint32_t renderedPixels = tile_w * tile_h;
+    bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+    bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
+    bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // HD replacement textures must still clamp to the rendered tile region
+    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
+    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+        width = tile_w;
+    }
+    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+        height = tile_h;
+    }
+
+    if (fullImageLineSizeBytes == sizeBytes) {
+        fullImageLineSizeBytes = resultLineSizeBytes;
+    }
+
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint32_t srcPixelIdx = y * (fullImageLineSizeBytes * 2) + x;
+            uint8_t byte = addr[srcPixelIdx / 2];
+            uint8_t idx = (byte >> (4 - (srcPixelIdx % 2) * 4)) & 0xf;
+            uint16_t col16 = (palette[idx * 2] << 8) | palette[idx * 2 + 1]; // Big endian load
+            uint8_t a = col16 & 1;
+            uint8_t r = col16 >> 11;
+            uint8_t g = (col16 >> 6) & 0x1f;
+            uint8_t b = (col16 >> 1) & 0x1f;
+            mTexUploadBuffer[4 * i + 0] = SCALE_5_8(r);
+            mTexUploadBuffer[4 * i + 1] = SCALE_5_8(g);
+            mTexUploadBuffer[4 * i + 2] = SCALE_5_8(b);
+            mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
+            i++;
+        }
+    }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
@@ -1013,13 +1101,31 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         }
     }
 
-    uint32_t resultLineSizeBytes = mRdp->texture_tile[tile].line_size_bytes;
+    uint32_t baseLineSizeBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
+                                                      mRdp->texture_tile[tile].line_size_bytes);
+    uint32_t resultLineSizeBytes = baseLineSizeBytes;
     if (metadata->h_byte_scale != 1) {
         resultLineSizeBytes *= metadata->h_byte_scale;
     }
 
     uint32_t width = resultLineSizeBytes;
-    uint32_t height = sizeBytes / resultLineSizeBytes;
+    uint32_t height = resultLineSizeBytes > 0 ? sizeBytes / resultLineSizeBytes : 0;
+
+    uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+    uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    uint32_t loadedPixels = width * height;
+    uint32_t renderedPixels = tile_w * tile_h;
+    bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+    bool clampS = (mRdp->texture_tile[tile].cms & G_TX_CLAMP) != 0;
+    bool clampT = (mRdp->texture_tile[tile].cmt & G_TX_CLAMP) != 0;
+    // HD replacement textures must still clamp to the rendered tile region
+    bool isHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
+    if ((isHd || pyramidLike || clampS) && tile_w > 0 && tile_w < width) {
+        width = tile_w;
+    }
+    if ((isHd || pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
+        height = tile_h;
+    }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
@@ -1124,7 +1230,10 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
     }
 
-    mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
+    // Describe the buffer by what was actually packed (the loaded HD stride)
+    uint32_t uploadWidth = safeLineSizeBytes / 4;
+    uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;
+    mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
 }
 
 // Dev builds: report every BC texture that misses the whole-image path, once per resource path, so a tour lists all
@@ -1903,6 +2012,15 @@ void Interpreter::PrepareTriangleState(bool is_rect) {
             tex_width2[i] = (mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4;
             tex_height2[i] = (mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4;
 
+            // HD replacements must clamp to the tile region.
+            bool isHd = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata.h_byte_scale != 1 ||
+                        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata.v_pixel_scale != 1;
+            if (isHd && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
+                tex_width[i] = tex_width2[i];
+            }
+            if (isHd && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
+                tex_height[i] = tex_height2[i];
+            }
             uint32_t tex_width1 = tex_width[i] << (cms & G_TX_MIRROR);
             uint32_t tex_height1 = tex_height[i] << (cmt & G_TX_MIRROR);
 
@@ -2579,8 +2697,40 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     }
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes = size_bytes;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes = size_bytes;
+    // The standard gDPLoadTextureBlock macro sets width=1, but manually-built DL
+    // commands may set the real pixel width.
+    uint32_t actual_line_bytes = size_bytes;
+    const RawTexMetadata& blkMeta = mRdp->texture_to_load.raw_tex_metadata;
+    bool blkHd = blkMeta.h_byte_scale != 1 || blkMeta.v_pixel_scale != 1;
+    if (mRdp->texture_to_load.width > 1 && blkHd && blkMeta.height > 0 && size_bytes % blkMeta.height == 0) {
+        // HD-upscaled textures report a sentinel SetTextureImage width, so the per-line stride
+        // derived from it is bogus. The resource's stored height is authoritative.
+        actual_line_bytes = size_bytes / blkMeta.height;
+    } else if (mRdp->texture_to_load.width > 1) {
+        uint32_t candidate;
+        switch (mRdp->texture_to_load.siz) {
+            case G_IM_SIZ_4b:
+                candidate = (mRdp->texture_to_load.width + 1) / 2;
+                break;
+            case G_IM_SIZ_8b:
+                candidate = mRdp->texture_to_load.width;
+                break;
+            case G_IM_SIZ_16b:
+                candidate = mRdp->texture_to_load.width * 2;
+                break;
+            case G_IM_SIZ_32b:
+                candidate = mRdp->texture_to_load.width * 4;
+                break;
+            default:
+                candidate = mRdp->texture_to_load.width;
+                break;
+        }
+        if (candidate > 0 && candidate < size_bytes && size_bytes % candidate == 0) {
+            actual_line_bytes = candidate;
+        }
+    }
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes = actual_line_bytes;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes = actual_line_bytes;
     // assert(size_bytes <= 4096 && "bug: too big texture");
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags = mRdp->texture_to_load.tex_flags;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;

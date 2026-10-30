@@ -87,6 +87,16 @@ class ResourceManager {
                       BS::priority_t priority = BS::pr::normal, std::shared_ptr<ResourceInitData> initData = nullptr);
     size_t UnloadResource(const ResourceIdentifier& identifier);
     size_t UnloadResource(const std::string& filePath);
+
+    /**
+     * @brief Inserts a runtime-built resource into the cache so LoadResource[Process] returns it by
+     *        path, without any backing archive file. Used for textures synthesized at runtime.
+     *        Evict with UnloadResource(filePath).
+     * @param filePath Virtual path the resource will be retrievable under.
+     * @param resource The resource to cache.
+     */
+    void CacheExternalResource(const std::string& filePath, std::shared_ptr<IResource> resource);
+
     bool WriteResource(const ResourceIdentifier& identifier, const std::vector<uint8_t>& data, bool unloadFile);
 
     std::shared_ptr<std::vector<std::shared_ptr<IResource>>> LoadResources(const std::string& searchMask);
