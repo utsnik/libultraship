@@ -567,6 +567,9 @@ class Interpreter {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
     std::map<std::string, MaskedTextureEntry, std::less<>> mMaskedTextures;
     std::unordered_map<uintptr_t, int> mFbTextures; // CPU addr -> GPU FB id
+    // G_SETTIMG_FB bound a framebuffer to tile 0; keep it (no ImportTexture from the stale loaded_texture) until the
+    // next G_SETTIMG. G_IMAGERECT marks the texture changed, which re-imported the last real texture over it.
+    bool mFbTextureSelected{};
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?

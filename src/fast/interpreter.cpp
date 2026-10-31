@@ -2245,6 +2245,9 @@ void Interpreter::PrepareTriangleState(bool is_rect) {
         effective_tile[i] = tile;
 
         if (comb->usedTextures[i]) {
+            if (mRdp->textures_changed[i] && i == 0 && mFbTextureSelected) {
+                mRdp->textures_changed[i] = false;  // the framebuffer selected by G_SETTIMG_FB stays bound
+            }
             if (mRdp->textures_changed[i]) {
                 RecordPerfFlush(PerfFlushReason::Texture);
                 Flush();
@@ -2939,6 +2942,7 @@ void Interpreter::GfxDpSetTextureImage(uint32_t format, uint32_t size, uint32_t 
                                        uint32_t texFlags, RawTexMetadata rawTexMetdata, const void* addr) {
     // fprintf(stderr, "GfxDpSetTextureImage: %s (width=%d; size=0x%X)\n",
     //         rawTexMetdata.resource ? rawTexMetdata.resource->GetInitData()->Path.c_str() : nullptr, width, size);
+    mFbTextureSelected = false;
     mRdp->texture_to_load.addr = (const uint8_t*)addr;
     mRdp->texture_to_load.siz = size;
     mRdp->texture_to_load.width = width;
@@ -5433,6 +5437,7 @@ bool gfx_set_timg_fb_handler_custom(F3DGfx** cmd0) {
     gfx->mRapi->SelectTextureFb((uint32_t)cmd->words.w1);
     gfx->mRdp->textures_changed[0] = false;
     gfx->mRdp->textures_changed[1] = false;
+    gfx->mFbTextureSelected = true;
     return false;
 }
 
