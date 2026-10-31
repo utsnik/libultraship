@@ -82,6 +82,11 @@ void ControllerGyro::ReloadGyroMappingFromConfig() {
     }
 
     mGyroMapping = GyroMappingFactory::CreateGyroMappingFromConfig(mPortIndex, id);
+    if (mGyroMapping == nullptr) {
+        // A saved mapping whose device/type cannot be rebuilt (e.g. a Wii U GamePad gyro
+        // mapping on a build without it) returned null and the next line DSI'd at boot.
+        return;
+    }
     mGyroMapping->SaveToConfig();
     SaveGyroMappingIdToConfig();
 }
