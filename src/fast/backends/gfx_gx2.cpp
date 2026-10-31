@@ -1237,10 +1237,23 @@ static void gfx_gx2_set_scissor(int x, int y, int width, int height) {
     uint32_t buffer_height = current_framebuffer->color_buffer.surface.height;
     uint32_t buffer_width = current_framebuffer->color_buffer.surface.width;
 
-    current_scissor_x = std::min((uint32_t)width, (uint32_t)x);
-    current_scissor_y = std::min((uint32_t)height, buffer_height - y - height);
-    current_scissor_width = std::min((uint32_t)width, buffer_width);
-    current_scissor_height = std::min((uint32_t)height, buffer_height);
+    // The interpreter passes a bottom-left origin (GL); GX2's is top-left, like D3D11's. Clip the rectangle to
+    // the buffer: clamping x to the width and y to the height moved every small scissor low on the screen
+    // upwards (the 2S2H clock's sun and hour digit were cut away).
+    const int64_t bw = buffer_width;
+    const int64_t bh = buffer_height;
+    int64_t left = x;
+    int64_t top = bh - (int64_t)y - height;
+    int64_t right = left + width;
+    int64_t bottom = top + height;
+    left = std::clamp<int64_t>(left, 0, bw);
+    right = std::clamp<int64_t>(right, left, bw);
+    top = std::clamp<int64_t>(top, 0, bh);
+    bottom = std::clamp<int64_t>(bottom, top, bh);
+    current_scissor_x = (uint32_t)left;
+    current_scissor_y = (uint32_t)top;
+    current_scissor_width = (uint32_t)(right - left);
+    current_scissor_height = (uint32_t)(bottom - top);
 
     if (trace) {
         SPDLOG_INFO("gfx_gx2: first frame state: GX2SetScissor ... x={} y={} width={} height={}", current_scissor_x,
