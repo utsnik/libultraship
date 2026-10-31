@@ -2393,12 +2393,64 @@ void GfxRenderingAPIGX2::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, in
 }
 
 void GfxRenderingAPIGX2::ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) {
-    // New upstream, used for screenshots//framebuffer effects. Not implemented for
-    // GX2 yet: leave the caller's buffer untouched rather than returning garbage.
-    (void)fbId;
-    (void)width;
-    (void)height;
-    (void)rgba16Buf;
+    struct Framebuffer* framebuffer = gfx_gx2_lookup_framebuffer(fbId);
+    if (!framebuffer || !rgba16Buf || !width || !height) {
+        return;
+    }
+
+    GX2Surface* source = &framebuffer->color_buffer.surface;
+    if (!source->image || !source->width || !source->height ||
+        source->format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8) {
+        return;
+    }
+
+    // Copy at the source size, then scale on the CPU as in the DX11 readback.
+    GX2Surface staging = *source;
+    staging.image = nullptr;
+    staging.mipmaps = nullptr;
+    staging.aa = GX2_AA_MODE1X;
+    staging.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&staging);
+    staging.image = memalign(staging.alignment, staging.imageSize);
+    if (!staging.image) {
+        SPDLOG_ERROR("gfx_gx2: framebuffer readback staging allocation failed");
+        return;
+    }
+
+    // Make sure recycled staging memory cannot overwrite the GPU's copy with dirty CPU cache lines.
+    DCFlushRange(staging.image, staging.imageSize);
+    if (source->aa == GX2_AA_MODE1X) {
+        GX2CopySurface(source, framebuffer->color_buffer.viewMip, framebuffer->color_buffer.viewFirstSlice,
+                       &staging, 0, 0);
+    } else {
+        GX2ResolveAAColorBuffer(&framebuffer->color_buffer, &staging, 0, 0);
+    }
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, staging.image, staging.imageSize);
+    GX2Flush();
+    // The copy uses the 3D pipeline and changes the bound render target.
+    gfx_wiiu_set_context_state();
+    if (current_framebuffer) {
+        GX2SetColorBuffer(&current_framebuffer->color_buffer, GX2_RENDER_TARGET_0);
+        GX2SetDepthBuffer(&current_framebuffer->depth_buffer);
+    }
+    gfx_gx2_draw_done("framebuffer readback");
+    DCInvalidateRange(staging.image, staging.imageSize);
+
+    const uint8_t* pixels = static_cast<const uint8_t*>(staging.image);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint32_t sourceY = static_cast<uint64_t>(y) * source->height / height;
+        const uint8_t* row = pixels + static_cast<size_t>(sourceY) * staging.pitch * 4;
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint32_t sourceX = static_cast<uint64_t>(x) * source->width / width;
+            const uint8_t* pixel = row + static_cast<size_t>(sourceX) * 4;
+            const uint16_t r = ((static_cast<uint32_t>(pixel[0]) + 4) * 31) / 255;
+            const uint16_t g = ((static_cast<uint32_t>(pixel[1]) + 4) * 31) / 255;
+            const uint16_t b = ((static_cast<uint32_t>(pixel[2]) + 4) * 31) / 255;
+            rgba16Buf[static_cast<size_t>(y) * width + x] =
+                (r << 11) | (g << 6) | (b << 1) | (pixel[3] ? 1 : 0);
+        }
+    }
+    free(staging.image);
 }
 
 void GfxRenderingAPIGX2::SetSrgbMode() {
