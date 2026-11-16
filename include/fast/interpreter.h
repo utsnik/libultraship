@@ -1,3 +1,4 @@
+#include <mutex>
 #pragma once
 
 #include <stdbool.h>
@@ -532,6 +533,11 @@ class Interpreter {
 
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
+    // Wii U render pipeline: the game thread queues depth requests and reads the last results; the render thread
+    // does the GX2 readback at the start of its frame (ServicePixelDepthRequests). Guarded by mPixelDepthMutex.
+    std::mutex mPixelDepthMutex;
+    std::vector<std::pair<std::pair<float, float>, uint16_t>> mGetPixelDepthLast;
+    void ServicePixelDepthRequests();
     std::map<std::string, MaskedTextureEntry, std::less<>> mMaskedTextures;
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;

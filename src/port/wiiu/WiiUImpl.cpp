@@ -1249,13 +1249,49 @@ static void FormatExceptionMessage(const char* typeName, const OSContext* contex
     *destination = '\0';
 }
 
-static BOOL FatalException(const char* typeName, OSContext* context) {
-    FormatExceptionMessage(typeName, context);
+// Crash reporting runs OUTSIDE the exception callback. Inside it, anything that takes the scheduler lock spins
+// forever: Watchdog::Emit -> vsnprintf -> __wut_getreent -> OSSetThreadCleanupCallback, and even OSFatal itself,
+// froze all three cores ("User Heartbeat Timeout", console 2026-11-16 17:50 and 21:55). So the callback only
+// copies the faulting context, points the thread at CrashReportEntry on a static stack and returns TRUE; the
+// thread then resumes there as ordinary code, where logging and OSFatal are safe.
+static OSContext sCrashContext;
+static const char* sCrashType = "UNKNOWN";
+static volatile uint32_t sCrashTaken = 0;
+alignas(16) static uint8_t sCrashStack[0x10000];
+alignas(16) static uint8_t sCrashParkStacks[3][0x800];
+
+static void CrashReportEntry() {
+    FormatExceptionMessage(sCrashType, &sCrashContext);
 #if WIIU_DIAGNOSTICS
-    EmitExceptionMessage(typeName, context);
+    EmitExceptionMessage(sCrashType, &sCrashContext);
 #endif
     OSFatal(sExceptionMessage);
-    return FALSE;
+    for (;;) {
+    }
+}
+
+static void CrashParkEntry() {
+    // A second thread faulted while the first is being reported: keep it out of the way.
+    for (;;) {
+        OSSleepTicks(OSSecondsToTicks(1));
+    }
+}
+
+static BOOL FatalException(const char* typeName, OSContext* context) {
+    if (context == nullptr) {
+        return FALSE;
+    }
+    if (__sync_lock_test_and_set(&sCrashTaken, 1) != 0) {
+        const uint32_t core = OSGetCoreId() < 3 ? OSGetCoreId() : 0;
+        context->srr0 = (uint32_t)(uintptr_t)&CrashParkEntry;
+        context->gpr[1] = (uint32_t)(uintptr_t)(sCrashParkStacks[core] + sizeof(sCrashParkStacks[core]) - 0x40);
+        return TRUE;
+    }
+    sCrashContext = *context;
+    sCrashType = typeName;
+    context->srr0 = (uint32_t)(uintptr_t)&CrashReportEntry;
+    context->gpr[1] = (uint32_t)(uintptr_t)(sCrashStack + sizeof(sCrashStack) - 0x80);
+    return TRUE;
 }
 
 static BOOL DsiExceptionCallback(OSContext* context) {

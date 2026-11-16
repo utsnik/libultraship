@@ -5705,8 +5705,7 @@ GfxExecStack g_exec_stack = {};
 void Interpreter::RunGuiOnly() {
     SpReset();
 
-    mGetPixelDepthPending.clear();
-    mGetPixelDepthCached.clear();
+    ServicePixelDepthRequests();
 
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
@@ -5752,8 +5751,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
     SpReset();
 
-    mGetPixelDepthPending.clear();
-    mGetPixelDepthCached.clear();
+    ServicePixelDepthRequests();
 
     mCurMtxReplacements = &mtx_replacements;
 
@@ -5916,13 +5914,65 @@ void Interpreter::AdjustPixelDepthCoordinates(float& x, float& y) {
     }
 }
 
+#ifdef __WIIU__
+extern "C" bool Graph_PipelineEnabled(void) __attribute__((weak));
+static bool WiiUPixelDepthDeferred() {
+    return Graph_PipelineEnabled != nullptr && Graph_PipelineEnabled();
+}
+#endif
+
 void Interpreter::GetPixelDepthPrepare(float x, float y) {
     AdjustPixelDepthCoordinates(x, y);
+#ifdef __WIIU__
+    std::lock_guard<std::mutex> lock(mPixelDepthMutex);
+#endif
     mGetPixelDepthPending.emplace(x, y);
+}
+
+void Interpreter::ServicePixelDepthRequests() {
+#ifdef __WIIU__
+    if (WiiUPixelDepthDeferred()) {
+        // Render thread, before this frame draws: the depth buffer still holds the previous frame, which is what
+        // the game asked about. The game thread never touches GX2 or these containers without the mutex.
+        std::set<std::pair<float, float>> pending;
+        {
+            std::lock_guard<std::mutex> lock(mPixelDepthMutex);
+            pending.swap(mGetPixelDepthPending);
+            mGetPixelDepthCached.clear();
+        }
+        if (!pending.empty()) {
+            auto res = mRapi->GetPixelDepth(mRendersToFb ? mGameFb : 0, pending);
+            std::lock_guard<std::mutex> lock(mPixelDepthMutex);
+            mGetPixelDepthLast.assign(res.begin(), res.end());
+        }
+        return;
+    }
+#endif
+    mGetPixelDepthPending.clear();
+    mGetPixelDepthCached.clear();
 }
 
 uint16_t Interpreter::GetPixelDepth(float x, float y) {
     AdjustPixelDepthCoordinates(x, y);
+#ifdef __WIIU__
+    if (WiiUPixelDepthDeferred()) {
+        // Pipeline: never read back on the game thread (core 2 must not issue GX2 commands, and the render thread
+        // clears these containers every frame). Queue the point and answer from the last readback; the sun moves
+        // a little each frame, so take the nearest recent point. Unknown = 0 (the sun counts as hidden for a frame).
+        std::lock_guard<std::mutex> lock(mPixelDepthMutex);
+        mGetPixelDepthPending.emplace(x, y);
+        uint16_t best = 0;
+        float bestDist = 16.0f * 16.0f;
+        for (const auto& [point, depth] : mGetPixelDepthLast) {
+            const float dx = point.first - x, dy = point.second - y, dist = dx * dx + dy * dy;
+            if (dist <= bestDist) {
+                bestDist = dist;
+                best = depth;
+            }
+        }
+        return best;
+    }
+#endif
 
     if (auto it = mGetPixelDepthCached.find(std::make_pair(x, y)); it != mGetPixelDepthCached.end()) {
         return it->second;
